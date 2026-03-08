@@ -1,0 +1,470 @@
+# Part 13: Nested Layouts — Recursive Virtual Module Generation
+
+*This is the thirteenth installment in a series where we build a toy Next.js on top of Vite. In [Part 12](/12-streaming-ssr), we added streaming SSR. Now we'll implement nested layouts — a `layout.tsx` convention where each directory level can wrap its child routes in shared UI, exactly like Next.js App Router's layout system.*
+
+**Concepts introduced:** Recursive filesystem scanning, hierarchical virtual module generation, composing component trees from directory structure, typed layout data, parent-to-child data flow across route segments, the layout/page rendering pipeline.
+
+---
+
+## The design goal
+
+Next.js App Router's layout convention is one of its most powerful ideas. Each directory segment can have a `layout.tsx` that wraps all routes beneath it:
+
+```
+src/pages/
+├── layout.tsx           ← Root layout (nav, footer)
+├── Home.tsx
+├── about.tsx
+└── dashboard/
+    ├── layout.tsx       ← Dashboard layout (sidebar)
+    ├── index.tsx        ← /dashboard
+    ├── settings.tsx     ← /dashboard/settings
+    └── analytics/
+        ├── layout.tsx   ← Analytics sub-layout (tabs)
+        └── index.tsx    ← /dashboard/analytics
+```
+
+When a user visits `/dashboard/analytics`, the rendered component tree is:
+
+```
+<RootLayout>
+  <DashboardLayout>
+    <AnalyticsLayout>
+      <AnalyticsPage />
+    </AnalyticsLayout>
+  </DashboardLayout>
+</RootLayout>
+```
+
+Each layout persists across sibling route navigations — navigating from `/dashboard/settings` to `/dashboard/analytics` doesn't remount `DashboardLayout`.
+
+---
+
+## Extending route discovery
+
+The route plugin from Part 2 discovers page files. Now it also needs to discover layout files and build a tree structure:
+
+```typescript
+// packages/eigen/route-tree.ts
+
+export interface RouteNode {
+  /** The URL path segment for this level (e.g., 'dashboard') */
+  segment: string
+  /** Full URL path (e.g., '/dashboard') */
+  fullPath: string
+  /** The layout component file for this directory, if any */
+  layoutFile: string | null
+  /** The page component file (index or named), if any */
+  pageFile: string | null
+  /** Nested children */
+  children: RouteNode[]
+  /** Dynamic parameter name, if this is a [param] segment */
+  paramName: string | null
+  /** Whether the layout has its own loader */
+  hasLayoutLoader: boolean
+}
+
+export function buildRouteTree(pagesDir: string): RouteNode {
+  return scanDirectory(pagesDir, '', '/')
+}
+
+function scanDirectory(
+  dir: string,
+  segment: string,
+  fullPath: string,
+): RouteNode {
+  const entries = readdirSync(dir, { withFileTypes: true })
+
+  const layoutFile = entries.find(e =>
+    e.isFile() && /^layout\.tsx$/.test(e.name),
+  )
+  const pageFile = entries.find(e =>
+    e.isFile() && /^(index|page)\.tsx$/.test(e.name),
+  )
+
+  // Check if the layout exports a loader
+  let hasLayoutLoader = false
+  if (layoutFile) {
+    const content = readFileSync(resolve(dir, layoutFile.name), 'utf-8')
+    hasLayoutLoader = /export\s+(const|async\s+function|function)\s+loader/.test(content)
+  }
+
+  const children: RouteNode[] = entries
+    .filter(e => e.isDirectory())
+    .map(e => {
+      const childSegment = e.name
+      const paramName = childSegment.match(/^\[(\w+)\]$/)?.[1] ?? null
+      const urlSegment = paramName ? `:${paramName}` : childSegment
+      const childFullPath = fullPath === '/'
+        ? `/${urlSegment}`
+        : `${fullPath}/${urlSegment}`
+
+      return scanDirectory(
+        resolve(dir, childSegment),
+        urlSegment,
+        childFullPath,
+      )
+    })
+
+  return {
+    segment,
+    fullPath,
+    layoutFile: layoutFile ? resolve(dir, layoutFile.name) : null,
+    pageFile: pageFile ? resolve(dir, pageFile.name) : null,
+    children,
+    paramName: segment.match(/^:(\w+)$/)?.[1] ?? null,
+    hasLayoutLoader,
+  }
+}
+```
+
+---
+
+## Generating the nested virtual module
+
+This is where the virtual module generation becomes recursive. For each route, the generated code must compose the full layout stack:
+
+```typescript
+// In the load() hook for eigen/routes
+
+function generateRouteCode(tree: RouteNode, isSSR: boolean): string {
+  const imports: string[] = []
+  const routes: string[] = []
+  let importIndex = 0
+
+  function walk(node: RouteNode, layoutStack: string[]) {
+    // Collect layout imports for this level
+    if (node.layoutFile) {
+      const layoutName = `Layout${importIndex++}`
+      if (isSSR) {
+        imports.push(`import ${layoutName} from '${node.layoutFile}'`)
+        if (node.hasLayoutLoader) {
+          imports.push(
+            `import { loader as ${layoutName}Loader } from '${node.layoutFile}'`,
+          )
+        }
+      } else {
+        imports.push(
+          `const ${layoutName} = React.lazy(() => import('${node.layoutFile}'))`,
+        )
+      }
+      layoutStack = [...layoutStack, layoutName]
+    }
+
+    // Generate route entry for this node's page
+    if (node.pageFile) {
+      const pageName = `Page${importIndex++}`
+      if (isSSR) {
+        imports.push(`import ${pageName} from '${node.pageFile}'`)
+      } else {
+        imports.push(
+          `const ${pageName} = React.lazy(() => import('${node.pageFile}'))`,
+        )
+      }
+
+      // Generate a component that nests layouts around the page
+      const componentName = `Route${importIndex++}`
+      const nestedJSX = layoutStack.reduceRight(
+        (inner, layout) => `<${layout}>${inner}</${layout}>`,
+        `<${pageName} />`,
+      )
+
+      imports.push(
+        `function ${componentName}(props) { return ${nestedJSX} }`,
+      )
+
+      routes.push(`  {
+    path: '${node.fullPath}',
+    component: ${componentName},
+    layouts: [${layoutStack.map(l => `'${l}'`).join(', ')}],
+  }`)
+    }
+
+    // Recurse into children
+    for (const child of node.children) {
+      walk(child, layoutStack)
+    }
+  }
+
+  walk(tree, [])
+
+  return `
+    import React from 'react'
+    ${imports.join('\n')}
+    export const routes = [\n${routes.join(',\n')}\n]
+  `
+}
+```
+
+The key insight: the virtual module generates **wrapper components** that nest layouts around pages. For the `/dashboard/analytics` route, it generates something like:
+
+```tsx
+function Route7(props) {
+  return (
+    <Layout0>
+      <Layout3>
+        <Layout5>
+          <Page6 />
+        </Layout5>
+      </Layout3>
+    </Layout0>
+  )
+}
+```
+
+---
+
+## Layout components with typed children
+
+A layout component receives `children` and optionally its own loader data:
+
+```tsx
+// src/pages/dashboard/layout.tsx
+import type { LayoutProps } from 'eigen/types'
+
+interface DashboardNav {
+  user: { name: string; role: string }
+  notifications: number
+}
+
+export const loader = defineLoader('/dashboard', async ({ params }) => {
+  const user = await getUser()
+  return { user, notifications: await getNotificationCount(user.id) }
+})
+
+type Data = Awaited<ReturnType<typeof loader>>
+
+export default function DashboardLayout({ children, data }: LayoutProps<Data>) {
+  return (
+    <div className="dashboard">
+      <aside>
+        <p>Welcome, {data.user.name}</p>
+        <span>{data.notifications} notifications</span>
+        <nav>
+          <a href="/dashboard">Overview</a>
+          <a href="/dashboard/settings">Settings</a>
+          <a href="/dashboard/analytics">Analytics</a>
+        </nav>
+      </aside>
+      <main>{children}</main>
+    </div>
+  )
+}
+```
+
+The framework types:
+
+```typescript
+// packages/eigen/types.ts — additions
+
+export interface LayoutProps<TData = unknown> {
+  children: React.ReactNode
+  data: TData
+}
+```
+
+---
+
+## The layout loader pipeline
+
+When the server renders `/dashboard/analytics`, it needs to call loaders for every layout in the stack *plus* the page, then thread the data through:
+
+```typescript
+// In entry-server.tsx — layout-aware rendering
+
+async function renderWithLayouts(
+  match: RouteMatch,
+): Promise<{ element: React.ReactElement; data: Record<string, unknown> }> {
+  const layoutData: Record<string, unknown> = {}
+
+  // Call each layout's loader in sequence (parent → child)
+  for (const layout of match.layouts) {
+    if (layout.loader) {
+      layoutData[layout.path] = await layout.loader({ params: match.params })
+    }
+  }
+
+  // Call the page loader
+  let pageData: unknown = null
+  if (match.route.loader) {
+    pageData = await match.route.loader({ params: match.params })
+  }
+
+  // Build the nested component tree from outside in
+  let element: React.ReactElement = (
+    <match.route.component params={match.params} data={pageData} />
+  )
+
+  // Wrap with layouts from innermost to outermost
+  for (let i = match.layouts.length - 1; i >= 0; i--) {
+    const layout = match.layouts[i]
+    const Layout = layout.component
+    const data = layoutData[layout.path] ?? null
+    element = <Layout data={data}>{element}</Layout>
+  }
+
+  return { element, data: { ...layoutData, __page: pageData } }
+}
+```
+
+### Parallel vs. sequential loader execution
+
+Notice we're calling layout loaders sequentially. A smarter implementation runs them in parallel since they're independent:
+
+```typescript
+// Parallel execution — all loaders run concurrently
+const loaderPromises = match.layouts
+  .filter(l => l.loader)
+  .map(async l => [l.path, await l.loader({ params: match.params })] as const)
+
+const pagePromise = match.route.loader
+  ? match.route.loader({ params: match.params })
+  : Promise.resolve(null)
+
+const [layoutResults, pageData] = await Promise.all([
+  Promise.all(loaderPromises),
+  pagePromise,
+])
+
+const layoutData = Object.fromEntries(layoutResults)
+```
+
+This is what Remix does — all loaders for a matched route run in parallel. It's significantly faster when layouts fetch independent data.
+
+---
+
+## Typing the layout data chain
+
+The type challenge with nested layouts: a child component might need access to data from a parent layout. For example, the page at `/dashboard/analytics` might need the `user` object from the dashboard layout's loader.
+
+One approach is a context-based pattern:
+
+```typescript
+// packages/eigen/layout-context.ts
+import { createContext, useContext } from 'react'
+
+const LayoutDataContext = createContext<Record<string, unknown>>({})
+
+export function LayoutDataProvider({
+  path,
+  data,
+  children,
+}: {
+  path: string
+  data: unknown
+  children: React.ReactNode
+}) {
+  const parentData = useContext(LayoutDataContext)
+  const merged = { ...parentData, [path]: data }
+  return (
+    <LayoutDataContext.Provider value={merged}>
+      {children}
+    </LayoutDataContext.Provider>
+  )
+}
+
+/**
+ * Access a parent layout's loader data from a child route.
+ * The path parameter is type-checked against known layout paths.
+ */
+export function useLayoutData<T>(path: string): T {
+  const allData = useContext(LayoutDataContext)
+  return allData[path] as T
+}
+```
+
+Usage in a page component:
+
+```tsx
+// src/pages/dashboard/analytics/index.tsx
+import { useLayoutData } from 'eigen/layout-context'
+
+export default function AnalyticsPage() {
+  // Access the dashboard layout's data from this child page
+  const { user } = useLayoutData<{ user: { name: string; role: string } }>(
+    '/dashboard',
+  )
+  return <h1>Analytics for {user.name}</h1>
+}
+```
+
+To make this fully type-safe, the plugin would need to generate a `LayoutDataMap` type (similar to `RouteParamsMap`) that maps layout paths to their loader return types. This is the same code generation pattern from Part 2, extended one level deeper.
+
+---
+
+## Generating layout-aware type declarations
+
+Extend `generateRouteDeclarations` to include layout information:
+
+```typescript
+const layoutEntries = layouts.map(l => {
+  // The loader return type would need to be extracted from the source
+  // file — a more sophisticated approach using the TypeScript compiler API.
+  // For now, we generate the path mapping.
+  return `    '${l.path}': unknown`
+}).join('\n')
+
+const dts = `
+declare module 'eigen/route-types' {
+  export type RoutePaths = ${pathUnion}
+  export interface RouteParamsMap { ${paramEntries} }
+
+  /** Maps layout paths to their loader data types */
+  export interface LayoutDataMap {
+${layoutEntries}
+  }
+}
+`
+```
+
+---
+
+## Layout persistence across navigations
+
+A key behavior of nested layouts: when navigating between sibling routes (e.g., `/dashboard/settings` → `/dashboard/analytics`), the `DashboardLayout` should not unmount and remount. Only the content below it changes.
+
+In our current client-side router (Part 4), every navigation replaces the entire component tree. To support layout persistence, the router needs to diff the layout stacks:
+
+```tsx
+function Router() {
+  const [pathname, setPathname] = useState(window.location.pathname)
+  const match = matchRoute(pathname)
+
+  // The route component already includes nested layouts
+  // React's reconciler handles persistence: if the same layout
+  // component appears at the same position in the tree, React
+  // reuses the instance (preserving state) and only updates children.
+  
+  if (!match) return <h1>404</h1>
+  const RouteComponent = match.route.component
+  return <RouteComponent params={match.params} data={data} />
+}
+```
+
+Because the virtual module generates wrapper components where layouts are always in the same order, React's reconciler naturally preserves layout instances when the page component changes. This is a subtle but important interaction between the generated code structure and React's diffing algorithm.
+
+---
+
+## What to observe
+
+1. **Add a `console.log('DashboardLayout mounted')` in the layout's `useEffect`.** Navigate between `/dashboard/settings` and `/dashboard/analytics`. The log should fire once — the layout persists.
+
+2. **Check the virtual module in `vite-plugin-inspect`.** You'll see the generated wrapper components that compose layouts around pages.
+
+3. **Add loaders to multiple layout levels.** Watch the Network tab during SSR — all loader data is serialized into `window.__EIGEN_DATA__` as a nested structure.
+
+4. **Try the parallel loader execution.** Add artificial delays to layout loaders and compare sequential vs. `Promise.all` — the difference is visible in the response timing.
+
+---
+
+## Key insight
+
+Nested layouts transform the route plugin from a flat list generator into a tree-walking code generator. The virtual module's `load` hook now produces recursive component compositions. This is where the code generation approach pays off — the developer writes flat files in a directory structure, and the plugin synthesizes the correct component nesting at build time.
+
+The type challenge deepens too. With flat routes, you type `params` and `data` per route. With layouts, you have a *chain* of typed data flowing from parent to child — each level's loader contributes to the data available downstream. Making this fully type-safe requires generating a `LayoutDataMap` that knows each layout's loader return type, which means the plugin needs to analyze TypeScript source at code-generation time. This is exactly the kind of build-time type extraction that TanStack Router's code generation performs.
+
+---
+
+## What's next
+
+In Part 14, we'll build **framework middleware** — a typed request pipeline that runs before loaders and route handlers, enabling authentication, redirects, and context injection that flows through to loaders and server functions.

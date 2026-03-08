@@ -1,0 +1,234 @@
+# Part 7: The `transform` Hook — Code Transformation at Scale
+
+*This is the eighth installment in a series where we build a toy Next.js on top of Vite. In [Part 6](/06-production-builds), we built the production pipeline. Now we'll tackle the most powerful tool in the plugin API: the `transform` hook, which lets you rewrite source code before it's executed.*
+
+**Concepts introduced:** The `transform` hook, `applyToEnvironment`, regex-based vs. AST-based code stripping, the TypeScript compiler API for transforms, server/client boundary enforcement, the "use server" / "use client" model.
+
+---
+
+## The problem
+
+So far, our server/client code boundary is enforced by the virtual module: the client version of `eigen/routes` doesn't import loaders, so the loader code gets tree-shaken away. This works when the loader is a named export on the page component.
+
+But what if a loader imports a Node-only package?
+
+```tsx
+// src/pages/Dashboard.tsx
+import { db } from '../lib/database'  // Imports 'pg' (PostgreSQL driver)
+
+export const loader = defineLoader('/dashboard', async () => {
+  const users = await db.query('SELECT * FROM users')
+  return { users: users.rows }
+})
+
+export default function Dashboard({ data }) {
+  return <ul>{data.users.map(u => <li key={u.id}>{u.name}</li>)}</ul>
+}
+```
+
+Even though the client virtual module doesn't reference the `loader`, the page component file *still imports `db`* at the top level. When Vite bundles this file for the client, it follows the `import { db }` statement, tries to resolve `pg`, and either fails (because `pg` doesn't run in browsers) or bundles a massive Node module into the client.
+
+This is the "server-side imports leaking to client bundles" issue. It's a real problem — TanStack Start has tracked it in issues #2783 and #6185. Next.js solves it by compiling `getServerSideProps` in a completely separate build pass. Remix solves it by running server-only code in a separate module boundary. We'll solve it with a `transform` hook that strips loader exports and their imports from client bundles.
+
+---
+
+## A regex-based transform
+
+```typescript
+// plugins/eigen-strip-loaders.ts
+import type { Plugin } from 'vite'
+
+export default function eigenStripLoaders(): Plugin {
+  return {
+    name: 'eigen-strip-loaders',
+
+    // Vite 6+: only run this plugin in the client environment
+    applyToEnvironment(environment) {
+      return environment.name === 'client'
+    },
+
+    transform(code: string, id: string) {
+      // Only process page component files
+      if (!id.includes('/pages/') || !id.endsWith('.tsx')) return
+
+      // Quick check: does this file export a loader?
+      if (!/export\s+(const|async\s+function|function)\s+loader/.test(code)) {
+        return  // No loader — don't transform
+      }
+
+      // Strip the loader export.
+      // This regex handles:
+      //   export async function loader(...) { ... }
+      //   export const loader = defineLoader(...)
+      //   export const loader = (async () => { ... }) satisfies LoaderFn
+      let stripped = code.replace(
+        /export\s+(?:const\s+loader\s*=[\s\S]*?(?:;|\n(?=export|import|\/\/))|(?:async\s+)?function\s+loader\s*\([^)]*\)\s*(?::\s*[^{]*?)?\{[\s\S]*?\n\})/,
+        '// [eigen] loader stripped for client bundle',
+      )
+
+      // Also strip defineLoader and LoaderFn imports if unused
+      stripped = stripped.replace(
+        /import\s*\{[^}]*defineLoader[^}]*\}\s*from\s*['"]eigen\/helpers['"]\s*;?\n?/,
+        '',
+      )
+      stripped = stripped.replace(
+        /import\s+type\s*\{[^}]*LoaderFn[^}]*\}\s*from\s*['"]eigen\/types['"]\s*;?\n?/,
+        '',
+      )
+
+      // Strip server-only imports that are only used by the loader.
+      // This is a simplified version — a real framework would do
+      // import analysis to determine which imports are loader-only.
+      // For now, strip imports marked with a comment convention:
+      stripped = stripped.replace(
+        /import\s+.*\/\/\s*server-only\s*\n/g,
+        '// [eigen] server-only import stripped\n',
+      )
+
+      return { code: stripped, map: null }
+    },
+  }
+}
+```
+
+### `applyToEnvironment` — environment-scoped plugins
+
+The `applyToEnvironment` hook (introduced in Vite 6) is how a plugin declares which environments it should be active in. By returning `environment.name === 'client'`, we ensure this transform *only* runs when building or serving client-side code. The SSR environment keeps the loaders intact — it needs them.
+
+Before the Environment API, you'd check `this.environment?.name === 'ssr'` inside the hook itself, or use the `ssr` boolean parameter that some hooks received. The `applyToEnvironment` approach is cleaner: the plugin is simply not present in the SSR pipeline, so there's no conditional logic inside `transform`.
+
+### Why regex is fragile
+
+The regex approach has real limitations:
+
+- **Nested braces**: `export function loader() { if (x) { return } }` — the regex might match the inner `}` instead of the outer one, truncating the function incorrectly.
+- **Template literals with braces**: Code like `` `${obj}` `` inside a loader body contains braces that confuse the regex.
+- **`satisfies` expressions**: `export const loader = (async () => ...) satisfies LoaderFn<'/path'>` has complex syntax that a simple regex can't reliably parse.
+- **Type-only exports**: `export type LoaderData = ...` contains `export` but shouldn't be stripped.
+- **Re-exports**: `export { loader } from './loaders'` uses a completely different syntax form.
+
+For a toy framework, regex works. For production, you need AST parsing.
+
+---
+
+## AST-based transform with the TypeScript compiler API
+
+The TypeScript compiler API can parse TypeScript source into an AST, transform it, and print the result. This handles all syntactic forms correctly:
+
+```typescript
+import ts from 'typescript'
+
+function stripLoaderExport(code: string, id: string): string {
+  const sourceFile = ts.createSourceFile(
+    id,
+    code,
+    ts.ScriptTarget.Latest,
+    true,     // setParentNodes — needed for walking the tree
+    ts.ScriptKind.TSX,
+  )
+
+  const printer = ts.createPrinter()
+
+  const transformer: ts.TransformerFactory<ts.SourceFile> = (context) => {
+    return (source) => {
+      function visit(node: ts.Node): ts.Node | undefined {
+        // Remove: export function loader(...) { ... }
+        if (
+          ts.isFunctionDeclaration(node) &&
+          node.name?.text === 'loader' &&
+          node.modifiers?.some(
+            m => m.kind === ts.SyntaxKind.ExportKeyword,
+          )
+        ) {
+          return undefined  // Removes the node entirely
+        }
+
+        // Remove: export const loader = ...
+        if (
+          ts.isVariableStatement(node) &&
+          node.modifiers?.some(
+            m => m.kind === ts.SyntaxKind.ExportKeyword,
+          )
+        ) {
+          const decl = node.declarationList.declarations[0]
+          if (ts.isIdentifier(decl.name) && decl.name.text === 'loader') {
+            return undefined
+          }
+        }
+
+        // Remove: export type LoaderData = Awaited<ReturnType<typeof loader>>
+        // (Type-only exports that reference the loader)
+        if (
+          ts.isTypeAliasDeclaration(node) &&
+          node.name.text === 'LoaderData' &&
+          node.modifiers?.some(
+            m => m.kind === ts.SyntaxKind.ExportKeyword,
+          )
+        ) {
+          return undefined
+        }
+
+        return ts.visitEachChild(node, visit, context)
+      }
+
+      return ts.visitNode(source, visit) as ts.SourceFile
+    }
+  }
+
+  const result = ts.transform(sourceFile, [transformer])
+  return printer.printFile(result.transformed[0])
+}
+```
+
+This correctly handles:
+- Arrow function loaders: `export const loader = async () => { ... }`
+- Function declaration loaders: `export async function loader() { ... }`
+- Re-exported loaders: The AST walk finds exports regardless of syntax form
+- `satisfies` expressions: TypeScript's parser understands these natively
+- Type-only exports referencing the loader: Caught by checking the node type
+
+### The performance trade-off
+
+`ts.createSourceFile` parses the entire file into an AST. This is slower than a regex check — roughly 10-50x slower per file. For a project with 50 page files, the total overhead is a few hundred milliseconds, which is fine for production builds but might feel sluggish during dev.
+
+Production frameworks like Remix and TanStack Start use **SWC** instead of the TypeScript compiler for transforms. SWC is a Rust-based parser/transformer that's 10-100x faster than `ts.createSourceFile`. It provides the same AST fidelity with minimal latency.
+
+For our toy framework, the regex approach is fine during development (where the transform only runs when a file changes, not on every request), and the TypeScript API is appropriate for build-time correctness.
+
+---
+
+## What code stripping teaches about boundaries
+
+The `transform` hook is where frameworks enforce the server/client boundary at the code level. There are several boundary models in use:
+
+**Export stripping** (our approach, also Remix's) — The framework strips specific named exports (`loader`) from the client bundle. The boundary is at the export level: everything in the file is universal except the loader.
+
+**File-level splitting** (TanStack Start's `.server.ts`) — Server-only code goes in files that end with `.server.ts`. The framework either excludes these files from the client build entirely or replaces their exports with stubs.
+
+**Directive-based** (React Server Components' `"use server"` / `"use client"`) — The boundary is declared with a string directive at the top of the file. The compiler splits the module graph at these boundaries, generating RPC client stubs for server functions.
+
+All three approaches use the `transform` hook under the hood. The difference is in what they detect (export names, file extensions, directives) and what they produce (stripped exports, empty modules, RPC stubs).
+
+---
+
+## What to observe
+
+1. **Install `vite-plugin-inspect`** and compare the client and SSR transform outputs for a page component with a loader. In the SSR output, the loader is intact. In the client output, it's stripped.
+
+2. **Import a Node-only module** in a loader (like `fs` or `path`). Without the strip transform, the client build will fail or produce a broken bundle. With the transform, the import is stripped along with the loader.
+
+3. **Run `vite build`** and inspect the client output in `dist/client/assets/`. Search the JavaScript files — the loader function should not appear anywhere in the client bundle.
+
+---
+
+## Key insight
+
+The `transform` hook is essentially a compiler pass — you receive source code and return modified source code. For framework development, it's the mechanism that enforces what code runs where. The TypeScript angle adds complexity: you're transforming source that may contain type-only exports, `satisfies` operators, and generic type arguments. A naive regex that looks for `export function loader` might accidentally match a type definition or a variable inside a template literal.
+
+This is why production frameworks invest in proper AST parsing. The `transform` hook is the most powerful tool in the Vite plugin API, and also the most dangerous — a buggy transform can silently corrupt application code.
+
+---
+
+## What's next
+
+In Part 8, we'll use `configureServer` to add API routes and dev middleware. This is how a framework takes control of the HTTP layer, handling API endpoints, data fetching, and custom routing during development.
