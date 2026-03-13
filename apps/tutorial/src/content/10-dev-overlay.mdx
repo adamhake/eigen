@@ -252,7 +252,7 @@ export function devEmit(event: DevEvent): void {
 }
 ```
 
-The `import.meta.env.DEV` check is the zero-cost guarantee. In production builds, Vite statically replaces `import.meta.env.DEV` with `false`. Rollup's dead code elimination removes the entire function body. The `devEmit` call, its arguments, and any event object construction are all stripped from the production bundle. This means we can instrument *everything* without worrying about runtime cost.
+The `import.meta.env.DEV` check is the zero-cost guarantee. In production builds, Vite statically replaces `import.meta.env.DEV` with `false`. Rolldown's dead code elimination removes the entire function body. The `devEmit` call, its arguments, and any event object construction are all stripped from the production bundle. This means we can instrument *everything* without worrying about runtime cost.
 
 As we build features in later parts, each will emit events:
 

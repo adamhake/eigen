@@ -50,7 +50,7 @@ export default defineConfig({
       },
       build: {
         outDir: 'dist/edge',
-        rollupOptions: {
+        rolldownOptions: {
           input: 'src/entry-edge.tsx',
           // Edge bundles are self-contained — no external node_modules
           external: [],

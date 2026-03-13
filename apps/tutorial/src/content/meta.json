@@ -41,6 +41,10 @@
     "33-authentication-authorization",
     "34-data-fetching",
     "35-error-boundaries-loading",
-    "36-testing-your-framework"
+    "36-testing-your-framework",
+    "37-css-styling-pipeline",
+    "38-forms-mutations",
+    "39-developer-experience-cli",
+    "40-monorepo-publishing"
   ]
 }

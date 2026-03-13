@@ -199,7 +199,7 @@ This correctly handles:
 
 <TypeDeepDive title="Concept: The visitor pattern for tree traversal">
 
-The visitor pattern walks every node in a tree and lets you decide what to do with each one: return it unchanged, modify it, or remove it (by returning `undefined`). `ts.visitNode(source, visit)` starts the walk; your `visit` function is called for every node in the AST. Inside `visit`, you call `ts.visitEachChild(node, visit, context)` to recurse into children — if you forget this, the walk stops at that node. This is the standard pattern for code transformation tools: Babel, ESLint, TypeScript, and Rollup plugins all use variations of it. The key insight is that you only need to handle the node types you care about and pass everything else through unchanged.
+The visitor pattern walks every node in a tree and lets you decide what to do with each one: return it unchanged, modify it, or remove it (by returning `undefined`). `ts.visitNode(source, visit)` starts the walk; your `visit` function is called for every node in the AST. Inside `visit`, you call `ts.visitEachChild(node, visit, context)` to recurse into children — if you forget this, the walk stops at that node. This is the standard pattern for code transformation tools: Babel, ESLint, TypeScript, and Rolldown/Rollup plugins all use variations of it. The key insight is that you only need to handle the node types you care about and pass everything else through unchanged.
 
 </TypeDeepDive>
 

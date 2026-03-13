@@ -69,7 +69,7 @@ A few of these settings deserve explanation:
 
 **`moduleResolution: "Bundler"`** — This tells TypeScript to use resolution rules that match what a bundler like Vite does. It supports `exports` fields in `package.json`, allows extensionless imports, and handles `import` conditions. Without this, TypeScript might resolve imports differently than Vite, causing phantom type errors or missing types.
 
-**`isolatedModules: true`** — Vite transforms each file independently (via esbuild), without cross-file type information. This flag tells TypeScript to error on patterns that require cross-file analysis, like `const enum` or `export =`. It keeps your code compatible with Vite's transform model.
+**`isolatedModules: true`** — Vite transforms each file independently (via Oxc), without cross-file type information. This flag tells TypeScript to error on patterns that require cross-file analysis, like `const enum` or `export =`. It keeps your code compatible with Vite's transform model.
 
 **`noEmit: true`** — Vite handles compilation. TypeScript is only used for type-checking. The `tsc` command never writes output files.
 
@@ -99,7 +99,7 @@ No `jsx` setting here — plugins don't contain JSX. No `paths` — plugins impo
 
 ### Why two tsconfigs?
 
-This dual-tsconfig pattern is standard in Vite projects, but it's worth understanding why. The app code targets the browser (or a browser-like environment), uses JSX, and is transformed by Vite's plugin pipeline. The tooling code targets Node, uses Node APIs like `fs` and `path`, and is executed directly by Vite's config loader (which uses esbuild to transpile `.ts` config files).
+This dual-tsconfig pattern is standard in Vite projects, but it's worth understanding why. The app code targets the browser (or a browser-like environment), uses JSX, and is transformed by Vite's plugin pipeline. The tooling code targets Node, uses Node APIs like `fs` and `path`, and is executed directly by Vite's config loader (which uses Oxc to transpile `.ts` config files).
 
 If you use a single tsconfig with `jsx: "react-jsx"`, TypeScript won't complain about JSX in your plugins (where it shouldn't appear). If you use a single tsconfig with `types: ["node"]`, TypeScript will offer `fs.readFileSync` autocomplete in React components (where it shouldn't be available). Two configs keep each zone's type environment honest.
 
@@ -126,7 +126,7 @@ This is minimal on purpose. Let's understand what's happening:
 
 - **JSX transformation** — Compiles JSX/TSX to `React.createElement` calls (or the automatic runtime `jsx()` calls with `react-jsx`).
 - **Fast Refresh** — Injects HMR boundary code into every React component so that edits hot-reload without losing component state.
-- **React-specific Babel plugins** — Depending on configuration, it can use Babel (for features like `styled-components` or React Compiler) or SWC.
+- **Oxc-based transforms** — As of v6, `@vitejs/plugin-react` uses Oxc for React Refresh transforms, eliminating the Babel dependency. (Babel can still be opted into for features like `styled-components` or React Compiler.)
 
 The `react()` plugin is separate from the framework plugin we'll build. This is by design — in the Vite ecosystem, the UI library plugin (React, Vue, Svelte) and the framework plugin (Next.js-like SSR, routing) are independent. TanStack Start's config has the same shape: `plugins: [tanstackStart(), react()]`.
 
@@ -206,7 +206,7 @@ Click on the `/src/main.tsx` request and look at the response. You'll see transf
 
 ### Dependency pre-bundling
 
-When the dev server starts, Vite scans your imports and detects that `react` and `react-dom/client` need to be pre-bundled. It runs esbuild to convert them from CommonJS (React's default format) to ESM, combining each package's internal files into a single module. The results are cached in `node_modules/.vite/deps/`.
+When the dev server starts, Vite scans your imports and detects that `react` and `react-dom/client` need to be pre-bundled. It runs Rolldown to convert them from CommonJS (React's default format) to ESM, combining each package's internal files into a single module. The results are cached in `node_modules/.vite/deps/`.
 
 Look at the Network tab paths: the pre-bundled dependencies are served from `/node_modules/.vite/deps/`, not from the original `node_modules/react/` directory. They have a content hash in their cache headers, so the browser caches them aggressively. On subsequent page loads, the browser fetches them from its HTTP cache without contacting the dev server.
 
@@ -242,7 +242,7 @@ const x: number = "this is a string"  // Type error!
 
 Save the file. The browser still updates — Vite happily strips the types and serves the code. The type error only surfaces if you run `npx tsc --noEmit` separately, or if your editor's TypeScript language server shows it.
 
-This is by design. Vite uses esbuild for TypeScript transformation, and esbuild strips types without checking them. Type checking is a separate, parallel concern. This separation keeps the dev server fast — esbuild transforms TypeScript 10-100x faster than `tsc` because it doesn't do type analysis.
+This is by design. Vite uses Oxc for TypeScript transformation, and Oxc strips types without checking them. Type checking is a separate, parallel concern. This separation keeps the dev server fast — Oxc transforms TypeScript orders of magnitude faster than `tsc` because it doesn't do type analysis.
 
 For a framework author, this means you can't rely on Vite to catch type errors in generated code. If your plugin generates a virtual module with a type error, Vite won't tell you. The `.d.ts` declaration files you generate are for the developer's IDE, not for Vite itself.
 

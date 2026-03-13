@@ -93,7 +93,7 @@ export default defineConfig({
       },
       build: {
         outDir: 'dist/rsc',
-        rollupOptions: {
+        rolldownOptions: {
           input: 'src/entry-rsc.tsx',
         },
       },
@@ -101,7 +101,7 @@ export default defineConfig({
     ssr: {
       build: {
         outDir: 'dist/server',
-        rollupOptions: {
+        rolldownOptions: {
           input: 'src/entry-ssr.tsx',
         },
       },

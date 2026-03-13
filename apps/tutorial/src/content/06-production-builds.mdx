@@ -17,20 +17,20 @@ concepts:
 
 Everything we've built so far runs on the Vite dev server — the on-demand module transformer from Part 0. In development, the browser requests modules individually, and Vite transforms each one on the fly. This is great for DX (instant startup, fast HMR) but terrible for production: hundreds of individual HTTP requests, untransformed source files, no minification, no tree-shaking.
 
-In production, Vite switches to a completely different tool: **Rollup**. Rollup is a bundler that processes the *entire* module graph eagerly and produces optimized output:
+In production, Vite switches to a completely different mode: **Rolldown bundling**. Rolldown is a Rust-based bundler (Rollup-compatible) that processes the *entire* module graph eagerly and produces optimized output:
 
 - **Bundling**: Hundreds of source modules are combined into a handful of chunks, eliminating the HTTP request waterfall.
-- **Tree-shaking**: Rollup analyzes `import`/`export` relationships and removes unused code. If a module exports 10 functions but only 3 are imported, the other 7 are eliminated from the output.
-- **Scope hoisting**: Instead of wrapping each module in a function (like webpack), Rollup concatenates modules into a single scope, reducing overhead and enabling better minification.
+- **Tree-shaking**: Rolldown analyzes `import`/`export` relationships and removes unused code. If a module exports 10 functions but only 3 are imported, the other 7 are eliminated from the output.
+- **Scope hoisting**: Instead of wrapping each module in a function (like webpack), Rolldown concatenates modules into a single scope, reducing overhead and enabling better minification.
 - **Code splitting**: Dynamic `import()` statements (like our `React.lazy(() => import('./Page'))`) create separate chunks that load on demand.
 - **Minification**: Variable names are shortened, whitespace is removed, and dead code is eliminated.
 - **Hashed filenames**: Output files get content-based hashes (`entry-client-a1b2c3d4.js`), enabling indefinite browser caching — when code changes, the hash changes, and the browser fetches the new version.
 
 <Callout type="info" title="Your plugins run in both modes">
-The same `resolveId`/`load`/`transform` hooks that served modules on-demand in development now process them eagerly during Rollup's build. Your route plugin's virtual module is generated the same way — the only difference is *when* it runs (on-demand vs. ahead-of-time) and *what consumes the output* (browser requests vs. Rollup's module graph).
+The same `resolveId`/`load`/`transform` hooks that served modules on-demand in development now process them eagerly during Rolldown's build. Your route plugin's virtual module is generated the same way — the only difference is *when* it runs (on-demand vs. ahead-of-time) and *what consumes the output* (browser requests vs. Rolldown's module graph).
 </Callout>
 
-For a server-rendered framework, we need **two** Rollup builds — one for the client (browser-targeted, code-split, hashed) and one for the server (Node-targeted, single-file, unhashed). These are connected by a manifest file.
+For a server-rendered framework, we need **two** Rolldown builds — one for the client (browser-targeted, code-split, hashed) and one for the server (Node-targeted, single-file, unhashed). These are connected by a manifest file.
 
 ---
 
@@ -45,7 +45,7 @@ export default defineConfig({
   plugins: [react(), eigenRoutes()],
   build: {
     manifest: true,
-    rollupOptions: {
+    rolldownOptions: {
       input: 'src/entry-client.tsx',
     },
   },
@@ -64,7 +64,7 @@ export default defineConfig({
 }
 ```
 
-**`rollupOptions.input`** sets the entry point for the client build. Without this, Vite defaults to `index.html` and its `<script>` tags.
+**`rolldownOptions.input`** sets the entry point for the client build. Without this, Vite defaults to `index.html` and its `<script>` tags.
 
 ### Build commands
 
@@ -119,7 +119,7 @@ After `vite build --outDir dist/client`, the manifest at `dist/client/.vite/mani
 
 The manifest tells the production server:
 - The client entry compiled to `assets/entry-client-a1b2c3d4.js`
-- Each page compiled to its own chunk (because we used `React.lazy(() => import(...))` in the client virtual module, Rollup produced separate chunks)
+- Each page compiled to its own chunk (because we used `React.lazy(() => import(...))` in the client virtual module, Rolldown produced separate chunks)
 - The CSS extracted to `assets/style-e5f6g7h8.css`
 - Vendor code (React, etc.) is in a shared `_vendor-i9j0k1l2.js` chunk
 

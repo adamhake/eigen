@@ -558,7 +558,7 @@ The architectural difference is cosmetic. Both approaches need a `transform` hoo
 
 In development, the RPC endpoint lives in `configureServer` middleware. In production, the framework needs to generate actual endpoint handlers.
 
-The `generateBundle` Rollup hook runs during the client build and can output additional files:
+The `generateBundle` hook runs during the client build and can output additional files:
 
 ```typescript
 // In the plugin, add to the client build:
@@ -765,4 +765,4 @@ The ID stability test is critical — if IDs change between server and client bu
 
 ## What's next
 
-In Part 16, we'll add **static site generation** — using the `generateBundle` Rollup hook to pre-render pages at build time, with a typed `generateStaticParams` convention for dynamic routes.
+In Part 16, we'll add **static site generation** — using the `generateBundle` hook to pre-render pages at build time, with a typed `generateStaticParams` convention for dynamic routes.

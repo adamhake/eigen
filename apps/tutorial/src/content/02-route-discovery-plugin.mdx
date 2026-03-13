@@ -225,10 +225,13 @@ export default function eigenRoutes(): Plugin {
             `  { path: '${r.path}', component: Page${i}, loader: typeof loader${i} !== 'undefined' ? loader${i} : undefined }`
           ).join(',\n')
 
-          return `
+          return {
+            code: `
 ${imports}
 export const routes = [\n${routeArray}\n]
-          `.trim()
+            `.trim(),
+            moduleType: 'js',
+          }
         } else {
           // Client: lazy imports for code splitting, no loaders
           const imports = routes.map((r, i) =>
@@ -239,11 +242,14 @@ export const routes = [\n${routeArray}\n]
             `  { path: '${r.path}', component: Page${i} }`
           ).join(',\n')
 
-          return `
+          return {
+            code: `
 import React from 'react'
 ${imports}
 export const routes = [\n${routeArray}\n]
-          `.trim()
+            `.trim(),
+            moduleType: 'js',
+          }
         }
       }
     },

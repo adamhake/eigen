@@ -519,7 +519,7 @@ Adapters do more than copy files around. They also:
 
 **Generate routing configuration.** Netlify needs `_redirects`. Vercel needs `config.json` with route rules. Cloudflare needs `_routes.json`. The adapter reads the route tree and generates the platform's routing format.
 
-**Bundle server dependencies.** Serverless functions need their dependencies bundled (no `node_modules` on the platform). The adapter may run a secondary bundling step with esbuild to produce a self-contained function.
+**Bundle server dependencies.** Serverless functions need their dependencies bundled (no `node_modules` on the platform). The adapter may run a secondary bundling step (e.g. with Rolldown or esbuild) to produce a self-contained function.
 
 **Configure headers and caching.** Each platform has its own mechanism for setting `Cache-Control`, security headers, and CORS rules. The adapter generates the platform-specific config.
 

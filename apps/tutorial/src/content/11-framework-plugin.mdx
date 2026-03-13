@@ -63,8 +63,8 @@ export default function eigen(options: EigenOptions = {}): Plugin[] {
         return {
           build: {
             manifest: true,
-            rollupOptions: {
-              input: userConfig.build?.rollupOptions?.input
+            rolldownOptions: {
+              input: userConfig.build?.rolldownOptions?.input
                 ?? 'src/entry-client.tsx',
             },
           },
@@ -72,7 +72,7 @@ export default function eigen(options: EigenOptions = {}): Plugin[] {
             ssr: {
               build: {
                 outDir: 'dist/server',
-                rollupOptions: {
+                rolldownOptions: {
                   input: 'src/entry-server.tsx',
                 },
               },
@@ -100,11 +100,11 @@ The framework's `config` hook sets sensible defaults:
 - **`input: 'src/entry-client.tsx'`** — Set the client entry point (overridable by the user)
 - **`environments.ssr`** — Configure the SSR build with its own output directory and entry point
 
-These defaults can be overridden by the user's config. Vite merges configs with a deep merge strategy, so the user can override `build.rollupOptions.input` without losing the `manifest: true` setting.
+These defaults can be overridden by the user's config. Vite merges configs with a deep merge strategy, so the user can override `build.rolldownOptions.input` without losing the `manifest: true` setting.
 
 <TypeDeepDive title="Concept: Deep merge vs. shallow merge">
 
-A shallow merge (`Object.assign` or `{ ...a, ...b }`) only merges top-level properties — if both objects have a `build` key, `b.build` completely replaces `a.build`. A deep merge recurses into nested objects, so `a.build.manifest` and `b.build.rollupOptions` both survive. Vite uses deep merge for plugin configs, which is why a framework can set `manifest: true` and the user can set `rollupOptions.input` without either overwriting the other. Arrays are typically replaced, not concatenated — so if two plugins both set `build.rollupOptions.external`, the last one wins.
+A shallow merge (`Object.assign` or `{ ...a, ...b }`) only merges top-level properties — if both objects have a `build` key, `b.build` completely replaces `a.build`. A deep merge recurses into nested objects, so `a.build.manifest` and `b.build.rolldownOptions` both survive. Vite uses deep merge for plugin configs, which is why a framework can set `manifest: true` and the user can set `rolldownOptions.input` without either overwriting the other. Arrays are typically replaced, not concatenated — so if two plugins both set `build.rolldownOptions.external`, the last one wins.
 
 </TypeDeepDive>
 
@@ -121,7 +121,7 @@ buildApp: {
   order: 'pre' as const,
   async handler(builder) {
     // builder.environments contains all configured environments
-    // Each has its own build config (outDir, rollupOptions, etc.)
+    // Each has its own build config (outDir, rolldownOptions, etc.)
 
     // Build client first — generates manifest.json
     await builder.build(builder.environments.client)
@@ -133,7 +133,7 @@ buildApp: {
 }
 ```
 
-The handler receives a `builder` object with `builder.environments` — a record of all configured environments. Each environment carries its own build configuration (output directory, Rollup options, resolve conditions). The framework decides the order: client first (generates the manifest), server second (can reference the manifest).
+The handler receives a `builder` object with `builder.environments` — a record of all configured environments. Each environment carries its own build configuration (output directory, Rolldown options, resolve conditions). The framework decides the order: client first (generates the manifest), server second (can reference the manifest).
 
 The `order: 'pre'` ensures this handler runs before any other `buildApp` handlers. If a deployment adapter (like `@netlify/vite-plugin-tanstack-start`) also defines a `buildApp` hook with `order: 'post'`, it runs after the framework's builds complete — the adapter can post-process the build output into platform-specific artifacts.
 

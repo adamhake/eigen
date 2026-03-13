@@ -1,9 +1,9 @@
 ---
 title: "The Eigen Series"
-description: "A 36-part tutorial building a fully-featured React meta-framework from scratch using Vite's plugin API."
+description: "A 40-part tutorial building a fully-featured React meta-framework from scratch using Vite's plugin API."
 ---
 
-The Eigen Series is a 36-part tutorial where you build a fully-featured React meta-framework from scratch using [Vite's](https://vite.dev/) plugin API. By the end, you won't just know *how* to use frameworks like [Next.js](https://nextjs.org/) and [TanStack Start](https://tanstack.com/start) — you'll understand how they work, why they make the architectural decisions they do, and how to build your own.
+The Eigen Series is a 40-part tutorial where you build a fully-featured React meta-framework from scratch using [Vite's](https://vite.dev/) plugin API. By the end, you won't just know *how* to use frameworks like [Next.js](https://nextjs.org/) and [TanStack Start](https://tanstack.com/start) — you'll understand how they work, why they make the architectural decisions they do, and how to build your own.
 
 ## Why build a framework?
 
@@ -36,7 +36,7 @@ React Server Components, `"use cache"`, Partial Prerendering, AI streaming, View
 <Step>
 ### Deep Dives
 
-Self-contained modules on auth, SEO, images, data fetching, and error handling. Can be read independently after Phase I.
+Self-contained modules on auth, SEO, images, data fetching, error handling, CSS, forms, DX tooling, and publishing. Can be read independently after Phase I.
 </Step>
 </Steps>
 
@@ -58,7 +58,7 @@ By the end of this phase, you'll have a complete framework: file-based routing w
 
 | Part | Title | What you learn |
 |---|---|---|
-| 0 | **The Mental Model** | Vite's duality (dev server vs. Rollup build), the plugin pipeline (`resolveId` → `load` → `transform`), virtual modules, the Environment API, friendly imports vs. `virtual:` prefix |
+| 0 | **The Mental Model** | Vite's duality (dev server vs. Rolldown build), the plugin pipeline (`resolveId` → `load` → `transform`), virtual modules, the Environment API, friendly imports vs. `virtual:` prefix |
 | 1 | **A Bare Vite SPA** | Project setup, TypeScript configuration (`tsconfig.json` vs. `tsconfig.node.json`), the dev server, `index.html` as entry point, dependency pre-bundling, HMR basics |
 | 2 | **File-Based Route Discovery** | Writing a Vite plugin, `resolveId`/`load` for virtual modules, scanning the filesystem, generating TypeScript declarations (`.d.ts`), the `RouteParams` template literal type, type-safe `Link` component |
 | 3 | **Server-Side Rendering** | `ssrLoadModule`, `createServer` programmatic API, Express middleware mode, `transformIndexHtml`, dual module graphs (client vs. SSR), typing `ssrLoadModule` results |
@@ -126,3 +126,7 @@ These modules go deep on specific concerns. Each is self-contained and can be re
 | 34 | **Data Fetching Strategy** | Request deduplication, parallel loader execution, TanStack Query integration (`prefetchQuery` → `dehydrate` → `HydrationBoundary`), isomorphic fetch, prefetching |
 | 35 | **Error Boundaries & Loading States** | Route-scoped error boundaries, typed `ErrorBoundaryProps<'/path'>`, loader vs. render errors, `retryLoader()`, `loading.tsx` convention, pending UI with `useTransition` |
 | 36 | **Testing Your Framework** | Vitest setup, the testing pyramid (unit → plugin → integration → E2E), snapshot-testing transforms, testing with `ssrLoadModule`, serialization boundary tests, the test-as-documentation pattern |
+| 37 | **CSS & Styling Pipeline** | Critical CSS extraction during SSR, CSS Modules with type-safe `.d.ts` generation, Tailwind CSS v4 integration, CSS-in-JS trade-offs with streaming SSR and RSC, the `eigen/styles` virtual module |
+| 38 | **Forms & Mutations** | Progressive enhancement with `<form action={serverFn}>`, `useServerFn` hook, optimistic UI with `useOptimistic`, shared zod validation schemas, cache revalidation after mutations |
+| 39 | **Developer Experience & CLI** | `create-eigen` scaffolding CLI, AST-based code generation with `magicast`, `eslint-plugin-eigen` custom rules, TypeScript language service plugin for route autocomplete, framework diagnostics in the dev overlay |
+| 40 | **Monorepo & Package Publishing** | Converting path aliases to pnpm workspaces, `tsup` library builds with subpath exports, Turborepo task orchestration, `@changesets/cli` versioning, npm publishing with provenance, GitHub Actions release workflow |

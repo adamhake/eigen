@@ -1,0 +1,592 @@
+---
+title: "Part 40: Monorepo & Package Publishing"
+description: "Converting path aliases to pnpm workspaces, building with tsup, Turborepo orchestration, changesets versioning, and publishing to npm."
+concepts:
+  - "pnpm workspaces"
+  - "tsup library builds"
+  - "Turborepo task orchestration"
+  - "changeset-based versioning"
+  - "npm publishing with provenance"
+---
+
+
+*The monorepo was hiding in plain sight — `packages/eigen/` with TypeScript path aliases was always a workspace waiting to be formalized. This module converts the tutorial's project structure into a real monorepo, builds the library for distribution, and publishes it to npm. Prerequisites: [Part 6](/06-production-builds) (production builds), [Part 11](/11-framework-plugin) (framework plugin), [Part 39](/39-developer-experience-cli) (DX & CLI).*
+
+---
+
+## From path aliases to workspaces
+
+Since [Part 1](/01-bare-vite-spa), the tutorial has used TypeScript path aliases to import framework code:
+
+```json title="tsconfig.json (the original setup)"
+{
+  "compilerOptions": {
+    "paths": {
+      "eigen/*": ["./packages/eigen/src/*"]
+    }
+  }
+}
+```
+
+This worked because Vite 8 resolves `tsconfig.json` paths natively — it reads the `paths` field and maps imports to the local filesystem without any extra plugin. But path aliases are a development-time convenience — they don't map to how packages are consumed after publishing. A real monorepo replaces path aliases with proper package resolution.
+
+### Step 1: Add `pnpm-workspace.yaml`
+
+```yaml title="pnpm-workspace.yaml"
+packages:
+  - 'packages/*'
+  - 'apps/*'
+```
+
+### Step 2: Add per-package `package.json`
+
+```json title="packages/eigen/package.json"
+{
+  "name": "eigen",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    "./plugin": "./src/plugin.ts",
+    "./router": "./src/router.ts",
+    "./server": "./src/server.ts",
+    "./client": "./src/client.ts",
+    "./helpers": "./src/helpers.ts",
+    "./styles": "./src/styles.ts",
+    "./cache": "./src/cache.ts",
+    "./types": "./src/types.ts"
+  }
+}
+```
+
+### Step 3: Replace path aliases with workspace protocol
+
+Update the app's `package.json` to reference the workspace package:
+
+```json title="apps/demo/package.json"
+{
+  "name": "eigen-demo",
+  "dependencies": {
+    "eigen": "workspace:*",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  }
+}
+```
+
+Now `import { eigen } from 'eigen/plugin'` resolves through Node's package resolution — the same way it will work for end users after publishing.
+
+### The migration bridge
+
+During migration, Vite 8's native tsconfig path resolution serves as an automatic fallback. Vite checks package exports first, then falls back to tsconfig `paths` — so you can migrate imports incrementally without breaking anything. Once all imports use the package exports map, the tsconfig `paths` entry can be removed entirely.
+
+<Callout type="info" title="Why workspaces over path aliases?">
+Path aliases let you import code as if it were a package, but they don't validate the `exports` map, don't test package resolution, and don't catch missing dependencies. With workspaces, you're developing against the same resolution strategy your users will experience.
+</Callout>
+
+---
+
+## Monorepo anatomy
+
+After the conversion, the project looks like this:
+
+```
+eigen/
+  pnpm-workspace.yaml
+  turbo.json
+  tsconfig.base.json               # Shared compiler options
+  package.json                      # Root: dev deps, scripts
+  packages/
+    eigen/                          # Core framework
+      src/
+        plugin.ts                   # eigen() Vite plugin
+        router.ts                   # Client-side router
+        server.ts                   # Server functions runtime
+        client.ts                   # Client hooks (useServerFn, etc.)
+        helpers.ts                  # defineLoader, defineMiddleware
+        styles.ts                   # eigen/styles virtual module
+        cache.ts                    # "use cache" runtime
+        types.ts                    # Public type exports
+        plugins/                    # Individual Vite plugins
+        entry-server.ts
+        entry-client.ts
+      package.json
+      tsconfig.json
+    create-eigen/                   # Scaffolding CLI (Part 39)
+      src/
+        index.ts
+      templates/
+      package.json
+    eslint-plugin-eigen/            # ESLint rules (Part 39)
+      src/
+        index.ts
+        rules/
+      package.json
+  apps/
+    demo/                           # Example application
+      src/
+        pages/
+      vite.config.ts
+      package.json
+```
+
+### Shared TypeScript config
+
+```json title="tsconfig.base.json"
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true
+  }
+}
+```
+
+Each package extends it:
+
+```json title="packages/eigen/tsconfig.json"
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "./dist",
+    "rootDir": "./src"
+  },
+  "include": ["src"]
+}
+```
+
+---
+
+## Build pipeline with `tsup`
+
+The demo app uses Vite (with Rolldown) to bundle the application. But `packages/eigen` is a **library** — it needs to be compiled to ESM with TypeScript declarations so other projects can consume it. `tsup` handles this.
+
+### Why not Rolldown for the library?
+
+Rolldown is an application bundler — it resolves and bundles everything into a single output. A library should **not** bundle its dependencies (React, Vite, etc.) — it declares them as `peerDependencies` and lets the consuming app resolve them. `tsup` (powered by esbuild) compiles TypeScript to JavaScript and emits `.d.ts` files without bundling dependencies.
+
+### `tsup` configuration
+
+```typescript title="packages/eigen/tsup.config.ts"
+import { defineConfig } from 'tsup'
+
+export default defineConfig({
+  entry: {
+    plugin: 'src/plugin.ts',
+    router: 'src/router.ts',
+    server: 'src/server.ts',
+    client: 'src/client.ts',
+    helpers: 'src/helpers.ts',
+    styles: 'src/styles.ts',
+    cache: 'src/cache.ts',
+    types: 'src/types.ts',
+  },
+  format: ['esm'],
+  dts: true,           // Generate .d.ts files
+  splitting: true,     // Code-split shared code between entries
+  clean: true,         // Clean dist/ before build
+  external: [
+    'react',
+    'react-dom',
+    'vite',
+  ],
+})
+```
+
+### The `exports` map (production)
+
+After building, update `package.json` to point to compiled output:
+
+```json title="packages/eigen/package.json"
+{
+  "name": "eigen",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    "./plugin": {
+      "import": "./dist/plugin.js",
+      "types": "./dist/plugin.d.ts"
+    },
+    "./router": {
+      "import": "./dist/router.js",
+      "types": "./dist/router.d.ts"
+    },
+    "./server": {
+      "import": "./dist/server.js",
+      "types": "./dist/server.d.ts"
+    },
+    "./client": {
+      "import": "./dist/client.js",
+      "types": "./dist/client.d.ts"
+    },
+    "./helpers": {
+      "import": "./dist/helpers.js",
+      "types": "./dist/helpers.d.ts"
+    },
+    "./styles": {
+      "import": "./dist/styles.js",
+      "types": "./dist/styles.d.ts"
+    },
+    "./cache": {
+      "import": "./dist/cache.js",
+      "types": "./dist/cache.d.ts"
+    },
+    "./types": {
+      "types": "./dist/types.d.ts"
+    }
+  },
+  "files": ["dist"],
+  "peerDependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "vite": "^8.0.0"
+  }
+}
+```
+
+<Callout type="warning" title="Development vs. production exports">
+During development (in the monorepo), `exports` point to `./src/*.ts` so you get live TypeScript without a build step. For publishing, they point to `./dist/*.js` with `.d.ts` types. You can use the `publishConfig` field or a `prepublishOnly` script to swap them before publishing.
+</Callout>
+
+---
+
+## Turborepo orchestration
+
+With multiple packages, you need a task runner that understands the dependency graph — building `eigen` before `create-eigen`, type-checking everything in parallel, caching results.
+
+### Setup
+
+```bash
+pnpm add -Dw turbo
+```
+
+```json title="turbo.json"
+{
+  "$schema": "https://turbo.build/schema.json",
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**"]
+    },
+    "typecheck": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "test": {
+      "dependsOn": ["build"],
+      "outputs": []
+    },
+    "lint": {
+      "outputs": []
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+    }
+  }
+}
+```
+
+### How the dependency graph works
+
+```
+turbo run build
+
+  1. packages/eigen        → tsup (no deps on other packages)
+  2. packages/eslint-plugin-eigen → tsup (no deps)
+     packages/create-eigen → tsup (no deps)
+  3. apps/demo             → vite build (depends on packages/eigen)
+```
+
+`"dependsOn": ["^build"]` means "build my workspace dependencies first." Turbo figures out the order automatically from `package.json` dependencies.
+
+### Local and remote caching
+
+Turbo caches task outputs. If `packages/eigen/src/` hasn't changed since the last build, `turbo run build` skips it entirely:
+
+```
+$ turbo run build
+ packages/eigen:build: cache hit, replaying logs
+ packages/create-eigen:build: cache hit, replaying logs
+ apps/demo:build: cache miss, running...
+```
+
+For CI, enable remote caching so builds are shared across machines:
+
+```json title="turbo.json"
+{
+  "remoteCache": {
+    "signature": true
+  }
+}
+```
+
+### Root scripts
+
+```json title="package.json (root)"
+{
+  "scripts": {
+    "build": "turbo run build",
+    "typecheck": "turbo run typecheck",
+    "test": "turbo run test",
+    "lint": "turbo run lint",
+    "dev": "turbo run dev --filter=apps/demo"
+  }
+}
+```
+
+---
+
+## Versioning with changesets
+
+`@changesets/cli` manages semver versioning across packages — it tracks what changed, bumps versions, generates changelogs, and coordinates multi-package releases.
+
+### Setup
+
+```bash
+pnpm add -Dw @changesets/cli && pnpm changeset init
+```
+
+This creates a `.changeset/` directory with a config file:
+
+```json title=".changeset/config.json"
+{
+  "$schema": "https://github.com/changesets/changesets/blob/main/packages/config/schema.json",
+  "changelog": "@changesets/cli/changelog",
+  "commit": false,
+  "fixed": [],
+  "linked": [["eigen", "create-eigen", "eslint-plugin-eigen"]],
+  "access": "public",
+  "baseBranch": "main",
+  "updateInternalDependencies": "patch"
+}
+```
+
+The `"linked"` field means all three packages version together — when `eigen` gets a minor bump, so do `create-eigen` and `eslint-plugin-eigen`.
+
+### The changeset workflow
+
+**During development** — when you make a change worth noting:
+
+```bash
+pnpm changeset
+```
+
+This prompts:
+1. Which packages changed? → `eigen`
+2. Semver bump? → `minor` (new feature)
+3. Summary? → "Add CSS Modules type generation"
+
+It creates a markdown file in `.changeset/`:
+
+```markdown title=".changeset/cool-lions-dance.md"
+---
+"eigen": minor
+---
+
+Add CSS Modules type generation
+```
+
+**At release time:**
+
+```bash
+# Consume changesets: bump versions, update changelogs
+pnpm changeset version
+
+# Review the changes
+git diff
+
+# Commit and publish
+git add -A && git commit -m "chore: release v0.2.0"
+pnpm changeset publish
+```
+
+`changeset version` reads all pending changeset files, determines the highest bump for each package, updates `package.json` versions, and writes `CHANGELOG.md` entries. `changeset publish` runs `npm publish` for each package that changed.
+
+---
+
+## Publishing to npm
+
+### Pre-publish checks
+
+Add a `prepublishOnly` script that runs the full validation pipeline:
+
+```json title="packages/eigen/package.json"
+{
+  "scripts": {
+    "build": "tsup",
+    "prepublishOnly": "pnpm run build && pnpm run typecheck"
+  }
+}
+```
+
+### Dry-run verification
+
+Always dry-run before publishing:
+
+```bash
+cd packages/eigen && npm publish --dry-run
+```
+
+This shows exactly what files will be published and the package size. Check for:
+- No `src/` directory (only `dist/` should ship)
+- No test files or fixtures
+- No `.env` or credentials
+- Reasonable package size
+
+### Publishing with provenance
+
+npm provenance links a published package to its source repository and CI build — proving the package was built from the claimed source code:
+
+```bash
+npm publish --provenance
+```
+
+This requires publishing from a CI environment (GitHub Actions, GitLab CI) with OIDC configured.
+
+### Scoped vs. unscoped
+
+| | Scoped (`@eigen/core`) | Unscoped (`eigen`) |
+|---|---|---|
+| **Availability** | Always available (scoped to your org) | Must be unique globally |
+| **Import style** | `import { eigen } from '@eigen/core/plugin'` | `import { eigen } from 'eigen/plugin'` |
+| **npm access** | `--access public` required for public packages | Public by default |
+
+For a framework, unscoped is typical (Next.js is `next`, not `@vercel/next`). For a company or org, scoped prevents naming conflicts.
+
+---
+
+## GitHub Actions release workflow
+
+Automate the release process with a GitHub Actions workflow:
+
+```yaml title=".github/workflows/release.yml"
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  id-token: write    # Required for npm provenance
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm turbo run build typecheck test lint
+
+      - name: Create release PR or publish
+        uses: changesets/action@v1
+        with:
+          publish: pnpm changeset publish
+          version: pnpm changeset version
+          commit: 'chore: release'
+          title: 'chore: release'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+```
+
+This workflow:
+1. Runs the full build/typecheck/test/lint pipeline
+2. If there are pending changesets → creates a "Release" PR that bumps versions and updates changelogs
+3. When that PR is merged → publishes the updated packages to npm
+
+---
+
+## Consuming the published framework
+
+After publishing, this is what an end user's project looks like:
+
+```bash
+npm create eigen my-app
+cd my-app
+npm install
+npm run dev
+```
+
+Their `package.json`:
+
+```json title="package.json"
+{
+  "name": "my-app",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "eigen": "^0.2.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "vite": "^8.0.0",
+    "typescript": "^5.7.0",
+    "eslint-plugin-eigen": "^0.2.0"
+  }
+}
+```
+
+Their `vite.config.ts`:
+
+```typescript title="vite.config.ts"
+import { defineConfig } from 'vite'
+import { eigen } from 'eigen/plugin'
+
+export default defineConfig({
+  plugins: [
+    eigen({
+      // All the defaults are sensible — configure only what you need
+      deploy: 'node',
+    }),
+  ],
+})
+```
+
+That's it. One import, one function call, and they have file-based routing, SSR, server functions, streaming, typed loaders, CSS extraction, and everything else built across 40 parts of this series.
+
+---
+
+## The final layout
+
+```
+Published packages:
+  ├── eigen               → Core framework (Vite plugin + runtime)
+  ├── create-eigen        → npm create eigen scaffolding CLI
+  └── eslint-plugin-eigen → Framework-specific lint rules
+
+End user installs:
+  npm install eigen
+  npm install -D eslint-plugin-eigen
+
+End user creates project:
+  npm create eigen my-app
+```
+
+---
+
+## Key insight
+
+The monorepo was hiding in plain sight. From [Part 1](/01-bare-vite-spa), `packages/eigen/` with TypeScript path aliases was a workspace waiting to be formalized. The conversion is mechanical — add `pnpm-workspace.yaml`, give each package a `package.json` with `exports`, replace path aliases with the workspace protocol. Publishing is the natural conclusion: `tsup` compiles the library, `changesets` manages versions, and `npm publish` makes it real. The loop is closed — you built a framework from scratch, and now anyone can `npm install` it.
+
+**This concludes the Eigen Series.** Over 40 parts, you've built a fully-featured React meta-framework on top of Vite's plugin API — from a bare SPA through SSR, streaming, server functions, React Server Components, and every modern web feature in between. The framework isn't magic anymore. It's just code generation, coordinated by plugins.

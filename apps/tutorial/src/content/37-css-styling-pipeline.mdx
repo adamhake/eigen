@@ -1,0 +1,484 @@
+---
+title: "Part 37: CSS & Styling Pipeline"
+description: "Critical CSS extraction during SSR, CSS Modules with type safety, Tailwind CSS v4 integration, and CSS-in-JS trade-offs in a streaming world."
+concepts:
+  - "critical CSS extraction"
+  - "CSS Modules type generation"
+  - "Tailwind CSS v4 integration"
+  - "CSS-in-JS and streaming SSR"
+  - "virtual style modules"
+---
+
+
+*This module explores how a framework handles CSS — from what Vite 8 gives you for free, through critical CSS extraction during SSR, to the hard trade-offs around CSS-in-JS in a streaming world. Prerequisites: [Part 3](/03-server-side-rendering) (SSR), [Part 7](/07-transform-hook) (transform hook), [Part 12](/12-streaming-ssr) (streaming SSR).*
+
+---
+
+## What Vite 8 gives you for free
+
+Before writing any framework code, understand what Vite 8's build pipeline already handles:
+
+**CSS Modules** — Any `.module.css` file is automatically scoped. Vite generates hashed class names and provides the name mapping as a default export.
+
+**PostCSS** — If a `postcss.config.js` exists, Vite runs it. Autoprefixer, nesting, custom media queries — all handled.
+
+**Preprocessors** — Sass, Less, and Stylus work out of the box with the corresponding package installed. No plugin needed.
+
+**Lightning CSS** — Vite 8 uses Lightning CSS for minification and CSS transforms by default. It handles nesting, custom media, color functions, and vendor prefixing in a single pass — faster than PostCSS for most use cases.
+
+```typescript title="vite.config.ts"
+import { defineConfig } from 'vite'
+
+export default defineConfig({
+  css: {
+    // Lightning CSS is the default minifier in Vite 8
+    // You can configure targets for vendor prefixing
+    lightningcss: {
+      targets: { chrome: 100, firefox: 100, safari: 15 },
+    },
+    // CSS Modules configuration
+    modules: {
+      localsConvention: 'camelCaseOnly',
+    },
+  },
+})
+```
+
+<Callout type="info" title="What the framework doesn't need to build">
+A common mistake in framework development is re-implementing what the bundler already provides. Vite 8 handles CSS parsing, scoping, preprocessing, and minification. The framework's job is narrower: extracting critical CSS during SSR, providing type safety for CSS Modules, and offering sensible defaults.
+</Callout>
+
+The framework adds value in the places where build tooling ends and runtime behavior begins — specifically, the SSR render cycle.
+
+---
+
+## Critical CSS extraction
+
+When Vite builds a production app, it emits a **manifest** that maps each module to its CSS dependencies. During SSR, the framework uses this manifest to figure out which stylesheets a given page needs, then inlines the critical ones in the `<head>` — so the page renders styled on first paint.
+
+### The SSR manifest
+
+After a client build, Vite writes an `ssr-manifest.json` that maps module URLs to their asset dependencies:
+
+```json title="dist/client/.vite/ssr-manifest.json"
+{
+  "src/pages/Home.tsx": [
+    "/assets/Home-a1b2c3.css"
+  ],
+  "src/pages/Dashboard.tsx": [
+    "/assets/Dashboard-d4e5f6.css",
+    "/assets/shared-789abc.css"
+  ]
+}
+```
+
+### Collecting styles during render
+
+During SSR, the framework tracks which modules were rendered. React 18's `renderToPipeableStream` accepts an `onShellReady` callback — by that point, the framework knows every component that contributed to the shell.
+
+```typescript title="packages/eigen/src/entry-server.ts"
+import { renderToPipeableStream } from 'react-dom/server'
+import type { ViteManifest } from './types'
+
+interface RenderOptions {
+  url: string
+  manifest: ViteManifest
+  template: string
+}
+
+export async function render({ url, manifest, template }: RenderOptions) {
+  const modules = new Set<string>()
+
+  // Track which modules are imported during render
+  const { pipe } = renderToPipeableStream(
+    <App url={url} />,
+    {
+      onShellReady() {
+        // Collect CSS for all rendered modules
+        const cssLinks = collectCss(modules, manifest)
+        // Inject into <head>
+        const html = template.replace(
+          '<!--ssr-css-->',
+          cssLinks,
+        )
+      },
+    },
+  )
+}
+
+function collectCss(
+  modules: Set<string>,
+  manifest: ViteManifest,
+): string {
+  const seen = new Set<string>()
+  let css = ''
+
+  for (const mod of modules) {
+    const assets = manifest[mod] ?? []
+    for (const asset of assets) {
+      if (asset.endsWith('.css') && !seen.has(asset)) {
+        seen.add(asset)
+        css += `<link rel="stylesheet" href="${asset}">\n`
+      }
+    }
+  }
+
+  return css
+}
+```
+
+### Inlining vs. linking
+
+For maximum performance, you can **inline** critical CSS directly in a `<style>` tag instead of linking to external files. This eliminates the round-trip for the stylesheet but increases the HTML payload size:
+
+```typescript title="packages/eigen/src/css.ts"
+import { readFile } from 'node:fs/promises'
+import { resolve } from 'node:path'
+
+export async function inlineCriticalCss(
+  cssFiles: string[],
+  distDir: string,
+): Promise<string> {
+  const contents = await Promise.all(
+    cssFiles.map(file =>
+      readFile(resolve(distDir, file.slice(1)), 'utf-8'),
+    ),
+  )
+
+  // Inline critical styles, lazy-load full stylesheets
+  const inlined = `<style>${contents.join('\n')}</style>`
+  // Lazy-load full stylesheets — note that inline `onload` handlers
+  // may be blocked by strict Content Security Policies. In production,
+  // consider using a small loader script with a nonce instead.
+  const preloads = cssFiles.map(
+    file =>
+      `<link rel="preload" href="${file}" as="style" onload="this.rel='stylesheet'">`
+  ).join('\n')
+
+  return inlined + '\n' + preloads
+}
+```
+
+<Callout type="tip" title="When to inline vs. link">
+Inline CSS for the initial shell (above the fold). Link external stylesheets for lazily-loaded routes. The manifest gives you the information to make this decision per-route — shell components get inlined, dynamic imports get preload hints.
+</Callout>
+
+### Using `transformIndexHtml`
+
+The framework plugin can also inject CSS using Vite's `transformIndexHtml` hook during development, ensuring the dev experience matches production:
+
+```typescript title="packages/eigen/src/plugin.ts"
+function eigenCssPlugin(): Plugin {
+  return {
+    name: 'eigen:css',
+    transformIndexHtml(html, ctx) {
+      // In dev, Vite injects CSS via HMR — but we still add
+      // preload hints for route-level stylesheets
+      const tags = ctx.server
+        ? [] // Dev: Vite handles CSS injection
+        : collectCssTagsForRoute(ctx.path)
+
+      return {
+        html,
+        tags: tags.map(href => ({
+          tag: 'link',
+          attrs: { rel: 'stylesheet', href },
+          injectTo: 'head',
+        })),
+      }
+    },
+  }
+}
+```
+
+---
+
+## CSS Modules with type safety
+
+CSS Modules give you scoped class names, but by default they're typed as `Record<string, string>` — you lose autocomplete and catch typos only at runtime.
+
+### Generating `.d.ts` files for CSS Modules
+
+A `transform` hook can generate TypeScript declarations for CSS Modules alongside the existing CSS Module output:
+
+```typescript title="packages/eigen/src/plugins/css-types.ts"
+import type { Plugin } from 'vite'
+import { writeFile, mkdir } from 'node:fs/promises'
+import { dirname, resolve } from 'node:path'
+
+export function eigenCssTypesPlugin(): Plugin {
+  return {
+    name: 'eigen:css-types',
+
+    async transform(code, id) {
+      // Only process CSS Modules
+      if (!id.endsWith('.module.css')) return null
+
+      // Parse the CSS Module's exported class names
+      // Vite has already processed the CSS Module at this point —
+      // the code contains the class name mapping as a JS export
+      const classNames = extractClassNames(code)
+
+      // Generate a .d.ts file next to the CSS file
+      const dtsPath = `${id}.d.ts`
+      const dtsContent = generateDts(classNames)
+      await mkdir(dirname(dtsPath), { recursive: true })
+      await writeFile(dtsPath, dtsContent)
+
+      return null // Don't modify the code, just generate types
+    },
+  }
+}
+
+function extractClassNames(code: string): string[] {
+  // CSS Module JS output contains: export default { "className": "hash" }
+  const matches = code.matchAll(/"([a-zA-Z][\w-]*)"\s*:/g)
+  return [...matches].map(m => m[1])
+}
+
+function generateDts(classNames: string[]): string {
+  const props = classNames.map(
+    name => `  readonly ${name}: string`
+  ).join('\n')
+
+  return `declare const styles: {\n${props}\n}\nexport default styles\n`
+}
+```
+
+Now your imports are fully typed:
+
+```tsx title="src/pages/Dashboard.tsx"
+import styles from './Dashboard.module.css'
+
+export default function Dashboard() {
+  return (
+    // ✅ TypeScript knows about .container and .header
+    <div className={styles.container}>
+      <h1 className={styles.header}>Dashboard</h1>
+      {/* @ts-expect-error — typo caught at compile time */}
+      <p className={styles.heder}>Subtitle</p>
+    </div>
+  )
+}
+```
+
+<Callout type="warning" title="Regeneration during HMR">
+When a CSS Module changes, the `.d.ts` must be regenerated. Wire this into the `handleHotUpdate` hook (from [Part 9](/09-hmr)) so that saving a `.module.css` file updates the type declarations immediately. Without this, TypeScript will report stale types until a full rebuild.
+</Callout>
+
+---
+
+## Tailwind CSS integration
+
+Tailwind CSS v4 is designed as a Vite-first tool. It ships as a Vite plugin and uses Lightning CSS under the hood — the same engine Vite 8 already uses.
+
+### Basic setup
+
+```bash
+npm install tailwindcss @tailwindcss/vite
+```
+
+```typescript title="vite.config.ts"
+import { defineConfig } from 'vite'
+import tailwindcss from '@tailwindcss/vite'
+import { eigen } from './packages/eigen/src/plugin'
+
+export default defineConfig({
+  plugins: [
+    tailwindcss(),
+    eigen(),
+  ],
+})
+```
+
+```css title="src/app.css"
+@import 'tailwindcss';
+```
+
+That's it. Tailwind v4 auto-discovers your content files — no `content` array needed.
+
+### Framework-level preset
+
+A framework can ship a Tailwind preset that provides design tokens, component classes, and theme configuration:
+
+```typescript title="packages/eigen/tailwind-preset.ts"
+import type { Config } from 'tailwindcss'
+
+export default {
+  theme: {
+    extend: {
+      colors: {
+        primary: {
+          50: '#f0f9ff',
+          500: '#0ea5e9',
+          900: '#0c4a6e',
+        },
+      },
+      fontFamily: {
+        sans: ['Inter', 'system-ui', 'sans-serif'],
+      },
+    },
+  },
+} satisfies Partial<Config>
+```
+
+Users consume it in their CSS:
+
+```css title="src/app.css"
+@import 'tailwindcss';
+@config 'eigen/tailwind-preset';
+```
+
+### Content path conventions
+
+Because Eigen uses file-based routing in `src/pages/`, the framework can establish a convention: Tailwind scans `src/pages/**/*.tsx`, `src/components/**/*.tsx`, and `src/layouts/**/*.tsx` by default. In Tailwind v4, this is automatic — it scans all files imported by your CSS entry point's dependency graph.
+
+---
+
+## CSS-in-JS and RSC
+
+CSS-in-JS libraries like styled-components and Emotion have a fundamental tension with streaming SSR and React Server Components.
+
+### The problem
+
+Traditional CSS-in-JS works by:
+1. Rendering a component
+2. Collecting the generated styles during render
+3. Injecting those styles into the HTML
+
+This **requires** a synchronous, single-pass render — you need to know all the styles *before* you send the HTML. Streaming SSR breaks this: the shell ships immediately, and Suspense boundaries resolve later. By the time a suspended component renders, the `<head>` is already sent.
+
+```typescript title="The timing problem"
+// Shell renders immediately — CSS for <Nav> and <Sidebar> must be in <head>
+// But <PostContent> is suspended — its CSS isn't known yet
+<html>
+  <head>{/* CSS must be here before streaming starts */}</head>
+  <body>
+    <Nav />           {/* ← renders in shell */}
+    <Sidebar />       {/* ← renders in shell */}
+    <Suspense>
+      <PostContent /> {/* ← renders later, streamed in */}
+    </Suspense>
+  </body>
+</html>
+```
+
+### RSC makes it worse
+
+React Server Components run on the server and produce a serializable payload — not HTML. The RSC payload cannot contain runtime JavaScript (which is what CSS-in-JS libraries inject). A Server Component cannot call `styled()` or `css()` because those functions create client-side style sheets.
+
+### Zero-runtime alternatives
+
+The Vite 8 ecosystem favors zero-runtime CSS solutions that extract styles at build time:
+
+| Solution | How it works | Vite 8 compatibility |
+|---|---|---|
+| **CSS Modules** | Scoped class names, extracted at build time | Built-in |
+| **Tailwind CSS v4** | Utility classes, scanned at build time | Vite plugin |
+| **Vanilla Extract** | TypeScript-authored styles, compiled to CSS | Vite plugin |
+| **Panda CSS** | Utility + recipe patterns, extracted at build time | PostCSS plugin |
+| **Lightning CSS** | CSS nesting + custom properties, native transforms | Built into Vite 8 |
+
+These all produce static CSS files — no runtime style injection, no streaming conflicts, no RSC incompatibility.
+
+<Callout type="info" title="The industry trajectory">
+The React ecosystem is moving toward build-time CSS extraction. Next.js deprecated runtime CSS-in-JS support in the App Router. Remix has always favored CSS Modules and Tailwind. Vite 8's architecture — with Rolldown bundling and Lightning CSS transforms — makes build-time CSS the path of least resistance.
+</Callout>
+
+---
+
+## The `styles` virtual module
+
+To tie everything together, the framework provides a virtual module that aggregates global styles for SSR injection:
+
+```typescript title="packages/eigen/src/plugins/styles.ts"
+import type { Plugin } from 'vite'
+
+const VIRTUAL_STYLES = 'eigen/styles'
+const RESOLVED_STYLES = '\0eigen/styles'
+
+export function eigenStylesPlugin(): Plugin {
+  return {
+    name: 'eigen:styles',
+
+    resolveId(id) {
+      if (id === VIRTUAL_STYLES) return RESOLVED_STYLES
+    },
+
+    load(id) {
+      if (id !== RESOLVED_STYLES) return
+
+      // In development, aggregate global style imports
+      // In production, the manifest handles CSS collection
+      return `
+        // Global styles aggregated by eigen/styles
+        import './src/app.css'
+
+        export function getStylesheets() {
+          // Returns stylesheet paths for SSR injection
+          return import.meta.env.SSR
+            ? collectSsrStyles()
+            : []
+        }
+
+        function collectSsrStyles() {
+          // During SSR, return the list of CSS files
+          // The production build resolves these from the manifest
+          return __EIGEN_CSS_MANIFEST__
+        }
+      `
+    },
+  }
+}
+```
+
+The entry server imports this module to inject styles during SSR:
+
+```typescript title="packages/eigen/src/entry-server.ts"
+import { getStylesheets } from 'eigen/styles'
+
+export async function render(url: string, template: string) {
+  const stylesheets = getStylesheets()
+  const styleHtml = stylesheets
+    .map(href => `<link rel="stylesheet" href="${href}">`)
+    .join('\n')
+
+  const html = template.replace('<!--ssr-styles-->', styleHtml)
+  // ... render React app
+}
+```
+
+This abstraction lets application developers import `eigen/styles` without thinking about the underlying CSS collection strategy — the framework handles the dev/production split internally.
+
+---
+
+## Putting it together: the CSS architecture
+
+Here's how the pieces connect:
+
+```
+Build time (Vite 8 / Rolldown):
+  ├── CSS Modules → scoped class names + .d.ts types
+  ├── Tailwind v4 → utility CSS extraction
+  ├── Lightning CSS → minification + vendor prefixes
+  └── Manifest → module → CSS file mapping
+
+SSR render time (Eigen):
+  ├── Track rendered modules
+  ├── Look up CSS in manifest
+  ├── Inline critical CSS in <head>
+  └── Preload remaining stylesheets
+
+Client hydration:
+  └── Styles already in DOM — no flash of unstyled content
+```
+
+The framework's CSS story is intentionally thin. Vite 8 handles the hard parts — parsing, scoping, preprocessing, bundling, minifying. Eigen adds three things: critical CSS extraction during SSR, type generation for CSS Modules, and the `eigen/styles` virtual module for a clean developer API.
+
+---
+
+## Key insight
+
+A framework's CSS story is mostly about **not fighting Vite**. Rolldown handles CSS Modules, PostCSS, preprocessors, and Lightning CSS minification out of the box. The framework's real work is narrow: extracting critical CSS during SSR so the first paint is styled, generating `.d.ts` files so CSS Modules are type-safe, and providing defaults so developers don't have to configure anything. The industry's move toward zero-runtime CSS solutions (Tailwind v4, Vanilla Extract, Panda CSS) aligns perfectly with Vite 8's build-time architecture — and makes the framework's job even simpler.
+
+**What's next:** [Part 38](/38-forms-mutations) brings together routing, server functions, validation, and caching into a cohesive forms and mutations system — where progressive enhancement isn't optional, it's the foundation.

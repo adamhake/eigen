@@ -33,7 +33,7 @@ Vite finds the changed file in its module graph — an in-memory data structure 
 
 Vite walks *up* the dependency tree (from the changed module toward the root) looking for an **HMR boundary** — a module that has registered an `import.meta.hot.accept()` handler. This handler says "I know how to update myself when my dependencies change."
 
-`@vitejs/plugin-react` injects HMR boundary code into every React component via its `transform` hook. This is why React components hot-reload by default — each component is a boundary.
+`@vitejs/plugin-react` injects HMR boundary code into every React component via its `transform` hook (using Oxc for the Fast Refresh transform). This is why React components hot-reload by default — each component is a boundary.
 </Step>
 <Step>
 ### WebSocket update

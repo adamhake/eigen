@@ -17,7 +17,7 @@ The framework is written entirely in TypeScript, and a central design goal is pr
 **Prerequisites:** Solid React and TypeScript knowledge, comfort with Node.js and ESM. Familiarity with what Next.js does at a high level.
 
 <Callout type="info">
-This series targets **Vite 7.x** (current stable). The key APIs we use — the Environment API, `buildApp`, `applyToEnvironment` — were introduced across Vite 6 and 7, and are stable in both. Vite 8 (currently in beta) replaces Rollup with **Rolldown**, a Rust-based bundler that's explicitly Rollup-compatible. Everything in this series — plugin hooks, virtual modules, the Environment API — works identically in Vite 8. The plugin API is unchanged: `resolveId`, `load`, `transform`, `generateBundle`, and every other hook we use are the same in both bundlers. Two minor naming differences in Vite 8: when we say "Rollup" as the production bundler, substitute "Rolldown"; and `build.rollupOptions` in config examples is renamed to `build.rolldownOptions` (the old name still works but is deprecated).
+This series targets **Vite 8.x** (current stable). Vite 8 replaced the dual esbuild/Rollup architecture with **Rolldown**, a unified Rust-based bundler. All the key APIs we use — the plugin pipeline (`resolveId`, `load`, `transform`, `generateBundle`), the Environment API, `buildApp`, `applyToEnvironment` — are stable and unchanged. A compatibility layer auto-converts most Vite 7 config; the main naming change is `build.rollupOptions` → `build.rolldownOptions`.
 </Callout>
 
 Before we write any code, we need to build a precise mental model of what Vite is. This matters because every decision a framework author makes — how to handle SSR, where to run loaders, how to split server and client code — flows from understanding Vite's architecture.
@@ -34,7 +34,7 @@ Vite isn't one tool — it's two tools that share a configuration surface.
 
 This is fundamentally different from webpack, which eagerly bundles your entire app before serving anything. Vite's approach means startup is near-instant regardless of project size — it only does work proportional to the page you're looking at, not the entire application.
 
-**In production**, Vite is a pre-configured Rollup build. It bundles everything into optimized chunks with tree-shaking, code-splitting, and minification. The dev server doesn't exist. Rollup takes over entirely, and the output is a set of static files (JavaScript bundles, CSS, assets) ready to be served by any HTTP server. (Vite 8 replaces Rollup with Rolldown, a faster Rust-based bundler. The plugin API is identical — `resolveId`, `load`, `transform`, and all other hooks work the same way. When this series says "Rollup," the concepts apply equally to Rolldown.)
+**In production**, Vite is a pre-configured Rolldown build. Rolldown is a Rust-based bundler (Rollup-compatible) that bundles everything into optimized chunks with tree-shaking, code-splitting, and minification. The dev server doesn't exist. Rolldown takes over entirely, and the output is a set of static files (JavaScript bundles, CSS, assets) ready to be served by any HTTP server.
 
 This duality is the central tension of framework development with Vite. Your framework plugin has to work in both modes, and behavior that works in dev (lazy, on-demand transformation) may need completely different handling in production (eager, ahead-of-time bundling). A virtual module that dynamically discovers routes by scanning the filesystem works identically in both modes — but a dev server middleware that handles API routes has no production equivalent at all. The framework has to bridge that gap.
 
@@ -58,9 +58,9 @@ Vite starts an HTTP server (using Node's `http` module and the `connect` middlew
 <Step>
 ### Dependency pre-bundling
 
-Vite scans your source code for `import` statements pointing at `node_modules` and runs esbuild to convert those packages from CommonJS to ESM, combining many internal files into single modules. This happens once and is cached in `node_modules/.vite`.
+Vite scans your source code for `import` statements pointing at `node_modules` and runs Rolldown to convert those packages from CommonJS to ESM, combining many internal files into single modules. This happens once and is cached in `node_modules/.vite`.
 
-The reason for pre-bundling is network efficiency. A package like `react-dom` internally consists of dozens of modules that import each other. Without pre-bundling, the browser would make dozens of individual HTTP requests for what is conceptually a single dependency. esbuild collapses those into one request. Your own source files are *not* pre-bundled — they're served individually, which is what makes HMR fast.
+The reason for pre-bundling is network efficiency. A package like `react-dom` internally consists of dozens of modules that import each other. Without pre-bundling, the browser would make dozens of individual HTTP requests for what is conceptually a single dependency. Rolldown collapses those into one request. Your own source files are *not* pre-bundled — they're served individually, which is what makes HMR fast.
 </Step>
 <Step>
 ### Waiting
@@ -85,7 +85,7 @@ This lazy, pull-based architecture is why Vite feels instant in development. It 
 
 ## The plugin pipeline in depth
 
-Vite's plugin system is Rollup's plugin system, extended with a handful of Vite-specific hooks. This is a deliberate design choice — it means the large ecosystem of Rollup plugins works in Vite out of the box, and plugin authors only need to learn one API.
+Vite's plugin system is based on the Rollup plugin interface, extended with a handful of Vite-specific hooks. This is a deliberate design choice — it means the large ecosystem of Rollup-compatible plugins works in Vite out of the box, and plugin authors only need to learn one API. (Vite 8's bundler, Rolldown, implements the same plugin interface.)
 
 ### The three core hooks
 
@@ -113,7 +113,7 @@ During development, the full hook sequence for the dev server lifecycle is:
 
 ```
 Server start:
-  options()        →  Rollup compatibility hook, rarely used directly
+  options()        →  Compatibility hook, rarely used directly
   buildStart()     →  Called once when the server starts
 
 Per-module request:
@@ -126,11 +126,11 @@ Server shutdown:
   closeBundle()    →  Final cleanup
 ```
 
-Note that `moduleParsed` (a Rollup hook) is *not* called during dev. Vite skips full AST parsing for performance. Output generation hooks like `renderChunk` and `generateBundle` are also not called during dev — they only run during `vite build`. This is the "you can think of Vite's dev server as only calling `rollup.rollup()` without calling `bundle.generate()`" mental model from Vite's docs.
+Note that `moduleParsed` is *not* called during dev. Vite skips full AST parsing for performance. Output generation hooks like `renderChunk` and `generateBundle` are also not called during dev — they only run during `vite build`. This is the "you can think of Vite's dev server as only calling `rollup.rollup()` without calling `bundle.generate()`" mental model from Vite's docs.
 
 ### Vite-specific hooks
 
-Beyond the Rollup hooks, Vite adds hooks that are specific to the dev server:
+Beyond the bundler hooks, Vite adds hooks that are specific to the dev server:
 
 **`config(userConfig, env)`** — Modify the Vite configuration before it's resolved. The `env` parameter tells you whether this is a `'serve'` (dev) or `'build'` (production) invocation. This is where a framework plugin sets defaults: entry points, build output directories, environment configurations.
 
@@ -158,16 +158,16 @@ This is a common source of confusion. Some hooks run in both dev and build. Othe
 | `configureServer` | ✓ | ✗ | Dev only — no server in production |
 | `transformIndexHtml` | ✓ | ✓ | Dev: per-request. Build: once during HTML emit |
 | `handleHotUpdate` | ✓ | ✗ | Dev only — no file watching in build |
-| `renderChunk` | ✗ | ✓ | Build only — Rollup output generation |
+| `renderChunk` | ✗ | ✓ | Build only — output generation |
 | `generateBundle` | ✗ | ✓ | Build only — access to final output before write |
 | `writeBundle` | ✗ | ✓ | Build only — after files are written to disk |
 | `closeBundle` | ✓ | ✓ | Dev: on server close. Build: after write |
 | `buildApp` | ✗ | ✓ | Build only — Vite 6+ multi-environment orchestration |
 | `applyToEnvironment` | ✓ | ✓ | Vite 6+ — controls which environments see the plugin |
 
-The key insight: `resolveId`, `load`, and `transform` work identically in both modes. This is why your virtual module generates the same route table whether Vite is serving it on-demand to a browser or bundling it with Rollup. The plugin code doesn't need to know which mode it's running in (though it can check `config.command === 'serve'` or `config.command === 'build'` if needed).
+The key insight: `resolveId`, `load`, and `transform` work identically in both modes. This is why your virtual module generates the same route table whether Vite is serving it on-demand to a browser or bundling it with Rolldown. The plugin code doesn't need to know which mode it's running in (though it can check `config.command === 'serve'` or `config.command === 'build'` if needed).
 
-The hooks that only run in build — `renderChunk`, `generateBundle`, `writeBundle` — are Rollup's output generation hooks. We'll use `closeBundle` for SSG (pre-rendering pages after the build is complete) and `generateBundle` for emitting additional assets.
+The hooks that only run in build — `renderChunk`, `generateBundle`, `writeBundle` — are output generation hooks. We'll use `closeBundle` for SSG (pre-rendering pages after the build is complete) and `generateBundle` for emitting additional assets.
 
 ---
 
@@ -182,7 +182,10 @@ resolveId(id) {
 },
 load(id) {
   if (id === '\0eigen:routes') {
-    return `export const routes = ${JSON.stringify(discoveredRoutes)}`
+    return {
+      code: `export const routes = ${JSON.stringify(discoveredRoutes)}`,
+      moduleType: 'js',  // Tell Rolldown this virtual module is JavaScript
+    }
   }
 }
 
@@ -190,7 +193,9 @@ load(id) {
 import { routes } from 'eigen/routes'
 ```
 
-The `\0` prefix on the *resolved* ID is a Rollup convention. It signals to other plugins that this is a virtual module and shouldn't be resolved to a path on disk. Developers never see it — it's internal to the plugin pipeline.
+The `moduleType: 'js'` property tells Rolldown to treat the returned code as JavaScript. This is important for virtual modules (which have no file extension for Rolldown to infer the type from) and any `load`/`transform` hook that converts non-JS content into JavaScript.
+
+The `\0` prefix on the *resolved* ID is a Rollup/Rolldown convention. It signals to other plugins that this is a virtual module and shouldn't be resolved to a path on disk. Developers never see it — it's internal to the plugin pipeline.
 
 ### Friendly imports vs. `virtual:` prefix
 
@@ -256,13 +261,13 @@ For this tutorial, we'll use the two default environments. But the mental model 
 
 ## How production builds work
 
-When you run `vite build`, the dev server doesn't start. Instead, Vite creates a Rollup build with your plugins, processes the entire module graph eagerly, and outputs optimized bundles.
+When you run `vite build`, the dev server doesn't start. Instead, Vite creates a Rolldown build with your plugins, processes the entire module graph eagerly, and outputs optimized bundles.
 
 For a server-rendered framework, you need **two builds**:
 
-1. **Client build** — Rollup bundles the client entry into hashed, code-split chunks. It produces a `manifest.json` that maps source filenames (like `src/entry-client.tsx`) to their hashed output filenames (like `assets/entry-client-a1b2c3d4.js`). It also produces CSS files, images, and other assets with content-hashed filenames for cache busting.
+1. **Client build** — Rolldown bundles the client entry into hashed, code-split chunks. It produces a `manifest.json` that maps source filenames (like `src/entry-client.tsx`) to their hashed output filenames (like `assets/entry-client-a1b2c3d4.js`). It also produces CSS files, images, and other assets with content-hashed filenames for cache busting.
 
-2. **Server build** — Rollup bundles the server entry into a single Node-compatible module. No code splitting, no hashing — it's designed to be `import()`-ed by a Node process. Dependencies from `node_modules` are typically externalized (not bundled) since they're available on the server at runtime.
+2. **Server build** — Rolldown bundles the server entry into a single Node-compatible module. No code splitting, no hashing — it's designed to be `import()`-ed by a Node process. Dependencies from `node_modules` are typically externalized (not bundled) since they're available on the server at runtime.
 
 The manifest file is the bridge between the two builds. The production server reads the manifest to know which `<script>` and `<link>` tags to inject into the HTML it serves. Without the manifest, the server wouldn't know that `src/entry-client.tsx` compiled to `assets/entry-client-a1b2c3d4.js`.
 

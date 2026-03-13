@@ -77,7 +77,7 @@ export interface StaticGenerationConfig {
 
 ## The SSG build plugin
 
-The `generateBundle` Rollup hook runs after Rollup has finished bundling but before it writes files to disk. This is where we pre-render:
+The `generateBundle` hook runs after Rolldown has finished bundling but before it writes files to disk. This is where we pre-render:
 
 ```typescript title="plugins/eigen-ssg.ts"
 import type { Plugin } from 'vite'
@@ -90,7 +90,7 @@ export default function eigenSSG(): Plugin {
     apply: 'build', // Only runs during production build
 
     configResolved(config) {
-      serverEntry = config.build?.rollupOptions?.input as string
+      serverEntry = config.build?.rolldownOptions?.input as string
         ?? 'src/entry-server.tsx'
     },
 

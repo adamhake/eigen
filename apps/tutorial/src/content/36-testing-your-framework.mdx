@@ -193,7 +193,7 @@ describe('eigen-routes plugin (integration)', () => {
       root: fixtureDir,
       build: {
         write: false, // Don't write to disk — return in-memory
-        rollupOptions: {
+        rolldownOptions: {
           input: resolve(fixtureDir, 'src/main.tsx'),
         },
       },

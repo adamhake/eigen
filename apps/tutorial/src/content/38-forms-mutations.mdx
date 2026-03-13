@@ -1,0 +1,559 @@
+---
+title: "Part 38: Forms & Mutations"
+description: "Progressive enhancement with server functions, optimistic UI, shared validation schemas, and cache revalidation after mutations."
+concepts:
+  - "progressive enhancement"
+  - "server function form actions"
+  - "optimistic UI patterns"
+  - "shared validation schemas"
+  - "cache revalidation after mutation"
+---
+
+
+*Forms are where every framework layer converges — routing, server functions, validation, caching. This module builds a forms and mutations system on top of [Part 15](/15-server-functions) (server functions), [Part 14](/14-framework-middleware) (middleware), and [Part 25](/25-use-cache) (`"use cache"`). The guiding principle: progressive enhancement isn't a nice-to-have, it's the foundation the JavaScript-enhanced experience builds on.*
+
+---
+
+## The form lifecycle
+
+Every form mutation follows the same cycle:
+
+```
+Submit → Validate → Mutate → Revalidate → Update UI
+```
+
+In Eigen, this maps directly to existing primitives:
+
+| Step | Primitive | Where it runs |
+|---|---|---|
+| **Submit** | `<form action={serverFn}>` or `useServerFn()` | Client → Server |
+| **Validate** | `.validator()` (from Part 15) + client-side schema | Both |
+| **Mutate** | Server function `.handler()` | Server |
+| **Revalidate** | `revalidateTag()` (from Part 25) | Server |
+| **Update UI** | React re-render with fresh data | Client |
+
+The framework's job is wiring these steps together so they work without JavaScript (progressive enhancement) and feel instant with JavaScript (optimistic UI).
+
+---
+
+## Progressive enhancement
+
+The foundation: a form that works with zero client-side JavaScript. The browser submits a standard HTML form, the server processes it, and the page reloads with the result.
+
+### Wiring forms to server functions
+
+When a server function is passed as a form's `action`, Eigen generates an endpoint that accepts `FormData`:
+
+```tsx title="src/pages/NewPost.tsx"
+import { createServerFn } from 'eigen/server'
+import { db } from '../lib/database'
+
+const createPost = createServerFn()
+  .validator((fd: FormData) => ({
+    title: fd.get('title') as string,
+    body: fd.get('body') as string,
+  }))
+  .handler(async ({ data }) => {
+    await db.query(
+      'INSERT INTO posts (title, body) VALUES ($1, $2)',
+      [data.title, data.body],
+    )
+    return { redirect: '/posts' }
+  })
+
+export default function NewPost() {
+  return (
+    <form action={createPost} method="post">
+      <label>
+        Title
+        <input name="title" required />
+      </label>
+      <label>
+        Body
+        <textarea name="body" required />
+      </label>
+      <button type="submit">Create Post</button>
+    </form>
+  )
+}
+```
+
+### How the transform works
+
+The `transform` hook (from [Part 7](/07-transform-hook)) rewrites `action={createPost}` differently per environment:
+
+**Server (SSR):** The form renders with `action="/api/__eigen/fn/createPost"` and `method="post"` — a standard HTML form pointing to the server function's generated endpoint.
+
+**Client (with JS):** The form action is intercepted. Instead of a full-page navigation, the client calls the server function via `fetch` and handles the response.
+
+```typescript title="packages/eigen/src/plugins/form-actions.ts"
+import type { Plugin } from 'vite'
+
+export function eigenFormActionsPlugin(): Plugin {
+  return {
+    name: 'eigen:form-actions',
+
+    transform(code, id, options) {
+      if (!id.endsWith('.tsx') && !id.endsWith('.jsx')) return null
+      if (!code.includes('action={')) return null
+
+      // Detect <form action={serverFn}> patterns
+      // In the SSR environment: render the endpoint URL as a string
+      // In the client environment: wrap with the form action handler
+      if (options?.ssr) {
+        // Simplified — a real implementation would check for
+        // an existing method attribute before adding one
+        return {
+          code: code.replace(
+            /action=\{(\w+)\}/g,
+            'action={$1.__url} method="post"',
+          ),
+        }
+      }
+
+      // Client: wrap form submission
+      return {
+        code: code.replace(
+          /action=\{(\w+)\}/g,
+          'action={$1.__url} onSubmit={__eigenFormHandler($1)}',
+        ),
+      }
+    },
+  }
+}
+```
+
+<Callout type="info" title="No JavaScript? No problem.">
+With JS disabled, the browser sends a standard `POST` with `FormData`. The server function endpoint parses the `FormData`, runs the validator and handler, and responds with a redirect. The user sees a full-page reload to the new state. This is the baseline experience — everything else builds on top of it.
+</Callout>
+
+---
+
+## Client-side submission
+
+When JavaScript is available, the framework enhances forms with instant feedback, pending states, and no full-page reloads.
+
+### The `useServerFn` hook
+
+For programmatic submissions outside of `<form>` elements — or when you need fine-grained control:
+
+```tsx title="src/components/LikeButton.tsx"
+import { useServerFn } from 'eigen/client'
+import { useTransition } from 'react'
+import { likePost } from '../actions/posts'
+
+export function LikeButton({ postId }: { postId: string }) {
+  const [isPending, startTransition] = useTransition()
+  const like = useServerFn(likePost)
+
+  return (
+    <button
+      disabled={isPending}
+      onClick={() => {
+        startTransition(async () => {
+          await like({ postId })
+        })
+      }}
+    >
+      {isPending ? 'Liking...' : '♥ Like'}
+    </button>
+  )
+}
+```
+
+`useServerFn` returns a function with the same signature as the server function, but it calls the generated endpoint via `fetch` under the hood. Combined with `useTransition`, the UI stays responsive while the mutation runs.
+
+### Pending states with forms
+
+For `<form>`-based submissions, Eigen provides a `useFormStatus` hook (matching React's built-in hook) that reads the pending state:
+
+```tsx title="src/components/SubmitButton.tsx"
+import { useFormStatus } from 'react-dom'
+
+export function SubmitButton() {
+  const { pending } = useFormStatus()
+  return (
+    <button type="submit" disabled={pending}>
+      {pending ? 'Saving...' : 'Save'}
+    </button>
+  )
+}
+```
+
+This works because Eigen wraps form submissions in React's action system — `startTransition` under the hood — so `useFormStatus` correctly reflects the pending state.
+
+---
+
+## Optimistic UI
+
+Optimistic updates show the result of a mutation immediately, before the server confirms it. If the server rejects the mutation, the UI rolls back.
+
+### The `useOptimistic` pattern
+
+```tsx title="src/pages/TodoList.tsx"
+import { useOptimistic, useTransition } from 'react'
+import { useServerFn } from 'eigen/client'
+import { addTodo, type Todo } from '../actions/todos'
+
+export default function TodoList({ todos }: { todos: Todo[] }) {
+  const [isPending, startTransition] = useTransition()
+  const add = useServerFn(addTodo)
+  const [optimisticTodos, addOptimistic] = useOptimistic(
+    todos,
+    (state: Todo[], newTodo: Todo) => [...state, newTodo],
+  )
+
+  async function handleSubmit(formData: FormData) {
+    const title = formData.get('title') as string
+    const optimisticTodo: Todo = {
+      id: `temp-${Date.now()}`,
+      title,
+      completed: false,
+    }
+
+    startTransition(async () => {
+      // Show the todo immediately
+      addOptimistic(optimisticTodo)
+      // Then persist on the server
+      await add({ title })
+    })
+  }
+
+  return (
+    <>
+      <ul>
+        {optimisticTodos.map(todo => (
+          <li key={todo.id} style={{
+            opacity: todo.id.startsWith('temp-') ? 0.6 : 1,
+          }}>
+            {todo.title}
+          </li>
+        ))}
+      </ul>
+      <form action={handleSubmit}>
+        <input name="title" required />
+        <button type="submit">Add</button>
+      </form>
+    </>
+  )
+}
+```
+
+The key: `useOptimistic` is scoped to a transition. If the server function throws, React rolls back the optimistic state automatically — the temporary todo disappears and the UI returns to the last confirmed state.
+
+### Error rollback
+
+When a server function returns an error, the optimistic state unwinds:
+
+```tsx title="src/actions/todos.ts"
+import { createServerFn } from 'eigen/server'
+import { db } from '../lib/database'
+
+export const addTodo = createServerFn()
+  .validator((data: { title: string }) => {
+    if (!data.title.trim()) throw new Error('Title required')
+    return data
+  })
+  .handler(async ({ data }) => {
+    const result = await db.query(
+      'INSERT INTO todos (title) VALUES ($1) RETURNING *',
+      [data.title],
+    )
+    return result.rows[0]
+  })
+```
+
+If the `INSERT` fails (constraint violation, network error, etc.), the transition rejects, and `useOptimistic` reverts to the pre-mutation state. No manual rollback logic needed.
+
+---
+
+## Validation on both sides
+
+Validation must run on the server (security) and should run on the client (UX). Sharing the schema between both sides avoids drift.
+
+### Shared schema with zod
+
+```typescript title="src/schemas/post.ts"
+import { z } from 'zod'
+
+export const createPostSchema = z.object({
+  title: z.string().min(1, 'Title is required').max(200),
+  body: z.string().min(1, 'Body is required').max(10000),
+  tags: z.array(z.string()).max(5, 'Maximum 5 tags').optional(),
+})
+
+export type CreatePostInput = z.infer<typeof createPostSchema>
+```
+
+This schema is consumed on both sides:
+
+**Server side** — via the server function's `.validator()`:
+
+```typescript title="src/actions/posts.ts"
+import { createServerFn } from 'eigen/server'
+import { createPostSchema } from '../schemas/post'
+import { db } from '../lib/database'
+
+export const createPost = createServerFn()
+  .validator(createPostSchema.parse)
+  .handler(async ({ data }) => {
+    return db.query(
+      'INSERT INTO posts (title, body, tags) VALUES ($1, $2, $3) RETURNING *',
+      [data.title, data.body, data.tags ?? []],
+    )
+  })
+```
+
+**Client side** — for instant feedback before submission:
+
+```tsx title="src/pages/NewPost.tsx"
+import { useState } from 'react'
+import { createPostSchema, type CreatePostInput } from '../schemas/post'
+import { createPost } from '../actions/posts'
+
+export default function NewPost() {
+  const [errors, setErrors] = useState<Record<string, string>>({})
+
+  async function handleSubmit(formData: FormData) {
+    const input = Object.fromEntries(formData)
+    const result = createPostSchema.safeParse(input)
+
+    if (!result.success) {
+      const fieldErrors: Record<string, string> = {}
+      for (const issue of result.error.issues) {
+        fieldErrors[issue.path[0] as string] = issue.message
+      }
+      setErrors(fieldErrors)
+      return
+    }
+
+    setErrors({})
+    await createPost(result.data)
+  }
+
+  return (
+    <form action={handleSubmit}>
+      <label>
+        Title
+        <input name="title" required />
+        {errors.title && <span className="error">{errors.title}</span>}
+      </label>
+      <label>
+        Body
+        <textarea name="body" required />
+        {errors.body && <span className="error">{errors.body}</span>}
+      </label>
+      <button type="submit">Create</button>
+    </form>
+  )
+}
+```
+
+<Callout type="warning" title="Never trust client validation alone">
+Client-side validation is a UX optimization — it gives instant feedback. But the server function's `.validator()` is the security boundary. An attacker can bypass client-side checks entirely. The shared schema means you write the rules once, but they're enforced in both places.
+</Callout>
+
+### Returning field-level errors from the server
+
+When server validation catches something client validation missed (uniqueness constraints, rate limits), the server function returns structured errors:
+
+```typescript title="src/actions/posts.ts"
+export const createPost = createServerFn()
+  .validator(createPostSchema.parse)
+  .handler(async ({ data }) => {
+    const existing = await db.query(
+      'SELECT id FROM posts WHERE title = $1',
+      [data.title],
+    )
+    if (existing.rows.length > 0) {
+      return {
+        error: true,
+        fieldErrors: { title: 'A post with this title already exists' },
+      }
+    }
+
+    const post = await db.query(
+      'INSERT INTO posts (title, body) VALUES ($1, $2) RETURNING *',
+      [data.title, data.body],
+    )
+    return { error: false, post: post.rows[0] }
+  })
+```
+
+---
+
+## Multi-step forms and wizards
+
+Multi-step forms introduce state management across steps — the framework provides patterns but doesn't prescribe a single approach.
+
+### FormData accumulation
+
+The simplest pattern: accumulate `FormData` across steps, submit everything on the final step.
+
+```tsx title="src/components/MultiStepForm.tsx"
+import { useState, type FormEvent } from 'react'
+import { createUser } from '../actions/users'
+
+interface StepData {
+  [key: string]: string
+}
+
+export function MultiStepForm() {
+  const [step, setStep] = useState(0)
+  const [data, setData] = useState<StepData>({})
+
+  function handleStep(formData: FormData) {
+    const stepData = Object.fromEntries(formData) as StepData
+    const merged = { ...data, ...stepData }
+    setData(merged)
+
+    if (step < 2) {
+      setStep(step + 1)
+    } else {
+      // Final step: submit everything
+      createUser(merged)
+    }
+  }
+
+  return (
+    <form action={handleStep}>
+      {step === 0 && (
+        <>
+          <input name="name" defaultValue={data.name} required />
+          <input name="email" defaultValue={data.email} required />
+        </>
+      )}
+      {step === 1 && (
+        <>
+          <input name="company" defaultValue={data.company} />
+          <input name="role" defaultValue={data.role} />
+        </>
+      )}
+      {step === 2 && (
+        <div>
+          <p>Name: {data.name}</p>
+          <p>Email: {data.email}</p>
+          <p>Company: {data.company}</p>
+        </div>
+      )}
+      <div>
+        {step > 0 && (
+          <button type="button" onClick={() => setStep(step - 1)}>
+            Back
+          </button>
+        )}
+        <button type="submit">
+          {step < 2 ? 'Next' : 'Submit'}
+        </button>
+      </div>
+    </form>
+  )
+}
+```
+
+### Typed FormData transforms
+
+For type safety, transform raw `FormData` into typed objects using the shared schema:
+
+```typescript title="packages/eigen/src/form-data.ts"
+import type { ZodSchema } from 'zod'
+
+export function parseFormData<T>(
+  formData: FormData,
+  schema: ZodSchema<T>,
+): { success: true; data: T } | { success: false; errors: Record<string, string> } {
+  const raw: Record<string, unknown> = {}
+
+  for (const [key, value] of formData.entries()) {
+    // Handle array fields (name="tags[]")
+    if (key.endsWith('[]')) {
+      const arrayKey = key.slice(0, -2)
+      if (!Array.isArray(raw[arrayKey])) raw[arrayKey] = []
+      ;(raw[arrayKey] as unknown[]).push(value)
+    } else {
+      raw[key] = value
+    }
+  }
+
+  const result = schema.safeParse(raw)
+  if (result.success) {
+    return { success: true, data: result.data }
+  }
+
+  const errors: Record<string, string> = {}
+  for (const issue of result.error.issues) {
+    errors[issue.path[0] as string] = issue.message
+  }
+  return { success: false, errors }
+}
+```
+
+---
+
+## Cache revalidation after mutation
+
+Mutations change server state — the cached data is now stale. Connecting mutations to the cache system from [Part 25](/25-use-cache) closes the loop.
+
+### `revalidateTag` after write
+
+```typescript title="src/actions/posts.ts"
+import { createServerFn } from 'eigen/server'
+import { revalidateTag } from 'eigen/cache'
+import { db } from '../lib/database'
+
+export const updatePost = createServerFn()
+  .validator((data: { id: string; title: string; body: string }) => data)
+  .handler(async ({ data }) => {
+    await db.query(
+      'UPDATE posts SET title = $1, body = $2 WHERE id = $3',
+      [data.title, data.body, data.id],
+    )
+
+    // Invalidate cached data for this post and the posts list
+    revalidateTag(`post:${data.id}`)
+    revalidateTag('posts:list')
+
+    return { success: true }
+  })
+```
+
+### The revalidation flow
+
+```
+1. User submits form
+2. Server function validates + mutates (database write)
+3. Server function calls revalidateTag('posts:list')
+4. Cache store marks 'posts:list' as stale
+5. Next request for the posts list loader runs fresh
+6. Client re-renders with new data
+```
+
+With optimistic UI, steps 5–6 happen in the background. The user already sees the updated state (optimistically) — the server response just confirms or corrects it.
+
+### Stale-while-revalidate
+
+For non-critical updates, you might want to show stale data immediately and refresh in the background:
+
+```typescript title="src/loaders/posts.ts"
+"use cache"
+
+import { cacheTag, cacheLife } from 'eigen/cache'
+import { db } from '../lib/database'
+
+export async function loadPosts() {
+  cacheTag('posts:list')
+  cacheLife('minutes', 5) // Serve stale for up to 5 minutes
+
+  return db.query('SELECT * FROM posts ORDER BY created_at DESC')
+}
+```
+
+After a mutation calls `revalidateTag('posts:list')`, the next request triggers a fresh load. But if a request arrives during the revalidation window, the stale data is served instantly while the fresh data is computed in the background.
+
+---
+
+## Key insight
+
+Forms are where all the framework layers converge — routing provides the URL, server functions handle the mutation, validation ensures correctness, middleware provides auth context, and the cache system manages staleness. Progressive enhancement isn't a legacy concern — it's the foundation. The no-JS form submission flow defines the data contract (FormData → server function → redirect), and every enhancement (pending states, optimistic updates, client validation) is layered on top without changing that contract.
+
+**What's next:** [Part 39](/39-developer-experience-cli) shifts focus from runtime to tooling — scaffolding CLIs, code generation, ESLint rules, and TypeScript plugins that make the framework a pleasure to use.
