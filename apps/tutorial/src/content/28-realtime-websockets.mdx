@@ -1,0 +1,373 @@
+---
+title: "Part 28: Real-Time Primitives"
+description: "WebSocket upgrade handling, typed event channels, and createRealtimeChannel as a framework primitive."
+---
+
+
+*This is the twenty-eighth installment in a series where we build a toy Next.js on top of Vite. In [Part 27](/27-ai-streaming), we built AI streaming. Now we'll add real-time communication — WebSocket connections, typed event channels, and the framework infrastructure that supports persistent connections alongside request/response server functions.*
+
+**Concepts introduced:** WebSocket upgrade handling in `configureServer`, typed event emitters, `createRealtimeChannel` as a framework primitive, room/topic multiplexing, reconnection strategies, server-to-client push, integrating real-time state with React, `useSubscription` hooks, the relationship between HMR WebSocket and application WebSocket.
+
+---
+
+## Real-time in a Vite framework
+
+Server functions (Part 15) and streaming server functions (Part 27) follow a request-initiated model — the client asks, the server responds. Real-time communication flips this: the server pushes data to the client at any time, without a request.
+
+Common use cases: collaborative editing, live notifications, chat presence, dashboard updates, multiplayer state. TanStack Start has real-time primitives on its roadmap, and frameworks like Phoenix LiveView and Rails Hotwire have demonstrated the power of server-push as a first-class framework feature.
+
+The transport is WebSockets — a persistent, bidirectional TCP connection upgraded from an initial HTTP request.
+
+---
+
+## The dev server: WebSocket handling
+
+Vite already runs a WebSocket server for HMR. We need a *second* WebSocket endpoint for application-level real-time communication. The `configureServer` hook gives us access to the HTTP server for WebSocket upgrades:
+
+```typescript title="plugins/eigen-realtime.ts"
+import type { Plugin } from 'vite'
+import { WebSocketServer, WebSocket } from 'ws'
+
+interface TypedMessage<T extends string = string, P = unknown> {
+  type: T
+  payload: P
+  channel?: string
+}
+
+export default function eigenRealtime(): Plugin {
+  const channels = new Map<string, Set<WebSocket>>()
+
+  return {
+    name: 'eigen-realtime',
+
+    configureServer(server) {
+      // Create a WebSocket server on a distinct path
+      // (Vite's HMR WebSocket is on /__vite_ws)
+      const wss = new WebSocketServer({ noServer: true })
+
+      // Handle upgrade requests on /_eigen/ws
+      server.httpServer?.on('upgrade', (request, socket, head) => {
+        if (request.url?.startsWith('/_eigen/ws')) {
+          wss.handleUpgrade(request, socket, head, (ws) => {
+            wss.emit('connection', ws, request)
+          })
+        }
+        // Other upgrade requests (like Vite's HMR) pass through untouched
+      })
+
+      wss.on('connection', (ws: WebSocket, request) => {
+        // Parse channel from URL: /_eigen/ws?channel=dashboard
+        const url = new URL(request.url!, 'http://localhost')
+        const channel = url.searchParams.get('channel') ?? 'default'
+
+        // Join the channel
+        if (!channels.has(channel)) channels.set(channel, new Set())
+        channels.get(channel)!.add(ws)
+
+        ws.on('message', async (raw) => {
+          try {
+            const message = JSON.parse(raw.toString()) as TypedMessage
+
+            // Route to a server-side message handler via ssrLoadModule
+            const handlerPath = `/src/realtime/${channel}.ts`
+            try {
+              const mod = await server.ssrLoadModule(handlerPath)
+              if (mod.onMessage) {
+                const response = await mod.onMessage(message, {
+                  channel,
+                  // Send to all clients in the channel EXCEPT the sender
+                  broadcast: (msg: TypedMessage) => broadcastToChannel(channel, msg, ws),
+                  // Send to ALL clients in the channel, including the sender
+                  broadcastAll: (msg: TypedMessage) => broadcastToChannel(channel, msg),
+                })
+                if (response) {
+                  ws.send(JSON.stringify(response))
+                }
+              }
+            } catch {
+              // No handler file — that's fine, just echo or ignore
+            }
+          } catch (e) {
+            console.error('WebSocket message error:', e)
+          }
+        })
+
+        ws.on('close', () => {
+          channels.get(channel)?.delete(ws)
+          if (channels.get(channel)?.size === 0) channels.delete(channel)
+        })
+
+        // Send a welcome message
+        ws.send(JSON.stringify({
+          type: 'connected',
+          payload: { channel },
+        }))
+      })
+
+      function broadcastToChannel(
+        channel: string,
+        message: TypedMessage,
+        exclude?: WebSocket,
+      ) {
+        const clients = channels.get(channel)
+        if (!clients) return
+        const data = JSON.stringify(message)
+        for (const client of clients) {
+          if (client !== exclude && client.readyState === WebSocket.OPEN) {
+            client.send(data)
+          }
+        }
+      }
+
+      // Expose broadcast to server functions via a global
+      // (In production, this would be a proper DI container)
+      ;(globalThis as any).__eigenRealtime = {
+        broadcast: (channel: string, message: TypedMessage) => {
+          broadcastToChannel(channel, message)
+        },
+      }
+    },
+  }
+}
+```
+
+---
+
+## Typed channels
+
+The framework defines channel schemas so both server and client agree on message shapes:
+
+```typescript title="packages/eigen/realtime-types.ts"
+/** Define a typed channel with specific event types */
+export interface ChannelSchema<TEvents extends Record<string, unknown>> {
+  events: TEvents
+}
+
+/** Helper to define a channel schema */
+export function defineChannel<T extends Record<string, unknown>>(): ChannelSchema<T> {
+  return {} as ChannelSchema<T>
+}
+```
+
+Usage — define the channel schema:
+
+```typescript title="src/realtime/schemas.ts"
+import { defineChannel } from 'eigen/realtime-types'
+
+export const dashboardChannel = defineChannel<{
+  'metric-update': { metric: string; value: number; timestamp: number }
+  'user-joined': { userId: string; name: string }
+  'user-left': { userId: string }
+  'alert': { level: 'info' | 'warning' | 'error'; message: string }
+}>()
+
+export const chatChannel = defineChannel<{
+  'message': { userId: string; text: string; timestamp: number }
+  'typing': { userId: string; isTyping: boolean }
+  'presence': { online: string[] }
+}>()
+```
+
+### Server-side handler
+
+```typescript title="src/realtime/dashboard.ts"
+import type { TypedMessage } from 'eigen/realtime-types'
+
+type DashboardEvents = {
+  'metric-update': { metric: string; value: number; timestamp: number }
+  'user-joined': { userId: string; name: string }
+}
+
+export function onMessage(
+  message: TypedMessage,
+  ctx: {
+    channel: string
+    broadcast: (msg: TypedMessage) => void
+    broadcastAll: (msg: TypedMessage) => void
+  },
+) {
+  // Handle incoming client messages
+  if (message.type === 'subscribe-metrics') {
+    // Start pushing metric updates to this client
+    // (In practice, this would connect to a metrics source)
+  }
+}
+```
+
+### Pushing from server functions
+
+Server functions (Part 15) can push real-time updates after mutations:
+
+```typescript title="src/server/posts.ts"
+export const createPost = createServerFn(async (data: { title: string; body: string }) => {
+  const post = await db.query('INSERT INTO posts ...')
+
+  // Push a real-time notification to all connected dashboard clients
+  const { broadcast } = (globalThis as any).__eigenRealtime
+  broadcast('dashboard', {
+    type: 'alert',
+    payload: { level: 'info', message: `New post: ${post.title}` },
+  })
+
+  return post
+})
+```
+
+---
+
+## React hooks for real-time
+
+```typescript title="packages/eigen/realtime-hooks.ts"
+import { useState, useEffect, useRef, useCallback } from 'react'
+
+interface UseChannelOptions {
+  /** Reconnect on disconnect */
+  reconnect?: boolean
+  /** Max reconnection attempts */
+  maxRetries?: number
+}
+
+export function useChannel<TEvents extends Record<string, unknown>>(
+  channelName: string,
+  options: UseChannelOptions = {},
+) {
+  const wsRef = useRef<WebSocket | null>(null)
+  const [isConnected, setIsConnected] = useState(false)
+  const listenersRef = useRef<Map<string, Set<Function>>>(new Map())
+
+  useEffect(() => {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    const url = `${protocol}//${window.location.host}/_eigen/ws?channel=${channelName}`
+    let retries = 0
+    const maxRetries = options.maxRetries ?? 5
+
+    function connect() {
+      const ws = new WebSocket(url)
+      wsRef.current = ws
+
+      ws.onopen = () => {
+        setIsConnected(true)
+        retries = 0
+      }
+
+      ws.onmessage = (event) => {
+        const message = JSON.parse(event.data) as { type: string; payload: unknown }
+        const handlers = listenersRef.current.get(message.type)
+        handlers?.forEach(fn => fn(message.payload))
+      }
+
+      ws.onclose = () => {
+        setIsConnected(false)
+        if (options.reconnect !== false && retries < maxRetries) {
+          retries++
+          setTimeout(connect, Math.min(1000 * Math.pow(2, retries), 30000))
+        }
+      }
+    }
+
+    connect()
+    return () => wsRef.current?.close()
+  }, [channelName])
+
+  const on = useCallback(<K extends keyof TEvents & string>(
+    event: K,
+    handler: (payload: TEvents[K]) => void,
+  ) => {
+    if (!listenersRef.current.has(event)) {
+      listenersRef.current.set(event, new Set())
+    }
+    listenersRef.current.get(event)!.add(handler)
+
+    return () => {
+      listenersRef.current.get(event)?.delete(handler)
+    }
+  }, [])
+
+  const send = useCallback(<K extends keyof TEvents & string>(
+    event: K,
+    payload: TEvents[K],
+  ) => {
+    wsRef.current?.send(JSON.stringify({ type: event, payload }))
+  }, [])
+
+  return { isConnected, on, send }
+}
+```
+
+### Usage in a component
+
+```tsx title="src/pages/dashboard.tsx"
+'use client'
+
+import { useChannel } from 'eigen/realtime-hooks'
+import type { dashboardChannel } from '../realtime/schemas'
+
+export default function Dashboard() {
+  const { isConnected, on } = useChannel<typeof dashboardChannel['events']>('dashboard')
+  const [metrics, setMetrics] = useState<Record<string, number>>({})
+  const [alerts, setAlerts] = useState<string[]>([])
+
+  useEffect(() => {
+    const unsub1 = on('metric-update', ({ metric, value }) => {
+      setMetrics(prev => ({ ...prev, [metric]: value }))
+    })
+
+    const unsub2 = on('alert', ({ message }) => {
+      setAlerts(prev => [...prev.slice(-9), message])
+    })
+
+    return () => { unsub1(); unsub2() }
+  }, [on])
+
+  return (
+    <div>
+      <span>{isConnected ? '🟢' : '🔴'} {isConnected ? 'Live' : 'Reconnecting...'}</span>
+      {Object.entries(metrics).map(([k, v]) => (
+        <div key={k}>{k}: {v}</div>
+      ))}
+    </div>
+  )
+}
+```
+
+The `on` handler is fully typed — `on('metric-update', (payload) => ...)` knows that `payload` is `{ metric: string; value: number; timestamp: number }`. Invalid event names or mismatched payloads are compile errors.
+
+---
+
+## Vite's HMR WebSocket vs. application WebSocket
+
+<Callout type="info" title="Two WebSockets, two purposes">
+Vite already runs a WebSocket server at `/__vite_ws` for HMR communication. Our real-time WebSocket is separate — different path (`/_eigen/ws`), different purpose, different lifecycle. In production, the HMR WebSocket doesn't exist; the application WebSocket does.
+</Callout>
+
+The `configureServer` hook handles both by listening for `upgrade` events on the shared HTTP server and routing based on URL path.
+
+---
+
+## What to observe
+
+1. **Open two browser tabs** to the same dashboard page. Send a message from one — it appears in the other via the broadcast.
+
+2. **Create a post via a server function.** A real-time alert appears in the dashboard without refreshing.
+
+3. **Kill the dev server and restart it.** The client reconnects automatically with exponential backoff.
+
+4. **Check the Types** — hover over the `on` callback's payload parameter. TypeScript knows the exact shape based on the channel schema.
+
+---
+
+## Key insight
+
+Real-time communication introduces a fundamentally different model from the request/response pattern that HTTP (and server functions) use. The `configureServer` hook handles the WebSocket upgrade, but the production story has constraints:
+
+<Callout type="warn" title="Deployment constraint">
+WebSockets require a deployment target that supports persistent connections — traditional Node.js servers, Deno, or Cloudflare Durable Objects. Serverless functions (Lambda, Vercel Functions) can't maintain WebSocket connections. For platforms without WebSocket support, the framework can fall back to SSE (Part 27's approach) or long-polling.
+</Callout>
+
+This is a deployment constraint, not a Vite constraint. The plugin generates the same code regardless; the deployment adapter determines whether WebSockets are available.
+
+---
+
+## What's next
+
+In Part 29, we'll explore **Module Federation** — composing independently-deployed micro-frontends using Vite's environment model, where different teams ship different parts of the UI as separate Vite builds that compose at runtime. This is the final installment in the series.

@@ -1,0 +1,553 @@
+---
+title: "Part 17: Deployment Adapters"
+description: "Platform-specific build transforms, closeBundle for post-processing, and serverless function packaging."
+---
+
+
+*This is the seventeenth installment in a series where we build a toy Next.js on top of Vite. In [Part 16](/16-static-site-generation), we added static site generation. Now we'll build the adapter pattern — a plugin abstraction that transforms Eigen's generic build output into platform-specific deployment artifacts for Netlify, Cloudflare, Vercel, or a standalone Node server.*
+
+**Concepts introduced:** The adapter pattern, platform-specific build transforms, `closeBundle` for post-processing, serverless function packaging, edge function bundling, output directory conventions, `_redirects` / `_headers` generation, adapter composition with the framework plugin, typed adapter configuration, the relationship between adapters and Vite environments.
+
+---
+
+## The problem: build output ≠ deployment artifact
+
+In Parts 6 and 14, we built a production pipeline that produces:
+
+<Files>
+  <Folder name="dist" defaultOpen>
+    <Folder name="client" comment="Static assets (JS, CSS, HTML)" />
+    <Folder name="server" comment="Node.js server bundle" />
+  </Folder>
+</Files>
+
+(Plus pre-rendered HTML files from SSG.)
+
+This output is platform-agnostic. To actually deploy, each hosting platform needs something different:
+
+| Platform | What it expects |
+|---|---|
+| **Node server** | A `server.js` entry point that listens on a port |
+| **Netlify** | Static files in a publish dir, serverless functions in `netlify/functions/`, optional edge functions in `netlify/edge-functions/` |
+| **Cloudflare Pages** | Static files in an output dir, a `_worker.js` entry point for SSR |
+| **Vercel** | Static files in `.vercel/output/static/`, serverless functions in `.vercel/output/functions/`, config in `.vercel/output/config.json` |
+
+The gap between "Vite's build output" and "what the platform needs" is what an adapter fills. An adapter is a Vite plugin that post-processes the build output into the platform's expected format.
+
+---
+
+## The adapter interface
+
+```typescript title="packages/eigen/adapter.ts"
+import type { Plugin } from 'vite'
+
+export interface AdapterOptions {
+  /** Override the output directory */
+  outDir?: string
+}
+
+export interface AdapterContext {
+  /** The resolved Vite config */
+  config: import('vite').ResolvedConfig
+  /** Path to the client build output */
+  clientOutDir: string
+  /** Path to the server build output */
+  serverOutDir: string
+  /** Discovered routes for generating routing config */
+  routes: Array<{
+    path: string
+    isStatic: boolean     // Has pre-rendered HTML
+    isDynamic: boolean    // Has dynamic segments
+    hasLoader: boolean    // Needs server-side rendering
+  }>
+}
+
+/**
+ * An adapter transforms Eigen's build output into a platform-specific
+ * deployment artifact. It's a Vite plugin factory that runs during
+ * the build phase.
+ */
+export type Adapter = (options?: AdapterOptions) => Plugin
+```
+
+---
+
+## Adapter implementations
+
+Each adapter is a Vite plugin that post-processes the build output into the platform's expected format:
+
+<Tabs items={["Node", "Netlify", "Cloudflare"]}>
+<Tab value="Node">
+
+### Node standalone server
+
+The simplest adapter — it generates a self-contained `server.js` that imports the server build and serves the client assets:
+
+```typescript title="packages/eigen/adapters/node.ts"
+import type { Plugin, ResolvedConfig } from 'vite'
+import { writeFileSync, mkdirSync } from 'fs'
+import { resolve } from 'path'
+
+export interface NodeAdapterOptions {
+  port?: number
+  host?: string
+  outDir?: string
+}
+
+export function nodeAdapter(options: NodeAdapterOptions = {}): Plugin {
+  let config: ResolvedConfig
+
+  return {
+    name: 'eigen-adapter-node',
+    apply: 'build',
+
+    configResolved(resolved) {
+      config = resolved
+    },
+
+    async closeBundle() {
+      // Only run after the server build
+      if (this.environment?.name !== 'ssr') return
+
+      const outDir = options.outDir ?? 'dist'
+      const port = options.port ?? 3000
+      const host = options.host ?? '0.0.0.0'
+
+      // Generate a production server entry point
+      const serverEntry = `
+import express from 'express'
+import { readFileSync, existsSync } from 'fs'
+import { resolve, dirname } from 'path'
+import { fileURLToPath } from 'url'
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
+const app = express()
+
+// Serve static assets with long-term caching
+app.use('/assets', express.static(
+  resolve(__dirname, 'client/assets'),
+  { maxAge: '1y', immutable: true },
+))
+
+// Serve other static files
+app.use(express.static(resolve(__dirname, 'client'), { index: false }))
+
+// Import the SSR renderer
+const { render } = await import('./server/entry-server.js')
+const template = readFileSync(resolve(__dirname, 'client/index.html'), 'utf-8')
+
+app.get('*', async (req, res) => {
+  // Check for pre-rendered HTML first
+  const staticPath = req.path === '/'
+    ? resolve(__dirname, 'client/index.html')
+    : resolve(__dirname, 'client' + req.path + '/index.html')
+
+  if (existsSync(staticPath) && req.path !== '/') {
+    return res.sendFile(staticPath)
+  }
+
+  // Fall back to SSR
+  try {
+    const { html, status, data } = await render(req.originalUrl)
+    const finalHtml = template
+      .replace('<!--ssr-outlet-->', html)
+      .replace('</head>', \`<script>window.__EIGEN_DATA__=\${JSON.stringify(data)}</script></head>\`)
+    res.status(status).set({ 'Content-Type': 'text/html' }).end(finalHtml)
+  } catch (e) {
+    console.error(e)
+    res.status(500).end('Internal Server Error')
+  }
+})
+
+app.listen(${port}, '${host}', () => {
+  console.log(\`Server running at http://${host}:${port}\`)
+})
+`
+
+      writeFileSync(resolve(outDir, 'server.js'), serverEntry)
+
+      // Generate a package.json for the output
+      const pkg = {
+        type: 'module',
+        scripts: { start: 'node server.js' },
+        dependencies: { express: '^4.21.0' },
+      }
+      writeFileSync(resolve(outDir, 'package.json'), JSON.stringify(pkg, null, 2))
+
+      console.log(`\n  ✓ Node adapter: ${outDir}/server.js`)
+      console.log(`    Run: cd ${outDir} && npm install && npm start\n`)
+    },
+  }
+}
+```
+
+</Tab>
+<Tab value="Netlify">
+
+### Netlify
+
+Netlify expects a specific output structure. The adapter transforms Eigen's output into Netlify's format:
+
+```typescript title="packages/eigen/adapters/netlify.ts"
+import type { Plugin, ResolvedConfig } from 'vite'
+import { writeFileSync, mkdirSync, cpSync, readFileSync } from 'fs'
+import { resolve } from 'path'
+
+export interface NetlifyAdapterOptions {
+  /** Enable Netlify Edge Functions for SSR (instead of serverless) */
+  edge?: boolean
+}
+
+export function netlifyAdapter(options: NetlifyAdapterOptions = {}): Plugin {
+  let config: ResolvedConfig
+  let routes: Array<{ path: string; isStatic: boolean }>
+
+  return {
+    name: 'eigen-adapter-netlify',
+    apply: 'build',
+
+    configResolved(resolved) {
+      config = resolved
+    },
+
+    async closeBundle() {
+      if (this.environment?.name !== 'ssr') return
+
+      const publishDir = 'dist/netlify'
+
+      // 1. Copy static assets to the publish directory
+      mkdirSync(resolve(publishDir), { recursive: true })
+      cpSync('dist/client', publishDir, { recursive: true })
+
+      if (options.edge) {
+        // 2a. Edge Functions — for Netlify Edge (Deno-based)
+        const edgeFnDir = resolve('netlify/edge-functions')
+        mkdirSync(edgeFnDir, { recursive: true })
+
+        const edgeHandler = `
+import { render } from '../../dist/server/entry-server.js'
+import template from '../../dist/client/index.html?raw'
+
+export default async (request, context) => {
+  const url = new URL(request.url)
+
+  // Let static assets pass through to the CDN
+  if (url.pathname.startsWith('/assets/')) return
+
+  try {
+    const { html, status, data } = await render(url.pathname)
+    const finalHtml = template
+      .replace('<!--ssr-outlet-->', html)
+      .replace('</head>', \`<script>window.__EIGEN_DATA__=\${JSON.stringify(data)}</script></head>\`)
+    return new Response(finalHtml, {
+      status,
+      headers: { 'Content-Type': 'text/html' },
+    })
+  } catch (e) {
+    console.error(e)
+    return new Response('Internal Server Error', { status: 500 })
+  }
+}
+
+export const config = { path: '/*' }
+`
+        writeFileSync(resolve(edgeFnDir, 'ssr.js'), edgeHandler)
+      } else {
+        // 2b. Serverless Functions — for Netlify Functions (Node.js)
+        const fnDir = resolve('netlify/functions')
+        mkdirSync(fnDir, { recursive: true })
+
+        const serverlessFn = `
+import { render } from '../../dist/server/entry-server.js'
+import { readFileSync } from 'fs'
+import { resolve, dirname } from 'path'
+import { fileURLToPath } from 'url'
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
+const template = readFileSync(
+  resolve(__dirname, '../../dist/client/index.html'), 'utf-8'
+)
+
+export async function handler(event) {
+  try {
+    const { html, status, data } = await render(event.path)
+    const finalHtml = template
+      .replace('<!--ssr-outlet-->', html)
+      .replace('</head>', \`<script>window.__EIGEN_DATA__=\${JSON.stringify(data)}</script></head>\`)
+
+    return {
+      statusCode: status,
+      headers: { 'Content-Type': 'text/html' },
+      body: finalHtml,
+    }
+  } catch (e) {
+    return { statusCode: 500, body: 'Internal Server Error' }
+  }
+}
+`
+        writeFileSync(resolve(fnDir, 'ssr.mjs'), serverlessFn)
+      }
+
+      // 3. Generate _redirects for routing
+      // Static assets and pre-rendered pages serve directly from CDN.
+      // Everything else falls through to the SSR function.
+      const redirects = [
+        '/assets/*  /assets/:splat  200',
+        '/*  /.netlify/functions/ssr  200',
+      ].join('\n')
+
+      writeFileSync(resolve(publishDir, '_redirects'), redirects)
+
+      // 4. Generate _headers for caching
+      const headers = [
+        '/assets/*',
+        '  Cache-Control: public, max-age=31536000, immutable',
+        '',
+        '/*',
+        '  X-Frame-Options: DENY',
+        '  X-Content-Type-Options: nosniff',
+      ].join('\n')
+
+      writeFileSync(resolve(publishDir, '_headers'), headers)
+
+      // 5. Generate netlify.toml if it doesn't exist
+      const netlifyToml = `
+[build]
+  publish = "${publishDir}"
+  command = "npm run build"
+
+${options.edge ? '' : `[[redirects]]
+  from = "/*"
+  to = "/.netlify/functions/ssr"
+  status = 200
+  conditions = {Role = ["admin", "user"]}
+`}
+`
+
+      console.log(`\n  ✓ Netlify adapter: ${publishDir}/`)
+      console.log(`    Deploy: netlify deploy --prod\n`)
+    },
+  }
+}
+```
+
+</Tab>
+<Tab value="Cloudflare">
+
+### Cloudflare Pages
+
+```typescript title="packages/eigen/adapters/cloudflare.ts"
+import type { Plugin } from 'vite'
+import { writeFileSync, mkdirSync, cpSync } from 'fs'
+import { resolve } from 'path'
+
+export function cloudflareAdapter(): Plugin {
+  return {
+    name: 'eigen-adapter-cloudflare',
+    apply: 'build',
+
+    async closeBundle() {
+      if (this.environment?.name !== 'ssr') return
+
+      const outDir = 'dist/cloudflare'
+      mkdirSync(outDir, { recursive: true })
+
+      // Copy static assets
+      cpSync('dist/client', outDir, { recursive: true })
+
+      // Generate _worker.js — Cloudflare Pages' SSR entry point
+      const worker = `
+import { render } from '../server/entry-server.js'
+
+// Cloudflare Pages uses the Fetch handler convention
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url)
+
+    // Serve static assets from the built directory
+    // (Cloudflare Pages handles this automatically for files in the output dir)
+
+    try {
+      const { html, status, data } = await render(url.pathname)
+      // In production, the template would be inlined at build time
+      const finalHtml = \`<!DOCTYPE html>...\${html}...\`
+      return new Response(finalHtml, {
+        status,
+        headers: { 'Content-Type': 'text/html' },
+      })
+    } catch (e) {
+      return new Response('Internal Server Error', { status: 500 })
+    }
+  },
+}
+`
+      writeFileSync(resolve(outDir, '_worker.js'), worker)
+
+      console.log(`\n  ✓ Cloudflare Pages adapter: ${outDir}/`)
+      console.log(`    Deploy: wrangler pages deploy ${outDir}\n`)
+    },
+  }
+}
+```
+
+</Tab>
+</Tabs>
+
+---
+
+## Composing adapters with the framework plugin
+
+The adapter slots into the framework's plugin array. The user picks their deployment target:
+
+```typescript title="vite.config.ts"
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+import eigen from 'eigen/plugin'
+import { netlifyAdapter } from 'eigen/adapters/netlify'
+
+export default defineConfig({
+  plugins: [
+    eigen(),
+    react(),
+    netlifyAdapter({ edge: true }),  // ← adapter is just another plugin
+  ],
+})
+```
+
+The adapter runs its `closeBundle` hook after the framework's `buildApp` has completed all environment builds. It reads the build output and transforms it into the platform's expected format. The framework doesn't know or care which adapter is active — it produces its standard output, and the adapter handles the rest.
+
+### Plugin ordering
+
+This matters. The adapter must run *after* the framework's build:
+
+```
+1. eigen() plugins run → produce dist/client/ and dist/server/
+2. SSG runs (Part 14) → writes pre-rendered HTML to dist/client/
+3. Adapter runs → transforms dist/ into platform-specific output
+```
+
+Because `closeBundle` hooks run in plugin order, the adapter plugin should come after `eigen()` in the plugins array. Alternatively, the adapter can use `enforce: 'post'` to guarantee it runs last.
+
+---
+
+## Typed adapter configuration
+
+Each adapter has different options. A generic `AdapterConfig` type lets the framework validate the adapter's configuration:
+
+```typescript title="packages/eigen/adapter.ts"
+export interface BaseAdapterConfig {
+  /** Name of the target platform */
+  platform: string
+  /** Whether the platform supports streaming responses */
+  supportsStreaming: boolean
+  /** Whether the platform supports WebSocket connections */
+  supportsWebSockets: boolean
+  /** Whether the platform supports the Node.js runtime */
+  supportsNode: boolean
+  /** Maximum serverless function duration (ms), if applicable */
+  maxDuration?: number
+}
+
+// Each adapter declares its capabilities
+export const NETLIFY_CONFIG: BaseAdapterConfig = {
+  platform: 'netlify',
+  supportsStreaming: true,
+  supportsWebSockets: false,  // Netlify Functions are request/response only
+  supportsNode: true,
+  maxDuration: 10_000,  // 10s default
+}
+
+export const CLOUDFLARE_CONFIG: BaseAdapterConfig = {
+  platform: 'cloudflare',
+  supportsStreaming: true,
+  supportsWebSockets: true,   // Durable Objects support WebSockets
+  supportsNode: false,         // Workers use Web APIs, not Node
+  maxDuration: 30_000,
+}
+```
+
+The framework can use this at build time to warn about incompatibilities:
+
+```typescript
+// In the framework plugin's configResolved hook
+configResolved(config) {
+  const adapterConfig = config.__eigenAdapterConfig as BaseAdapterConfig | undefined
+
+  if (adapterConfig && !adapterConfig.supportsWebSockets) {
+    const hasRealtimeRoutes = discoverRoutes(pagesDir).some(r =>
+      r.file.includes('realtime') || r.hasWebSocketHandler,
+    )
+    if (hasRealtimeRoutes) {
+      console.warn(
+        `⚠ ${adapterConfig.platform} does not support WebSockets. ` +
+        `Real-time features from Part 23 will not work in production.`,
+      )
+    }
+  }
+
+  if (adapterConfig && !adapterConfig.supportsNode) {
+    // Warn about Node-only imports that won't work on this platform
+  }
+}
+```
+
+---
+
+## How real frameworks handle adapters
+
+| Framework | Adapter pattern | Examples |
+|---|---|---|
+| **TanStack Start** | `@netlify/vite-plugin-tanstack-start`, `@vercel/vite-plugin` | Separate npm packages per platform |
+| **Astro** | `@astrojs/netlify`, `@astrojs/cloudflare`, `@astrojs/node` | Official adapter packages |
+| **SolidStart** | `solid-start-netlify`, `solid-start-cloudflare` | Community + official adapters |
+| **Remix / React Router** | Built-in preset system | `@react-router/cloudflare`, `@react-router/netlify` |
+
+The pattern is consistent: adapters are separate plugins/packages, one per platform, that transform the framework's generic output into platform-specific artifacts. The framework defines the interface; the adapter implements it.
+
+### The TanStack Start detail you've seen
+
+From our ILTA architecture review: TanStack Start's Netlify deployment uses `@netlify/vite-plugin-tanstack-start`. Plugin order matters — `tanstackStart()` must come first. This is the exact same ordering constraint we described above: the framework plugin produces the build, the adapter plugin post-processes it.
+
+---
+
+## Adapter responsibilities beyond file layout
+
+Adapters do more than copy files around. They also:
+
+**Generate routing configuration.** Netlify needs `_redirects`. Vercel needs `config.json` with route rules. Cloudflare needs `_routes.json`. The adapter reads the route tree and generates the platform's routing format.
+
+**Bundle server dependencies.** Serverless functions need their dependencies bundled (no `node_modules` on the platform). The adapter may run a secondary bundling step with esbuild to produce a self-contained function.
+
+**Configure headers and caching.** Each platform has its own mechanism for setting `Cache-Control`, security headers, and CORS rules. The adapter generates the platform-specific config.
+
+**Handle environment variables.** Netlify uses `netlify.toml` env vars. Cloudflare uses `wrangler.toml`. Vercel uses the dashboard. The adapter can generate the config file or validate that required env vars are defined.
+
+**Transform the server entry point.** Netlify Functions expect `export async function handler(event)`. Cloudflare Workers expect `export default { fetch(request) }`. Vercel Functions expect `export default function(req, res)`. The adapter wraps Eigen's `render()` function in the platform's expected handler signature.
+
+---
+
+## What to observe
+
+1. **Run `npm run build` with different adapters** and compare the output directories. The `dist/` structure changes completely depending on the adapter.
+
+2. **Check the generated routing files** (`_redirects`, `config.json`). They map Eigen's routes to the platform's routing format — static routes serve files directly, dynamic routes invoke the SSR function.
+
+3. **Deploy to Netlify** with `netlify deploy --prod`. The adapter has already generated everything Netlify needs — no additional configuration.
+
+4. **Switch adapters** without changing any application code. Only `vite.config.ts` changes. The same app deploys to Node, Netlify, or Cloudflare with a one-line config swap.
+
+---
+
+## Key insight
+
+Adapters are the bridge between "framework build output" and "production deployment." They exist because hosting platforms have wildly different expectations for file layout, server entry point signatures, routing configuration, and runtime APIs. The framework can't know about every platform — but it can define a clean build output contract that adapters transform.
+
+From a Vite perspective, adapters are `closeBundle` plugins. They run after the build is complete, read the output artifacts, and write platform-specific files. They don't participate in the transform pipeline or module resolution — they're purely post-processing. This is a clean separation of concerns: the framework handles code transformation and build orchestration, the adapter handles deployment packaging.
+
+The adapter pattern also creates a natural extension point for the community. Supporting a new hosting platform doesn't require changes to Eigen's core — it just requires a new adapter plugin that conforms to the `Adapter` interface.
+
+---
+
+## What's next
+
+In Part 18, we'll add **runtime validation** with zod/valibot integration — bridging the gap between compile-time type safety and runtime data integrity, especially for serialized loader data crossing the server/client boundary.

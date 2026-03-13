@@ -1,0 +1,344 @@
+---
+title: "Part 5: Typed Loaders"
+description: "Loader conventions, satisfies for constrained type inference, and the defineLoader helper."
+---
+
+
+*This is the sixth installment in a series where we build a toy Next.js on top of Vite. In [Part 4](/04-hydration), we connected server and client with hydration. Now we'll build the data loading layer — the `loader` pattern that Next.js calls `getServerSideProps` and Remix calls `loader` — with full TypeScript inference.*
+
+**Concepts introduced:** Loader conventions, `satisfies` for constrained type inference, `defineLoader` helper, three levels of type inference sophistication, client-side data fetching endpoint, `configureServer` for data middleware.
+
+---
+
+## The design goal
+
+When a developer writes a loader, the return type should flow through to the component's `data` prop. Ideally with zero manual type annotations:
+
+```tsx
+// Dream DX:
+export const loader = defineLoader('/posts/:id', async ({ params }) => {
+  // params.id is typed as string — inferred from the route path
+  const post = await fetchPost(params.id)
+  return post  // { title: string; body: string }
+})
+
+export default function PostPage({ params, data }) {
+  // data.title: string  ← inferred from the loader return type
+  // params.id: string   ← inferred from the route path
+}
+```
+
+Getting here requires progressively more sophisticated type machinery. Let's build through three levels.
+
+---
+
+## Level 1: Manual annotation
+
+The simplest approach — the developer explicitly writes the types:
+
+```tsx title="src/pages/posts/[id].tsx"
+import type { PageProps } from 'eigen/types'
+
+type Props = PageProps<'/posts/:id', { title: string; body: string }>
+
+export async function loader({ params }: { params: { id: string } }) {
+  const res = await fetch(
+    `https://jsonplaceholder.typicode.com/posts/${params.id}`,
+  )
+  return res.json() as Promise<{ title: string; body: string }>
+}
+
+export default function PostPage({ params, data }: Props) {
+  return (
+    <article>
+      <h1>{data.title}</h1>
+      <p>Post #{params.id}</p>
+      <p>{data.body}</p>
+    </article>
+  )
+}
+```
+
+This works. `PageProps<'/posts/:id', { title: string; body: string }>` expands to `{ params: { id: string }; data: { title: string; body: string } }`. Both the params and data are typed.
+
+But the developer had to write the data type twice — once in the loader's return type assertion and once in the `PageProps` generic. If they change the loader to return a `userId` field but forget to update `PageProps`, the types silently diverge from reality. The type system is providing safety, but it's not DRY.
+
+---
+
+## Level 2: `satisfies` and `ReturnType`
+
+TypeScript's `satisfies` operator (introduced in 4.9) solves the "constrain without widening" problem. We can constrain the loader's shape (it must accept the right params and return a Promise) without losing the narrow return type:
+
+```tsx title="src/pages/posts/[id].tsx"
+import type { PageProps, LoaderFn } from 'eigen/types'
+
+export const loader = (async ({ params }) => {
+  const res = await fetch(
+    `https://jsonplaceholder.typicode.com/posts/${params.id}`,
+  )
+  const post = await res.json() as { id: number; title: string; body: string }
+  return post
+}) satisfies LoaderFn<'/posts/:id'>
+
+// Extract the return type automatically
+type LoaderData = Awaited<ReturnType<typeof loader>>
+
+export default function PostPage({
+  params,
+  data,
+}: PageProps<'/posts/:id', LoaderData>) {
+  // data.id: number       ← inferred from the loader
+  // data.title: string    ← inferred from the loader
+  // data.body: string     ← inferred from the loader
+  // params.id: string     ← inferred from the route path
+  return (
+    <article>
+      <h1>{data.title}</h1>
+      <p>Post #{params.id}</p>
+      <p>{data.body}</p>
+    </article>
+  )
+}
+```
+
+The `satisfies LoaderFn<'/posts/:id'>` constraint ensures:
+- The loader's `params` argument matches the route's dynamic segments (`{ id: string }`)
+- The return type is a `Promise` or synchronous value
+- The function signature conforms to the `LoaderFn` shape
+
+But crucially, `satisfies` does *not* widen the return type to `unknown`. The `typeof loader` retains the narrow type `(ctx: ...) => Promise<{ id: number; title: string; body: string }>`, which `Awaited<ReturnType<...>>` extracts.
+
+<TypeDeepDive title="TypeScript: The `satisfies` operator">
+
+`satisfies` (added in TS 4.9) checks that an expression matches a type *without widening it*. Compare two approaches: `const x: Type = value` widens `x` to `Type`, losing any narrower type information. `const x = value satisfies Type` checks compatibility but preserves the narrow, specific type. This distinction matters here because `ReturnType<typeof loader>` needs the narrow type. With `: LoaderFn`, the return type widens to `unknown` and `ReturnType` gives you nothing useful. With `satisfies`, TypeScript retains the exact `{ id: number; title: string; body: string }` shape while still enforcing that the function conforms to the `LoaderFn` contract.
+
+</TypeDeepDive>
+
+The data type is now written once — in the loader. The component derives it via `ReturnType`. If the loader changes, the component's types update automatically.
+
+<TypeDeepDive title="TypeScript: `ReturnType` and `Awaited` utility types">
+
+`ReturnType<typeof fn>` extracts a function's return type — it's a built-in utility type that uses `infer` under the hood. Since loaders are async, the return type is `Promise<{ id: number; title: string; body: string }>`, not the inner object. `Awaited<T>` unwraps the Promise (recursively, handling nested Promises) to get the resolved type. Chained together, `Awaited<ReturnType<typeof loader>>` gives you the data shape that `data` will actually be at runtime after the `await` — which is exactly what the component needs for its props.
+
+</TypeDeepDive>
+
+The trade-off: the developer still has to write `Awaited<ReturnType<typeof loader>>` and thread it through `PageProps`. It's a boilerplate tax.
+
+---
+
+## Level 3: The `defineLoader` helper
+
+We can reduce the boilerplate with a helper function that validates the route path and preserves the return type:
+
+```typescript title="packages/eigen/helpers.ts"
+import type { RouteParamsMap } from 'eigen/route-types'
+
+/**
+ * Define a type-safe loader for a specific route.
+ * - Validates the path against known routes at compile time
+ * - Types the params based on the route's dynamic segments
+ * - Preserves the narrow return type for inference
+ */
+export function defineLoader<
+  TPath extends keyof RouteParamsMap,
+  TData,
+>(
+  _path: TPath,
+  fn: (ctx: { params: RouteParamsMap[TPath] }) => Promise<TData> | TData,
+): (ctx: { params: RouteParamsMap[TPath] }) => Promise<TData> | TData {
+  return fn
+}
+```
+
+The first generic parameter `TPath` is constrained to `keyof RouteParamsMap` — the union of all valid route paths generated by our plugin. TypeScript validates that the path string is a known route. The second generic parameter `TData` is inferred from the function's return type.
+
+<TypeDeepDive title="TypeScript: Generic constraints with `extends keyof`">
+
+`TPath extends keyof RouteParamsMap` constrains the type parameter `TPath` to only keys that exist in `RouteParamsMap` (the interface generated from your filesystem routes). The `keyof` operator produces a union of all the map's keys — your valid route paths, like `'/' | '/about' | '/posts/:id'`. When you call `defineLoader('/posts/:id', ...)`, TypeScript infers `TPath` as the literal `'/posts/:id'`, then uses it to look up `RouteParamsMap['/posts/:id']` to get `{ id: string }` for the params type. If you pass a path that isn't a key in the map, it's a compile error — no runtime check needed.
+
+</TypeDeepDive>
+
+Usage:
+
+```tsx title="src/pages/posts/[id].tsx"
+import { defineLoader } from 'eigen/helpers'
+import type { PageProps } from 'eigen/types'
+
+export const loader = defineLoader('/posts/:id', async ({ params }) => {
+  // params.id is typed as string — guaranteed by the route path
+  const res = await fetch(`https://api.example.com/posts/${params.id}`)
+  return res.json() as Promise<{ id: number; title: string; body: string }>
+})
+
+type LoaderData = Awaited<ReturnType<typeof loader>>
+
+export default function PostPage({
+  params,
+  data,
+}: PageProps<'/posts/:id', LoaderData>) {
+  return (
+    <article>
+      <h1>{data.title}</h1>
+      <p>Post #{params.id}</p>
+      <p>{data.body}</p>
+    </article>
+  )
+}
+```
+
+Now the path string is validated at compile time. If you write `defineLoader('/posts/:id', ...)` but the file is at `src/pages/users/[name].tsx`, the path won't match any entry in `RouteParamsMap` and TypeScript reports an error. The loader's params are correctly typed as `{ id: string }` without any annotation.
+
+You still need `Awaited<ReturnType<typeof loader>>` to bridge the loader return type to the component props. Eliminating that last piece of boilerplate requires per-route code generation.
+
+---
+
+## Level 4 (conceptual): Generated per-route types
+
+To eliminate all manual type annotations, the plugin can generate per-route helper modules:
+
+```typescript
+// Generated by the plugin into node_modules/.eigen/route-helpers.d.ts
+declare module 'eigen/page/posts/[id]' {
+  import type { PageProps } from 'eigen/types'
+
+  /** Pre-typed props for this page */
+  export type Props = PageProps<'/posts/:id'>
+
+  /** Hook that returns this route's loader data with full types */
+  export function useLoaderData(): Awaited<
+    ReturnType<typeof import('/src/pages/posts/[id].tsx').loader>
+  >
+}
+```
+
+With this, the developer writes:
+
+```tsx
+import { useLoaderData } from 'eigen/page/posts/[id]'
+
+export default function PostPage() {
+  const data = useLoaderData()
+  // data.title: string — fully inferred, zero annotations
+}
+```
+
+This is essentially what TanStack Router's code generation produces. The plugin scans each route file, extracts the loader's type signature, and generates a `.d.ts` with pre-connected types. The complexity is in the plugin, not in the developer's code.
+
+We won't implement this in the tutorial — it requires the plugin to parse TypeScript ASTs and extract type information, which is a significant investment. But understanding that it's possible (and how it works) is important for understanding the tradeoffs real frameworks make.
+
+---
+
+## The spectrum of framework type inference
+
+| Level | Developer writes | Framework generates | Used by |
+|---|---|---|---|
+| Manual | `PageProps<'/path', DataType>` | Route path union | Basic frameworks |
+| `satisfies` | `satisfies LoaderFn<'/path'>` + `ReturnType` | Route path union + param map | Eigen (our framework) |
+| `defineLoader` | `defineLoader('/path', fn)` + `ReturnType` | Path validation + typed params | Enhanced Eigen |
+| Full codegen | Nothing — types flow automatically | Per-route typed hooks + props | TanStack Router |
+
+Next.js App Router with Server Components takes a different approach — components *are* the data fetching layer, so there's no loader/component type bridge to build. The data is fetched inline with `await`, and TypeScript infers the types naturally because it's all in one function. This is an architectural trade-off, not a limitation of either approach: RSC eliminates the loader abstraction entirely, while the loader pattern provides a clearer separation of data fetching from rendering.
+
+---
+
+## Client-side data fetching
+
+After hydration, client-side navigations need fresh loader data. The initial page load gets data from `window.__EIGEN_DATA__`, but subsequent navigations don't have serialized data. The client needs to fetch it from the server.
+
+We add a data endpoint to the framework plugin:
+
+```typescript title="plugins/eigen-routes.ts"
+configureServer(server) {
+  // ... existing watcher code ...
+
+  return () => {
+    server.middlewares.use(async (req, res, next) => {
+      if (!req.url?.startsWith('/_eigen/data')) return next()
+
+      const url = new URL(req.url, 'http://localhost')
+      const pathname = url.searchParams.get('path') ?? '/'
+
+      try {
+        const { render } = await server.ssrLoadModule(
+          '/src/entry-server.tsx',
+        ) as { render: Function }
+        const { data } = await render(pathname)
+
+        res.setHeader('Content-Type', 'application/json')
+        res.end(JSON.stringify(data))
+      } catch (e) {
+        res.writeHead(500)
+        res.end('Internal server error')
+      }
+    })
+  }
+}
+```
+
+And update the client's navigation to fetch data:
+
+```tsx title="src/entry-client.tsx"
+function Router() {
+  const [pathname, setPathname] = useState(window.location.pathname)
+  const [data, setData] = useState<unknown>(window.__EIGEN_DATA__)
+  const [loading, setLoading] = useState(false)
+
+  useEffect(() => {
+    const handler = () => {
+      const newPath = window.location.pathname
+      setPathname(newPath)
+      setLoading(true)
+
+      // Fetch fresh data for the new route
+      fetch(`/_eigen/data?path=${encodeURIComponent(newPath)}`)
+        .then(res => res.json())
+        .then(newData => {
+          setData(newData)
+          setLoading(false)
+        })
+    }
+    window.addEventListener('popstate', handler)
+    return () => window.removeEventListener('popstate', handler)
+  }, [])
+
+  const match = matchRoute(pathname)
+  if (!match) return <h1>404</h1>
+  const Component = match.route.component
+
+  return (
+    <Suspense fallback={<div>Loading...</div>}>
+      {loading ? <div>Loading...</div> : (
+        <Component params={match.params} data={data} />
+      )}
+    </Suspense>
+  )
+}
+```
+
+This creates the standard framework data flow: first load gets data from serialized HTML, subsequent navigations fetch data from an API endpoint that calls the same loader functions on the server. This is exactly how Next.js's `getServerSideProps` works — subsequent navigations hit `/_next/data/...` to get fresh props.
+
+---
+
+## What to observe
+
+1. **View source** — the HTML contains a `<script>` tag with `window.__EIGEN_DATA__` holding the serialized loader data. This is the same pattern as Next.js's `__NEXT_DATA__`.
+
+2. **Navigate between pages** with the Link component. Open the Network tab and watch for `/_eigen/data` requests. Each client-side navigation fetches loader data from the server.
+
+3. **The loader never appears in the client bundle.** Because the client version of `eigen/routes` doesn't import loaders, Vite's tree-shaking eliminates them entirely. You can verify this in `vite-plugin-inspect` or by running a production build.
+
+4. **The `defineLoader` path is type-checked.** Try `defineLoader('/nonexistent', ...)` and see the compile error.
+
+---
+
+## Key insight
+
+The loader type inference story is really a question about where the type information lives and how it flows. At the simplest level, the developer writes the types manually. At the most sophisticated level, the framework's plugin extracts type information from source files and generates declarations that connect everything automatically.
+
+The `satisfies` operator is the key TypeScript feature that makes Level 2 and Level 3 work. Without it, the loader's return type would widen to `unknown` (matching the `LoaderFn` signature), and `ReturnType` would be useless. `satisfies` constrains the shape while preserving the narrow type — exactly what framework type inference needs.
+
+---
+
+## What's next
+
+In Part 6, we'll tackle production builds — the `vite build` command, client/server build coordination, manifest files, and the production server. This is where the dev server's two module graphs produce two concrete output directories, connected by a manifest.

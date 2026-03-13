@@ -1,0 +1,384 @@
+---
+title: "Part 19: Edge Runtimes"
+description: "Custom Vite environments, the DevEnvironment factory, resolve conditions, and building for multiple runtimes."
+---
+
+
+*This is the nineteenth installment in a series where we build a toy Next.js on top of Vite. In [Part 18](/18-runtime-validation), we added runtime validation. Now we'll use the Environment API (introduced in Vite 6) to add a third environment targeting Cloudflare Workers — a fundamentally different runtime with different global APIs, different constraints, and different deployment characteristics.*
+
+**Concepts introduced:** Custom Vite environments, `DevEnvironment` factory, the `react-server` condition, environment-polymorphic types, `Request`/`Response` Web APIs vs Node's `IncomingMessage`/`ServerResponse`, `@cloudflare/vite-plugin` and `createWorkerdEnvironment`, `childEnvironments`, building for multiple runtimes from a single config.
+
+---
+
+## Why a third environment matters
+
+<Callout type="info" title="Environment vs. runtime">
+In this series, **environment** refers to a Vite build/dev target (client, ssr, edge) — each with its own module graph and resolve conditions. **Runtime** refers to the actual execution context where the code runs (browser, Node.js, Cloudflare Workers, Deno). A single environment targets a specific runtime.
+</Callout>
+
+So far, Eigen has two environments: `client` (browser) and `ssr` (Node.js). But modern deployment platforms don't just run Node. Cloudflare Workers, Deno Deploy, Vercel Edge Functions, and Netlify Edge all run JavaScript in lightweight V8 isolates with Web API globals (`Request`, `Response`, `fetch`) instead of Node APIs (`http.IncomingMessage`, `fs`, `Buffer`).
+
+These edge runtimes have different constraints: no filesystem access, limited CPU time, restricted `node:` built-ins, and different module resolution. A framework that deploys to the edge needs Vite to process server code for this target — which means a third environment with its own resolve conditions, its own module graph, and its own build output.
+
+This is exactly the problem the Environment API was designed to solve.
+
+---
+
+## Defining the edge environment
+
+In `vite.config.ts`, add a custom environment:
+
+```typescript title="vite.config.ts"
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+import eigen from 'eigen/plugin'
+
+export default defineConfig({
+  plugins: [eigen(), react()],
+  environments: {
+    // The default 'client' and 'ssr' environments are still here.
+    // We add a third one:
+    edge: {
+      // Resolve conditions for Cloudflare Workers / edge runtimes
+      resolve: {
+        conditions: ['workerd', 'worker', 'edge-light', 'browser'],
+        // Don't use Node built-ins
+        mainFields: ['module', 'main'],
+      },
+      build: {
+        outDir: 'dist/edge',
+        rollupOptions: {
+          input: 'src/entry-edge.tsx',
+          // Edge bundles are self-contained — no external node_modules
+          external: [],
+        },
+        // Target modern JS (V8 isolates support recent syntax)
+        target: 'es2022',
+      },
+      // Don't try to externalize node_modules for edge
+      // (edge bundles must be self-contained)
+      nodeCompat: false,
+    },
+  },
+})
+```
+
+### Resolve conditions
+
+The `conditions` array is critical. When Vite resolves an import like `import { renderToReadableStream } from 'react-dom/server'`, it checks the package's `exports` map against these conditions. React's `package.json` exports different entry points for different conditions:
+
+- `"node"` → Node.js build (uses `Buffer`, streams)
+- `"workerd"` → Cloudflare Workers build (uses Web APIs)
+- `"browser"` → Browser build
+- `"react-server"` → RSC server build (we'll use this in Part 21)
+
+By setting conditions to `['workerd', 'worker', 'edge-light', 'browser']`, the edge environment gets Web API-compatible builds of React and other packages.
+
+---
+
+## The edge entry point
+
+Edge runtimes use Web standard APIs — the entry point structure is the same as the Node SSR version from Part 3, but the handler signature and streaming APIs differ:
+
+<Tabs items={["Edge (Web APIs)", "Node SSR (for comparison)"]}>
+<Tab value="Edge (Web APIs)">
+
+```typescript title="src/entry-edge.tsx"
+import React from 'react'
+import { renderToReadableStream } from 'react-dom/server'
+import { routes } from 'eigen/routes'
+import type { RouteDefinition } from 'eigen/types'
+
+interface RouteMatch {
+  route: RouteDefinition
+  params: Record<string, string>
+}
+
+function matchRoute(pathname: string): RouteMatch | null {
+  // Same matching logic as other entries
+  for (const route of routes) {
+    if (route.path === pathname) return { route, params: {} }
+    const routeParts = route.path.split('/')
+    const pathParts = pathname.split('/')
+    if (routeParts.length !== pathParts.length) continue
+    const params: Record<string, string> = {}
+    const match = routeParts.every((part, i) => {
+      if (part.startsWith(':')) {
+        params[part.slice(1)] = pathParts[i]
+        return true
+      }
+      return part === pathParts[i]
+    })
+    if (match) return { route, params }
+  }
+  return null
+}
+
+// Edge handler uses Web standard Request/Response
+export default {
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url)
+    const match = matchRoute(url.pathname)
+
+    if (!match) {
+      return new Response('<h1>404</h1>', {
+        status: 404,
+        headers: { 'Content-Type': 'text/html' },
+      })
+    }
+
+    // Run loader
+    let data: unknown = null
+    if (match.route.loader) {
+      data = await match.route.loader({ params: match.params })
+    }
+
+    const Component = match.route.component
+    const App = () => <Component params={match.params} data={data} />
+
+    // Use Web Streams API (not Node streams)
+    const stream = await renderToReadableStream(<App />, {
+      onError(error: unknown) {
+        console.error('Edge SSR error:', error)
+      },
+    })
+
+    // For bots, wait for all content
+    const isBot = /bot|crawler|spider/i.test(
+      request.headers.get('user-agent') ?? '',
+    )
+    if (isBot) {
+      await stream.allReady
+    }
+
+    return new Response(stream, {
+      status: 200,
+      headers: { 'Content-Type': 'text/html' },
+    })
+  },
+}
+```
+
+</Tab>
+<Tab value="Node SSR (for comparison)">
+
+```typescript title="src/entry-server.tsx"
+import express from 'express'
+import { renderToPipeableStream } from 'react-dom/server'
+
+// Express callback pattern: (req, res) => void
+app.get('*', async (req, res) => {
+  const match = matchRoute(req.originalUrl)
+  const data = match?.route.loader
+    ? await match.route.loader({ params: match.params })
+    : null
+
+  // Node streams: pipe to response
+  const { pipe } = renderToPipeableStream(<App />, {
+    onShellReady() {
+      res.setHeader('Content-Type', 'text/html')
+      pipe(res)
+    },
+  })
+})
+```
+
+</Tab>
+</Tabs>
+
+Notice the fundamental API difference: instead of Express's `(req, res) => void` callback pattern, edge runtimes use `(request: Request) => Promise<Response>` — the Web standard fetch handler. Instead of `renderToPipeableStream` (Node streams), we use `renderToReadableStream` (Web streams).
+
+---
+
+## Environment-polymorphic types
+
+Our framework types need to support both Node and edge handlers. This is where TypeScript's conditional types earn their keep:
+
+```typescript title="packages/eigen/handler-types.ts"
+/** Node.js handler (Express/Hono/Fastify style) */
+export interface NodeHandler {
+  (
+    req: import('http').IncomingMessage,
+    res: import('http').ServerResponse,
+  ): Promise<void> | void
+}
+
+/** Edge handler (Cloudflare Workers / Web standard) */
+export interface EdgeHandler {
+  fetch(request: Request): Promise<Response>
+}
+
+/** API handler that works in either environment */
+export type UniversalApiHandler<TResponse = unknown> =
+  | {
+      runtime: 'node'
+      handler: (ctx: ApiContext) => Promise<TResponse>
+    }
+  | {
+      runtime: 'edge'
+      handler: (request: Request) => Promise<Response>
+    }
+
+/**
+ * The framework's createHandler helper adapts to the target environment.
+ * The plugin generates different code per environment, so at runtime
+ * only one branch exists in the bundle.
+ */
+export function createHandler<T>(
+  handlers: {
+    node?: (ctx: ApiContext) => Promise<T>
+    edge?: (request: Request) => Promise<Response>
+  },
+): NodeHandler | EdgeHandler {
+  // At runtime, only one path is bundled.
+  // The plugin's transform or virtual module generates the correct import.
+  if (typeof globalThis.process !== 'undefined') {
+    // Node environment
+    return handlers.node as any
+  } else {
+    // Edge environment
+    return { fetch: handlers.edge! } as any
+  }
+}
+```
+
+A cleaner approach: the virtual module generates different handler wiring per environment, so the runtime check is unnecessary. The edge environment's `eigen/routes` imports the edge-compatible handler directly.
+
+---
+
+## Plugin behavior per environment
+
+The `applyToEnvironment` hook (introduced in Part 7) becomes essential when you have three environments. Some plugins should only run in specific environments:
+
+```typescript
+// Example: a plugin that polyfills Node APIs for edge
+export function edgePolyfills(): Plugin {
+  return {
+    name: 'eigen-edge-polyfills',
+    applyToEnvironment(env) {
+      return env.name === 'edge'
+    },
+    resolveId(id) {
+      // Redirect Node built-in imports to edge-compatible polyfills
+      if (id === 'node:crypto') return 'eigen/polyfills/crypto'
+      if (id === 'node:buffer') return 'eigen/polyfills/buffer'
+    },
+  }
+}
+```
+
+The virtual route module also needs to generate edge-appropriate code:
+
+```typescript
+// In the load() hook — three-way branch
+load(id: string) {
+  if (id !== resolvedVirtualModuleId) return
+
+  const routes = discoverRoutes(pagesDir)
+  const envName = this.environment?.name
+
+  if (envName === 'edge') {
+    // Edge: static imports, loaders included, no React.lazy
+    // (same as SSR, but resolve conditions differ)
+    return generateRouteCode(routes, { lazy: false, includeLoaders: true })
+  } else if (envName === 'ssr') {
+    return generateRouteCode(routes, { lazy: false, includeLoaders: true })
+  } else {
+    // Client: lazy imports, no loaders
+    return generateRouteCode(routes, { lazy: true, includeLoaders: false })
+  }
+}
+```
+
+---
+
+## Build orchestration with three environments
+
+The `buildApp` hook now coordinates three builds:
+
+```typescript
+buildApp: {
+  order: 'pre' as const,
+  async handler(builder) {
+    // 1. Client build (generates manifest)
+    await builder.build(builder.environments.client)
+    // 2. Node SSR build (for traditional server hosting)
+    await builder.build(builder.environments.ssr)
+    // 3. Edge build (for Cloudflare/Deno deployment)
+    if (builder.environments.edge) {
+      await builder.build(builder.environments.edge)
+    }
+  },
+}
+```
+
+The output structure:
+
+<Files>
+  <Folder name="dist" defaultOpen>
+    <Folder name="client" defaultOpen comment="Browser bundles + static assets">
+      <File name="index.html" />
+      <Folder name="assets" />
+      <Folder name=".vite" defaultOpen>
+        <File name="manifest.json" />
+      </Folder>
+    </Folder>
+    <Folder name="server" defaultOpen comment="Node.js server bundle">
+      <File name="entry-server.js" />
+    </Folder>
+    <Folder name="edge" defaultOpen comment="Edge worker bundle">
+      <File name="entry-edge.js" comment="Self-contained, no node_modules" />
+    </Folder>
+  </Folder>
+</Files>
+
+---
+
+## Using `@cloudflare/vite-plugin`
+
+In a real deployment, you'd use Cloudflare's official Vite plugin instead of configuring the edge environment manually. This maps directly to the pattern we've built:
+
+```typescript
+import { defineConfig } from 'vite'
+import { cloudflare } from '@cloudflare/vite-plugin'
+import react from '@vitejs/plugin-react'
+import eigen from 'eigen/plugin'
+
+export default defineConfig({
+  plugins: [
+    eigen(),
+    cloudflare(), // Configures the edge environment automatically
+    react(),
+  ],
+})
+```
+
+The Cloudflare plugin creates an environment backed by `workerd` (the actual Workers runtime) for dev, so your edge code runs in the real runtime during development — not a Node.js approximation. This is the "dev matches prod" promise of the Environment API.
+
+---
+
+## What to observe
+
+1. **Run `vite build`** with the edge environment configured. You get three output directories. The edge bundle is self-contained — no `require('pg')` or other Node dependencies.
+
+2. **Compare the edge and SSR bundles.** The edge bundle uses `renderToReadableStream` and `Response`. The SSR bundle uses `renderToPipeableStream` and Express. Same app, different runtime targets.
+
+3. **Check resolve behavior.** Import something that has different exports for Node vs. edge (like `react-dom/server`). The edge environment resolves to the workerd-compatible build.
+
+4. **Try importing `node:fs` in an edge-targeted file.** It either fails (correctly — no filesystem in Workers) or gets redirected by the polyfill plugin.
+
+---
+
+## Key insight
+
+The Environment API is the Vite feature that makes multi-runtime frameworks possible. Before the Environment API, supporting edge runtimes meant running separate Vite instances or using a meta-framework like Vinxi to coordinate multiple builds. Now it's a configuration object with its own resolve conditions, build config, and plugin filtering.
+
+For a framework author, the three environments — client, ssr, edge — are three different *compilation targets* for the same source code. The plugin pipeline is shared (one set of plugins), but each environment gets its own module graph, its own resolved imports, and its own build output. The virtual module generates different code per environment. The `applyToEnvironment` hook lets plugins opt in or out. And `buildApp` orchestrates the whole thing.
+
+This is the architectural foundation for React Server Components, which we'll explore in the next (and final) installment.
+
+---
+
+## What's next
+
+In Part 20, we'll add **observability** — instrumenting Eigen's rendering pipeline with OpenTelemetry for distributed tracing, performance budgets, and adapter-specific exporters.

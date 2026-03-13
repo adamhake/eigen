@@ -1,0 +1,255 @@
+---
+title: "Part 6: Production Builds"
+description: "Client/server build coordination, manifest files, hashed assets, and the production server."
+---
+
+
+*This is the seventh installment in a series where we build a toy Next.js on top of Vite. In [Part 5](/05-typed-loaders), we built typed data loaders. Now we'll move from development to production — building optimized, deployable artifacts.*
+
+**Concepts introduced:** `vite build`, `--ssr` flag, client/server build coordination, manifest files, hashed asset filenames, the production server.
+
+---
+
+## Development vs. production
+
+Everything we've built so far runs on the Vite dev server — the on-demand module transformer from Part 0. In development, the browser requests modules individually, and Vite transforms each one on the fly. This is great for DX (instant startup, fast HMR) but terrible for production: hundreds of individual HTTP requests, untransformed source files, no minification, no tree-shaking.
+
+In production, Vite switches to a completely different tool: **Rollup**. Rollup is a bundler that processes the *entire* module graph eagerly and produces optimized output:
+
+- **Bundling**: Hundreds of source modules are combined into a handful of chunks, eliminating the HTTP request waterfall.
+- **Tree-shaking**: Rollup analyzes `import`/`export` relationships and removes unused code. If a module exports 10 functions but only 3 are imported, the other 7 are eliminated from the output.
+- **Scope hoisting**: Instead of wrapping each module in a function (like webpack), Rollup concatenates modules into a single scope, reducing overhead and enabling better minification.
+- **Code splitting**: Dynamic `import()` statements (like our `React.lazy(() => import('./Page'))`) create separate chunks that load on demand.
+- **Minification**: Variable names are shortened, whitespace is removed, and dead code is eliminated.
+- **Hashed filenames**: Output files get content-based hashes (`entry-client-a1b2c3d4.js`), enabling indefinite browser caching — when code changes, the hash changes, and the browser fetches the new version.
+
+<Callout type="info" title="Your plugins run in both modes">
+The same `resolveId`/`load`/`transform` hooks that served modules on-demand in development now process them eagerly during Rollup's build. Your route plugin's virtual module is generated the same way — the only difference is *when* it runs (on-demand vs. ahead-of-time) and *what consumes the output* (browser requests vs. Rollup's module graph).
+</Callout>
+
+For a server-rendered framework, we need **two** Rollup builds — one for the client (browser-targeted, code-split, hashed) and one for the server (Node-targeted, single-file, unhashed). These are connected by a manifest file.
+
+---
+
+## Configuring the builds
+
+```typescript title="vite.config.ts"
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+import eigenRoutes from './plugins/eigen-routes'
+
+export default defineConfig({
+  plugins: [react(), eigenRoutes()],
+  build: {
+    manifest: true,
+    rollupOptions: {
+      input: 'src/entry-client.tsx',
+    },
+  },
+})
+```
+
+**`manifest: true`** tells Vite to generate a `.vite/manifest.json` file alongside the build output. This file maps source file paths to their built equivalents:
+
+```json
+{
+  "src/entry-client.tsx": {
+    "file": "assets/entry-client-a1b2c3d4.js",
+    "css": ["assets/style-e5f6g7h8.css"],
+    "isEntry": true
+  }
+}
+```
+
+**`rollupOptions.input`** sets the entry point for the client build. Without this, Vite defaults to `index.html` and its `<script>` tags.
+
+### Build commands
+
+```json title="package.json"
+{
+  "scripts": {
+    "build": "npm run build:client && npm run build:server",
+    "build:client": "vite build --outDir dist/client",
+    "build:server": "vite build --outDir dist/server --ssr src/entry-server.tsx"
+  }
+}
+```
+
+The **`--ssr` flag** changes the build fundamentally:
+
+- **Target**: Node instead of the browser
+- **Code splitting**: Disabled — the server bundle is a single file
+- **External dependencies**: `node_modules` packages are *not* bundled by default (they're available at runtime in Node)
+- **Module format**: ESM (or CJS, configurable)
+- **Asset handling**: No hashing — server bundles don't need cache-busted filenames
+
+Both builds run the same plugin pipeline. Our `eigen-routes` plugin generates the virtual module during both builds, producing client-specific code (lazy imports) for the client build and server-specific code (static imports + loaders) for the server build. Same plugin, different output.
+
+---
+
+## The manifest file
+
+After `vite build --outDir dist/client`, the manifest at `dist/client/.vite/manifest.json` looks like:
+
+```json
+{
+  "src/entry-client.tsx": {
+    "file": "assets/entry-client-a1b2c3d4.js",
+    "imports": [
+      "_vendor-i9j0k1l2.js"
+    ],
+    "css": [
+      "assets/style-e5f6g7h8.css"
+    ],
+    "isEntry": true
+  },
+  "src/pages/Home.tsx": {
+    "file": "assets/Home-m3n4o5p6.js",
+    "isDynamicEntry": true
+  },
+  "src/pages/About.tsx": {
+    "file": "assets/About-q7r8s9t0.js",
+    "isDynamicEntry": true
+  }
+}
+```
+
+The manifest tells the production server:
+- The client entry compiled to `assets/entry-client-a1b2c3d4.js`
+- Each page compiled to its own chunk (because we used `React.lazy(() => import(...))` in the client virtual module, Rollup produced separate chunks)
+- The CSS extracted to `assets/style-e5f6g7h8.css`
+- Vendor code (React, etc.) is in a shared `_vendor-i9j0k1l2.js` chunk
+
+The content hashes in filenames (`a1b2c3d4`) mean the browser can cache these files indefinitely. When code changes, the hash changes, the filename changes, and the browser fetches the new version.
+
+---
+
+## The production server
+
+```typescript title="server.prod.ts"
+import express from 'express'
+import { readFileSync } from 'fs'
+
+const app = express()
+
+// Serve hashed static assets with aggressive caching
+app.use(
+  '/assets',
+  express.static('dist/client/assets', {
+    maxAge: '1y',         // Cache for a year — hashes handle busting
+    immutable: true,       // Tell the browser this will never change
+  }),
+)
+
+// Serve other static files (favicon, etc.) without aggressive caching
+app.use(express.static('dist/client', { index: false }))
+
+// Read the built HTML template
+const template = readFileSync('dist/client/index.html', 'utf-8')
+
+// Read the manifest
+const manifest: Record<string, { file: string; css?: string[] }> = JSON.parse(
+  readFileSync('dist/client/.vite/manifest.json', 'utf-8'),
+)
+
+// Import the server build
+const { render } = await import('./dist/server/entry-server.js') as {
+  render: (pathname: string) => Promise<{
+    html: string
+    status: number
+    data: unknown
+  }>
+}
+
+app.get('*', async (req, res) => {
+  try {
+    const { html: appHtml, status, data } = await render(req.originalUrl)
+
+    // Inject preload hints for the entry chunk and its CSS
+    const entry = manifest['src/entry-client.tsx']
+    const preloadLinks = [
+      `<link rel="modulepreload" href="/${entry.file}" />`,
+      ...(entry.css?.map(css => `<link rel="stylesheet" href="/${css}" />`) ?? []),
+    ].join('\n    ')
+
+    const finalHtml = template
+      .replace('<!--ssr-outlet-->', appHtml)
+      .replace(
+        '</head>',
+        `    ${preloadLinks}\n    <script>window.__EIGEN_DATA__ = ${JSON.stringify(data)}</script>\n  </head>`,
+      )
+
+    res.status(status).set({ 'Content-Type': 'text/html' }).end(finalHtml)
+  } catch (e) {
+    console.error(e)
+    res.status(500).end('Internal server error')
+  }
+})
+
+app.listen(3000, () => console.log('Production server: http://localhost:3000'))
+```
+
+Notice what changed from the dev server:
+
+- **No Vite instance.** The dev server created Vite with `createServer()` and used it as middleware. The production server doesn't need Vite at all.
+- **Static file serving replaces Vite's middleware.** Express serves pre-built files from `dist/client/`.
+- **No `transformIndexHtml`.** The HTML was already processed during the build. Asset URLs are already rewritten.
+- **`import()` instead of `ssrLoadModule`.** The server entry is a pre-built Node module, not a source file that needs on-demand transformation.
+- **Manifest-driven asset injection.** The server reads the manifest to know which script and stylesheet URLs to inject into the HTML.
+
+---
+
+## What the builds produce
+
+After running `npm run build`, you'll have:
+
+<Files>
+  <Folder name="dist" defaultOpen>
+    <Folder name="client" defaultOpen>
+      <Folder name=".vite" defaultOpen>
+        <File name="manifest.json" comment="Maps source → hashed filenames" />
+      </Folder>
+      <File name="index.html" comment="Built HTML (scripts rewritten)" />
+      <Folder name="assets" defaultOpen>
+        <File name="entry-client-a1b2c3d4.js" comment="Client entry" />
+        <File name="Home-m3n4o5p6.js" comment="Lazy-loaded page chunk" />
+        <File name="About-q7r8s9t0.js" comment="Lazy-loaded page chunk" />
+        <File name="_vendor-i9j0k1l2.js" comment="Shared vendor chunk" />
+        <File name="style-e5f6g7h8.css" comment="Extracted CSS" />
+      </Folder>
+    </Folder>
+    <Folder name="server" defaultOpen>
+      <File name="entry-server.js" comment="Server bundle (no hashing)" />
+    </Folder>
+  </Folder>
+</Files>
+
+The client directory is entirely static — it could be deployed to a CDN. The server directory contains a single entry point for the Node process.
+
+**Type annotations are stripped in the output.** The production bundles are pure JavaScript. TypeScript was a dev-time concern; the build output has no trace of it.
+
+---
+
+## What to observe
+
+1. **Run the build** with `npm run build`. Watch the terminal output — Vite reports chunk sizes and warnings about large bundles.
+
+2. **Inspect the manifest.** Open `dist/client/.vite/manifest.json` and trace how source files map to hashed outputs.
+
+3. **Run the production server** with `node server.prod.js` (you'll need to compile it first or use `tsx`). Compare it to the dev server: the output is the same HTML structure, but assets load from hashed URLs instead of through Vite's transform pipeline.
+
+4. **Both builds run the same plugin.** Our `eigen-routes` plugin generates `eigen/routes` during both the client and server builds, with environment-appropriate code.
+
+---
+
+## Key insight
+
+The production build is where "two module graphs" becomes "two output directories." The manifest file is the bridge between them. Every SSR framework has this pattern: build client, build server, use the manifest to connect them at runtime.
+
+In a later installment, we'll see how `buildApp` — the Vite 7+ hook for build orchestration — lets the framework coordinate both builds in a single `vite build` command.
+
+---
+
+## What's next
+
+In Part 7, we'll dive into the `transform` hook — the most powerful and dangerous tool in the plugin API. We'll use it to strip server-only code from client bundles, ensuring that database drivers and other Node-only imports don't leak into browser bundles. We'll also explore the difference between regex-based transformation and proper AST parsing with the TypeScript compiler API.

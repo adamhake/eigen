@@ -1,0 +1,316 @@
+---
+title: "Part 22: The Navigation API"
+description: "Browser-native routing with navigation.navigate(), NavigateEvent.intercept(), and abort signals."
+---
+
+
+*This is the twenty-second installment in a series where we build a toy Next.js on top of Vite. In [Part 21](/21-react-server-components), we implemented React Server Components. Now we'll replace our hand-rolled `pushState`/`popstate` router with the Navigation API — the modern browser primitive for client-side routing that became Baseline Newly Available in January 2026.*
+
+**Concepts introduced:** The `navigation.navigate()` API, `NavigateEvent.intercept()`, abort signals for navigations, `navigation.transition` for pending state, `NavigationHistoryEntry`, replacing the framework router with browser primitives, progressive enhancement from MPA to SPA.
+
+---
+
+## What's wrong with `pushState`/`popstate`
+
+Since Part 2, our client-side router has used this pattern:
+
+```typescript
+window.history.pushState({}, '', href)
+window.dispatchEvent(new PopStateEvent('popstate'))
+```
+
+This works, but it's a hack. `pushState` is a low-level history manipulation API that was never designed for application routing. The problems are well-known: `popstate` doesn't fire on `pushState` (we manually dispatch it), there's no way to intercept or cancel navigations, no built-in loading states, no abort signals, and back/forward button handling requires careful state management.
+
+The Navigation API, standardized as part of the HTML spec and now available in Chrome, Edge, and Firefox (147+), was designed specifically for what frameworks have been building ad hoc for a decade.
+
+---
+
+## The core API
+
+```typescript
+// Listen to ALL navigations — link clicks, back/forward, form submissions, programmatic
+navigation.addEventListener('navigate', (event: NavigateEvent) => {
+  // Only handle same-origin navigations
+  if (!event.canIntercept) return
+
+  const url = new URL(event.destination.url)
+
+  event.intercept({
+    // This async handler replaces the navigation with your SPA logic
+    async handler() {
+      const match = matchRoute(url.pathname)
+      if (!match) return // Fall through to browser default (404)
+
+      // Fetch data, update React state, etc.
+      const data = await fetchLoaderData(url.pathname)
+      renderRoute(match, data)
+    },
+
+    // The browser shows a loading indicator (and fires events) during this
+    focusReset: 'after-transition',
+    scroll: 'after-transition',
+  })
+})
+
+// Programmatic navigation — replaces pushState
+navigation.navigate('/posts/42')
+
+// With state
+navigation.navigate('/dashboard', { state: { tab: 'analytics' } })
+
+// Replace current entry (instead of pushing)
+navigation.navigate('/login', { history: 'replace' })
+```
+
+The fundamental shift: instead of the framework *performing* navigations (`pushState`, dispatch event, manually handle the response), the framework *intercepts* navigations that the browser initiates. Links, form submissions, `navigation.navigate()`, and back/forward buttons all fire the same `navigate` event. The framework handles them uniformly.
+
+---
+
+## Rewriting Eigen's router
+
+Replace the `popstate` listener and manual `pushState` dispatch with the Navigation API:
+
+```tsx title="packages/eigen/router.tsx"
+import { useState, useEffect, useTransition, Suspense } from 'react'
+import { routes } from 'eigen/routes'
+import type { RouteDefinition } from 'eigen/types'
+import type { RoutePaths, RouteParamsMap } from 'eigen/route-types'
+
+interface RouteMatch {
+  route: RouteDefinition
+  params: Record<string, string>
+}
+
+function matchRoute(pathname: string): RouteMatch | null {
+  for (const route of routes) {
+    if (route.path === pathname) return { route, params: {} }
+    const routeParts = route.path.split('/')
+    const pathParts = pathname.split('/')
+    if (routeParts.length !== pathParts.length) continue
+    const params: Record<string, string> = {}
+    const match = routeParts.every((part, i) => {
+      if (part.startsWith(':')) {
+        params[part.slice(1)] = pathParts[i]
+        return true
+      }
+      return part === pathParts[i]
+    })
+    if (match) return { route, params }
+  }
+  return null
+}
+
+export function Router() {
+  const [pathname, setPathname] = useState(window.location.pathname)
+  const [data, setData] = useState<unknown>(window.__EIGEN_DATA__)
+  const [isNavigating, setIsNavigating] = useState(false)
+  const [isPending, startTransition] = useTransition()
+
+  useEffect(() => {
+    // Feature detection — fall back to popstate if Navigation API unavailable
+    if (!('navigation' in window)) {
+      const handler = () => setPathname(window.location.pathname)
+      window.addEventListener('popstate', handler)
+      return () => window.removeEventListener('popstate', handler)
+    }
+
+    const handleNavigate = (event: NavigateEvent) => {
+      // Only intercept same-origin, non-download navigations
+      if (!event.canIntercept || event.hashChange) return
+
+      const url = new URL(event.destination.url)
+
+      // Only handle routes we know about
+      const match = matchRoute(url.pathname)
+      if (!match) return // Let the browser handle it (404 page, external link)
+
+      event.intercept({
+        async handler() {
+          setIsNavigating(true)
+
+          try {
+            // Fetch loader data from the server
+            const res = await fetch(
+              `/_eigen/data?path=${encodeURIComponent(url.pathname)}`,
+              { signal: event.signal }, // ← Automatic abort on new navigation!
+            )
+            const newData = await res.json()
+
+            // Use React transition to avoid blocking the UI
+            startTransition(() => {
+              setPathname(url.pathname)
+              setData(newData)
+            })
+          } finally {
+            setIsNavigating(false)
+          }
+        },
+        focusReset: 'after-transition',
+        scroll: 'after-transition',
+      })
+    }
+
+    navigation.addEventListener('navigate', handleNavigate)
+    return () => navigation.removeEventListener('navigate', handleNavigate)
+  }, [])
+
+  const match = matchRoute(pathname)
+  if (!match) return <h1>404</h1>
+  const Component = match.route.component
+
+  return (
+    <>
+      {/* Native navigation-aware loading indicator */}
+      {isNavigating && <div className="nav-progress-bar" />}
+      <Suspense fallback={<div>Loading...</div>}>
+        <Component params={match.params} data={data} />
+      </Suspense>
+    </>
+  )
+}
+```
+
+### The `Link` component simplifies dramatically
+
+```tsx
+interface LinkProps<T extends RoutePaths> {
+  to: T
+  params?: RouteParamsMap[T]
+  children: React.ReactNode
+}
+
+function Link<T extends RoutePaths>({ to, params, children }: LinkProps<T>) {
+  let href: string = to
+  if (params) {
+    href = to.replace(/:(\w+)/g, (_, key: string) => {
+      return (params as Record<string, string>)[key] ?? `:${key}`
+    })
+  }
+
+  // That's it. A regular anchor tag.
+  // The Navigation API's navigate event intercepts the click.
+  // No onClick handler, no preventDefault, no manual pushState.
+  return <a href={href}>{children}</a>
+}
+```
+
+This is the key simplification. The `Link` component no longer needs `onClick` / `preventDefault` / `pushState`. It renders a plain `<a>` tag. The Navigation API's `navigate` event fires when the user clicks it, and our intercept handler takes over. The link works with or without JavaScript — it's progressively enhanced by default.
+
+---
+
+## Abort signals: free cancellation
+
+Notice `{ signal: event.signal }` on the fetch call. The `NavigateEvent` provides an `AbortSignal` that fires when the user initiates a *new* navigation before the current one completes. If a user clicks three links quickly, the first two fetches are automatically aborted. No manual cleanup needed.
+
+Compare this to our `popstate` router, where we had no cancellation at all — every fetch ran to completion even if the user had already navigated away.
+
+---
+
+## Transition state: `navigation.transition`
+
+The Navigation API tracks the current in-progress navigation via `navigation.transition`:
+
+```typescript
+// In a global loading indicator component
+function GlobalProgress() {
+  const [loading, setLoading] = useState(false)
+
+  useEffect(() => {
+    navigation.addEventListener('navigatesuccess', () => setLoading(false))
+    navigation.addEventListener('navigateerror', () => setLoading(false))
+    navigation.addEventListener('navigate', (e) => {
+      if (e.canIntercept) setLoading(true)
+    })
+  }, [])
+
+  return loading ? <progress className="global-nav-progress" /> : null
+}
+```
+
+The browser provides `navigatesuccess` and `navigateerror` events, replacing the ad hoc loading state management that every SPA framework currently implements.
+
+---
+
+## History entries with typed state
+
+The Navigation API's `NavigationHistoryEntry` objects carry state that persists across navigations and survives page reloads (unlike React state):
+
+```typescript
+// Store scroll position, form state, etc. in the history entry
+navigation.navigate('/dashboard', {
+  state: { scrollY: window.scrollY, activeTab: 'analytics' },
+})
+
+// Read it back
+const entry = navigation.currentEntry
+const state = entry?.getState() as { scrollY?: number; activeTab?: string }
+```
+
+A framework plugin could generate typed state interfaces per route:
+
+```typescript
+// In the generated .d.ts
+declare module 'eigen/route-types' {
+  export interface RouteStateMap {
+    '/dashboard': { scrollY?: number; activeTab?: string }
+    '/posts/:id': { commentDraft?: string }
+  }
+}
+```
+
+---
+
+## Plugin integration: generating a Navigation API-aware router
+
+The route plugin can generate the intercept handler as part of the virtual module, so the user doesn't write routing logic at all:
+
+```typescript
+// In the client virtual module, the plugin generates:
+export function setupRouter(renderFn: (pathname: string, data: unknown) => void) {
+  if ('navigation' in window) {
+    navigation.addEventListener('navigate', (event) => {
+      if (!event.canIntercept) return
+      const url = new URL(event.destination.url)
+      const match = matchRoute(url.pathname)
+      if (!match) return
+
+      event.intercept({
+        async handler() {
+          const res = await fetch(
+            `/_eigen/data?path=${encodeURIComponent(url.pathname)}`,
+            { signal: event.signal },
+          )
+          const data = await res.json()
+          renderFn(url.pathname, data)
+        },
+      })
+    })
+  }
+}
+```
+
+---
+
+## What to observe
+
+1. **Click a link, then quickly click another.** In the Network tab, the first request shows as "cancelled" — the abort signal from the Navigation API killed it automatically.
+
+2. **Use the browser's back/forward buttons.** The same `navigate` event fires, with `event.navigationType === 'traverse'`. No separate `popstate` handler needed.
+
+3. **Disable JavaScript** and click a link. The page still navigates — it's a real `<a>` tag with a real `href`. The Navigation API is progressive enhancement over standard HTML.
+
+4. **Check `navigation.entries()`.** It returns the full history stack with typed state, replacing the opaque `window.history` API.
+
+---
+
+## Key insight
+
+The Navigation API moves routing from "framework concern" to "browser primitive." Instead of every framework reimplementing `pushState` wrappers, click interception, scroll restoration, and abort handling, the browser provides a single event-driven model. The framework's job narrows: match routes, fetch data, render components. The transport layer (intercepting navigations, managing history, aborting in-flight requests) is handled by the platform.
+
+For Vite plugin authors, this means the generated router code gets simpler. Less JavaScript in the client bundle, fewer edge cases to handle, and better integration with browser features like the back/forward cache (bfcache).
+
+---
+
+## What's next
+
+In Part 23, we'll combine the Navigation API with the **View Transitions API** and **Speculation Rules** — enabling CSS-animated page transitions and browser-native prerendering that together give Eigen the feel of a native app without a single line of animation JavaScript.

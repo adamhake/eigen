@@ -1,0 +1,393 @@
+---
+title: "Part 20: Observability"
+description: "OpenTelemetry integration, spans and traces, and instrumenting loaders, middleware, and server functions."
+---
+
+
+*This is the twentieth installment in a series where we build a toy Next.js on top of Vite. In [Part 19](/19-edge-runtimes), we added edge runtime support. Now we'll instrument Eigen with OpenTelemetry — adding distributed tracing, metrics, and logging that give operators visibility into every layer of the framework: SSR rendering, loader execution, middleware chains, server functions, and streaming responses.*
+
+**Concepts introduced:** OpenTelemetry SDK integration, spans and traces, instrumenting `configureServer` middleware, loader and server function tracing, build-time performance metrics, the `transform` hook for automatic instrumentation, adapter-specific exporters (Vercel, Netlify, Datadog), typed span attributes, W3C Trace Context propagation, performance budgets.
+
+---
+
+## Why observability is a framework concern
+
+In a traditional backend, you instrument your HTTP handlers and database calls. In a framework like Eigen, the interesting work happens *inside* the framework's abstractions: route matching, middleware chains, parallel loader execution, streaming SSR, server function RPC. Application developers don't write this code — the framework generates it. So the framework must instrument it.
+
+Without framework-level instrumentation, you see a single long HTTP span and can't tell whether the 800ms response time is from the middleware chain, a slow loader, SSR rendering, or streaming delays.
+
+---
+
+## The instrumentation plugin
+
+```typescript title="plugins/eigen-observability.ts"
+import type { Plugin, ViteDevServer } from 'vite'
+import {
+  trace,
+  SpanKind,
+  SpanStatusCode,
+  context,
+  propagation,
+} from '@opentelemetry/api'
+
+const tracer = trace.getTracer('eigen', '1.0.0')
+
+export interface ObservabilityOptions {
+  /** Service name for trace identification */
+  serviceName?: string
+  /** Enable build-time performance tracing */
+  traceBuild?: boolean
+  /** Custom span attributes added to every request span */
+  defaultAttributes?: Record<string, string>
+}
+
+export default function eigenObservability(
+  options: ObservabilityOptions = {},
+): Plugin {
+  return {
+    name: 'eigen-observability',
+
+    configureServer(server) {
+      // Add tracing middleware BEFORE the framework middleware
+      // (pre-middleware, not post-middleware — we want to wrap everything)
+      server.middlewares.use((req, res, next) => {
+        // Extract trace context from incoming headers (W3C Trace Context)
+        const parentContext = propagation.extract(context.active(), req.headers)
+
+        // Start a root span for this request
+        const span = tracer.startSpan(
+          `${req.method} ${req.url}`,
+          {
+            kind: SpanKind.SERVER,
+            attributes: {
+              'http.method': req.method ?? 'GET',
+              'http.url': req.url ?? '/',
+              'http.scheme': 'http',
+              'service.name': options.serviceName ?? 'eigen',
+              ...options.defaultAttributes,
+            },
+          },
+          parentContext,
+        )
+
+        // Store the span in context so downstream code can create child spans
+        const spanContext = trace.setSpan(context.active(), span)
+
+        // Wrap the response to capture status code and timing
+        const originalEnd = res.end.bind(res)
+        res.end = function (...args: any[]) {
+          span.setAttribute('http.status_code', res.statusCode)
+          if (res.statusCode >= 400) {
+            span.setStatus({ code: SpanStatusCode.ERROR })
+          }
+          span.end()
+          return originalEnd(...args)
+        } as typeof res.end
+
+        // Run downstream handlers within the span context
+        context.with(spanContext, () => next())
+      })
+    },
+
+    // Build-time tracing
+    buildStart() {
+      if (!options.traceBuild) return
+      const span = tracer.startSpan('vite.build', {
+        attributes: {
+          'build.environment': this.environment?.name ?? 'unknown',
+        },
+      })
+      ;(this as any).__buildSpan = span
+    },
+
+    buildEnd() {
+      const span = (this as any).__buildSpan
+      if (span) span.end()
+    },
+  }
+}
+```
+
+---
+
+## Instrumenting framework internals
+
+The framework's rendering pipeline (entry-server) creates child spans for each phase:
+
+```typescript title="entry-server.tsx"
+import { trace, context, SpanKind } from '@opentelemetry/api'
+
+const tracer = trace.getTracer('eigen')
+
+export async function render(pathname: string, request: Request) {
+  const parentSpan = trace.getActiveSpan()
+
+  // Span: Route matching
+  const matchSpan = tracer.startSpan('eigen.route.match', {
+    attributes: { 'route.pathname': pathname },
+  })
+  const match = matchRoute(pathname)
+  matchSpan.setAttribute('route.matched', !!match)
+  if (match) {
+    matchSpan.setAttribute('route.path', match.route.path)
+    matchSpan.setAttribute('route.has_loader', !!match.route.loader)
+  }
+  matchSpan.end()
+
+  if (!match) return { html: '<h1>404</h1>', status: 404, data: null }
+
+  // Span: Middleware chain
+  const mwSpan = tracer.startSpan('eigen.middleware', {
+    attributes: { 'middleware.count': allMiddleware.length },
+  })
+  const { ctx, response } = await executeMiddleware(allMiddleware, {
+    request,
+    params: match.params,
+    pathname,
+  })
+  mwSpan.end()
+
+  if (response) return { response }
+
+  // Span: Loader execution
+  let data: unknown = null
+  if (match.route.loader) {
+    const loaderSpan = tracer.startSpan('eigen.loader', {
+      kind: SpanKind.INTERNAL,
+      attributes: {
+        'loader.route': match.route.path,
+      },
+    })
+    try {
+      data = await match.route.loader({ params: match.params, ctx })
+      loaderSpan.setStatus({ code: 0 }) // OK
+    } catch (e) {
+      loaderSpan.setStatus({
+        code: 2, // ERROR
+        message: e instanceof Error ? e.message : 'Unknown error',
+      })
+      throw e
+    } finally {
+      loaderSpan.end()
+    }
+  }
+
+  // Span: React SSR rendering
+  const renderSpan = tracer.startSpan('eigen.render.ssr', {
+    attributes: {
+      'render.route': match.route.path,
+      'render.has_data': data !== null,
+    },
+  })
+  const html = renderToString(
+    <match.route.component params={match.params} data={data} />,
+  )
+  renderSpan.end()
+
+  return { html, status: 200, data }
+}
+```
+
+The resulting trace looks like:
+
+```
+GET /posts/42                              [350ms]
+├── eigen.route.match                       [0.2ms]
+├── eigen.middleware                         [15ms]
+│   ├── timing-middleware                  [0.1ms]
+│   └── auth-middleware                    [14ms]
+│       └── db.query (verify session)      [12ms]
+├── eigen.loader                            [280ms]
+│   └── db.query (SELECT * FROM posts)     [275ms]
+└── eigen.render.ssr                        [45ms]
+```
+
+Now you can see *exactly* where the 350ms went: 275ms in the database query, 14ms in auth verification, 45ms in React rendering.
+
+---
+
+## Instrumenting server functions
+
+Server functions (Part 14) get automatic tracing via the `transform` hook. When the plugin generates the RPC endpoint handler, it wraps the execution in a span:
+
+```typescript
+// Generated server function endpoint (in configureServer)
+const result = await tracer.startActiveSpan(
+  `eigen.server_fn.${registration.exportName}`,
+  {
+    kind: SpanKind.SERVER,
+    attributes: {
+      'server_fn.id': fnId,
+      'server_fn.name': registration.exportName,
+      'server_fn.file': registration.file,
+    },
+  },
+  async (span) => {
+    try {
+      const result = await fn(args, ctx)
+      span.setStatus({ code: 0 })
+      return result
+    } catch (e) {
+      span.setStatus({ code: 2, message: String(e) })
+      throw e
+    } finally {
+      span.end()
+    }
+  },
+)
+```
+
+---
+
+## Auto-instrumentation via `transform`
+
+Rather than requiring developers to manually add tracing to their loaders, the framework can auto-instrument via the `transform` hook:
+
+```typescript
+// In the observability plugin — auto-instrument loaders
+transform(code: string, id: string) {
+  if (!id.includes('/pages/') || !id.endsWith('.tsx')) return
+  if (!/export\s+(const|async\s+function|function)\s+loader/.test(code)) return
+
+  // Only instrument in the SSR environment
+  if (this.environment?.name !== 'ssr') return
+
+  // Wrap the loader export with tracing
+  const routePath = fileToRoute(id)
+  const instrumented = code.replace(
+    /export\s+(const\s+loader\s*=|(?:async\s+)?function\s+loader)/,
+    `import { trace as __trace } from '@opentelemetry/api';
+const __tracer = __trace.getTracer('eigen');
+export $1`,
+  )
+
+  // This is simplified — a real implementation wraps the function body
+  // with startActiveSpan using AST transformation
+  return { code: instrumented, map: null }
+}
+```
+
+---
+
+## Adapter-specific exporters
+
+Each hosting platform has its own observability stack. The adapter plugin (Part 16) configures the appropriate OTEL exporter:
+
+```typescript
+// In the Vercel adapter
+import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http'
+
+const exporter = new OTLPTraceExporter({
+  url: process.env.OTEL_EXPORTER_OTLP_ENDPOINT ?? 'https://otel.vercel.sh/v1/traces',
+  headers: {
+    'x-vercel-otel-api-key': process.env.VERCEL_OTEL_API_KEY ?? '',
+  },
+})
+```
+
+```typescript
+// In the Netlify adapter
+import { NetlifyExporter } from '@netlify/opentelemetry'
+
+const exporter = new NetlifyExporter()
+```
+
+The observability plugin accepts an exporter configuration, or auto-detects based on the active adapter:
+
+```typescript title="vite.config.ts"
+import eigen from 'eigen/plugin'
+import { netlifyAdapter } from 'eigen/adapters/netlify'
+import eigenObservability from 'eigen/observability'
+
+export default defineConfig({
+  plugins: [
+    eigen(),
+    react(),
+    netlifyAdapter(),
+    eigenObservability({
+      serviceName: 'my-app',
+      traceBuild: true,
+      // Exporter auto-detected from adapter, or specify manually:
+      // exporter: new OTLPTraceExporter({ url: '...' }),
+    }),
+  ],
+})
+```
+
+---
+
+## Performance budgets
+
+The observability plugin can enforce performance budgets during development:
+
+```typescript
+// In configureServer — dev-time performance warnings
+const BUDGETS = {
+  'eigen.middleware': 50,      // Middleware should complete in <50ms
+  'eigen.loader': 500,         // Loaders should complete in <500ms
+  'eigen.render.ssr': 100,     // SSR rendering should complete in <100ms
+}
+
+// After each span ends, check against budget
+span.end()
+const duration = span.duration // in milliseconds
+const budget = BUDGETS[span.name]
+if (budget && duration > budget) {
+  console.warn(
+    `⚠ Performance budget exceeded: ${span.name} took ${duration.toFixed(0)}ms (budget: ${budget}ms)`,
+  )
+}
+```
+
+This gives developers immediate feedback when a loader is slow or middleware is doing too much work.
+
+---
+
+## Metrics (beyond traces)
+
+Traces show individual request flows. Metrics show aggregates — request rates, error rates, p50/p99 latencies. The plugin can export OpenTelemetry metrics alongside traces:
+
+```typescript
+import { metrics } from '@opentelemetry/api'
+
+const meter = metrics.getMeter('eigen')
+const requestCounter = meter.createCounter('eigen.requests', {
+  description: 'Total HTTP requests',
+})
+const requestDuration = meter.createHistogram('eigen.request.duration', {
+  description: 'Request duration in milliseconds',
+  unit: 'ms',
+})
+
+// In the middleware
+requestCounter.add(1, { route: match.route.path, method: req.method })
+requestDuration.record(duration, { route: match.route.path, status: res.statusCode })
+```
+
+---
+
+## What to observe
+
+1. **Start the dev server** with observability enabled. Each request logs its trace structure to the console — you can see the hierarchy of spans.
+
+2. **Add a slow database query** to a loader. The performance budget warning fires immediately in the terminal.
+
+3. **Deploy with an OTEL collector.** View traces in Jaeger, Grafana Tempo, or your platform's trace viewer. Each request shows the full breakdown: middleware, loaders, rendering.
+
+4. **Compare two routes** in the trace viewer. A simple static page has two spans (match + render). A data-heavy dashboard page has five+ spans (match, middleware, parallel loaders, render, streaming).
+
+---
+
+## Key insight
+
+Framework-level observability instruments the code that the framework *generates*, not the code the developer writes. When the plugin creates a server function endpoint, it wraps it in a span. When the rendering pipeline runs loaders in parallel, each loader gets its own span. When middleware runs, the chain is traced.
+
+This is possible because the framework controls the execution model. The `configureServer` hook wraps the HTTP layer. The virtual module wires up the middleware-loader-render pipeline. The `transform` hook can inject instrumentation. And the adapter configures the exporter for the target platform.
+
+The developer gets end-to-end visibility without writing a single line of instrumentation code. That's the framework's value proposition: it generates both the application infrastructure *and* the observability for that infrastructure.
+
+---
+
+## What's next
+
+In Part 21, we'll implement **React Server Components** — the three-environment architecture that ties together everything we've built: environments, streaming, server functions, middleware, and the `"use client"` boundary.
