@@ -17,7 +17,4 @@ publish = "apps/tutorial/.next"
 #  port = 3000 # Port that the dev server will be listening on
 #  publish = "dist" # Folder with the static content for _redirect file
 
-[[plugins]]
-package = "@netlify/plugin-nextjs"
-
 ## more info on configuring this file: https://ntl.fyi/file-based-build-config
