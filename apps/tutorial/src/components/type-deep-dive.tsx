@@ -1,13 +1,7 @@
 import { Accordion, Accordions } from "fumadocs-ui/components/accordion";
 import type { ReactNode } from "react";
 
-export function TypeDeepDive({
-  title,
-  children,
-}: {
-  title: string;
-  children: ReactNode;
-}) {
+export function TypeDeepDive({ title, children }: { title: string; children: ReactNode }) {
   return (
     <Accordions type="single" collapsible className="border-fd-primary/30 bg-fd-primary/5 rounded-lg not-prose">
       <Accordion title={title} className="border-none px-1 [&>h3]:text-fd-primary [&>h3]:text-sm [&>h3]:font-medium">

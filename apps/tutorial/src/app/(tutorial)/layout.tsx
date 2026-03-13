@@ -16,10 +16,7 @@ function shortenSidebarTitles(tree: ReturnType<typeof source.getPageTree>) {
 
 export default function Layout({ children }: LayoutProps<"/">) {
   return (
-    <DocsLayout
-      tree={shortenSidebarTitles(source.getPageTree())}
-      {...baseOptions()}
-    >
+    <DocsLayout tree={shortenSidebarTitles(source.getPageTree())} {...baseOptions()}>
       {children}
     </DocsLayout>
   );
