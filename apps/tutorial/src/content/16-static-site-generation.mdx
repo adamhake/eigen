@@ -1,12 +1,15 @@
 ---
 title: "Part 16: Static Site Generation"
 description: "The generateBundle hook, renderToString at build time, typed generateStaticParams, and ISR-like revalidation."
+concepts:
+  - "static site generation"
+  - "build-time rendering"
+  - "hybrid SSR/SSG routing"
+  - "incremental static regeneration"
 ---
 
 
 *This is the sixteenth installment in a series where we build a toy Next.js on top of Vite. In [Part 15](/15-server-functions), we built server functions. Now we'll add static site generation (SSG) — pre-rendering pages to HTML files at build time, so they can be served from a CDN with no server runtime.*
-
-**Concepts introduced:** The `generateBundle` Rollup hook, `renderToString` at build time, typed `generateStaticParams`, ISR-like revalidation concepts, the `closeBundle` hook, hybrid SSR/SSG routing, build-time data fetching.
 
 ---
 

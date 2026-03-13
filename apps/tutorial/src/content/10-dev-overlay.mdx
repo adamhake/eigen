@@ -1,12 +1,15 @@
 ---
 title: "Part 10: Dev Overlay"
 description: "Injecting a diagnostic panel via transformIndexHtml, a WebSocket channel for real-time events, and Shadow DOM isolation."
+concepts:
+  - "dev-only code injection"
+  - "WebSocket diagnostics"
+  - "Shadow DOM isolation"
+  - "zero-cost production removal"
 ---
 
 
 *This is the eleventh installment in a series where we build "Eigen" — a toy Next.js on top of Vite. In [Part 9](/09-hmr), we explored HMR and the module graph. Now we'll build the development overlay — an in-browser diagnostic panel that gives real-time visibility into every layer of the framework.*
-
-**Concepts introduced:** `transformIndexHtml` for overlay injection, a `configureServer` WebSocket channel for real-time diagnostics, virtual modules for the overlay client, `import.meta.env.DEV` for zero-cost production removal, Shadow DOM isolation, the `devEmit` instrumentation pattern.
 
 ---
 

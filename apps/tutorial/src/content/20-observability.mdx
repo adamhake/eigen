@@ -1,12 +1,15 @@
 ---
 title: "Part 20: Observability"
 description: "OpenTelemetry integration, spans and traces, and instrumenting loaders, middleware, and server functions."
+concepts:
+  - "distributed tracing"
+  - "automatic instrumentation"
+  - "performance budgets"
+  - "trace context propagation"
 ---
 
 
 *This is the twentieth installment in a series where we build a toy Next.js on top of Vite. In [Part 19](/19-edge-runtimes), we added edge runtime support. Now we'll instrument Eigen with OpenTelemetry — adding distributed tracing, metrics, and logging that give operators visibility into every layer of the framework: SSR rendering, loader execution, middleware chains, server functions, and streaming responses.*
-
-**Concepts introduced:** OpenTelemetry SDK integration, spans and traces, instrumenting `configureServer` middleware, loader and server function tracing, build-time performance metrics, the `transform` hook for automatic instrumentation, adapter-specific exporters (Vercel, Netlify, Datadog), typed span attributes, W3C Trace Context propagation, performance budgets.
 
 ---
 

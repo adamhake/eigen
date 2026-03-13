@@ -1,13 +1,16 @@
 ---
 title: "Part 33: Authentication and Authorization"
 description: "Session middleware, typed user context, route-level access control, and CSRF protection."
+concepts:
+  - "session management"
+  - "typed user context"
+  - "route-level access control"
+  - "CSRF protection"
+  - "auth provider abstraction"
 ---
 
 
 *In this installment, we build the authentication and authorization primitives that Eigen provides to application developers. The framework doesn't implement a specific auth strategy — it provides the hooks, middleware patterns, session management, and typed context that make any strategy (session cookies, JWTs, OAuth, SAML, passkeys) plug in cleanly.*
-
-**Concepts introduced:** Session middleware and typed user context, the `getSession` / `getUser` pattern, route-level access control declarations, session serialization across SSR/client boundary, CSRF protection for server functions, the `useSession` hook for client components, auth provider abstraction, protected route conventions, role-based access control types, the relationship between framework auth primitives and auth libraries (Better Auth, Lucia, Auth.js).
-
 ---
 
 ## What the framework provides vs. what the application provides

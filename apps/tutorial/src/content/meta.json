@@ -40,6 +40,7 @@
     "32-platform-integrations",
     "33-authentication-authorization",
     "34-data-fetching",
-    "35-error-boundaries-loading"
+    "35-error-boundaries-loading",
+    "36-testing-your-framework"
   ]
 }

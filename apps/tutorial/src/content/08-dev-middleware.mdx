@@ -1,12 +1,14 @@
 ---
 title: "Part 8: Dev Middleware"
 description: "Custom dev server middleware, middleware ordering, and ssrLoadModule for API routes."
+concepts:
+  - "dev server middleware"
+  - "middleware ordering"
+  - "the dev/prod middleware gap"
 ---
 
 
 *This is the ninth installment in a series where we build a toy Next.js on top of Vite. In [Part 7](/07-transform-hook), we used the `transform` hook to strip server-only code. Now we'll use `configureServer` to give the framework control over the HTTP layer — adding API routes and dev middleware.*
-
-**Concepts introduced:** Custom dev server middleware, middleware ordering, `ssrLoadModule` for API routes, typed request/response handling, the dev/prod middleware gap.
 
 ---
 

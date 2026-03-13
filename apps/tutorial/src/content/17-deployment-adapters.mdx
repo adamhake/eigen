@@ -1,12 +1,15 @@
 ---
 title: "Part 17: Deployment Adapters"
 description: "Platform-specific build transforms, closeBundle for post-processing, and serverless function packaging."
+concepts:
+  - "the adapter pattern"
+  - "platform-specific build transforms"
+  - "serverless and edge packaging"
+  - "adapter composition"
 ---
 
 
 *This is the seventeenth installment in a series where we build a toy Next.js on top of Vite. In [Part 16](/16-static-site-generation), we added static site generation. Now we'll build the adapter pattern — a plugin abstraction that transforms Eigen's generic build output into platform-specific deployment artifacts for Netlify, Cloudflare, Vercel, or a standalone Node server.*
-
-**Concepts introduced:** The adapter pattern, platform-specific build transforms, `closeBundle` for post-processing, serverless function packaging, edge function bundling, output directory conventions, `_redirects` / `_headers` generation, adapter composition with the framework plugin, typed adapter configuration, the relationship between adapters and Vite environments.
 
 ---
 

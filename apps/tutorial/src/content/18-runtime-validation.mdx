@@ -1,12 +1,14 @@
 ---
 title: "Part 18: Runtime Validation"
 description: "Schema-first validation with zod/valibot, inferring TypeScript types from runtime schemas, and parse-don't-validate."
+concepts:
+  - "schema-first validation"
+  - "inferring types from runtime schemas"
+  - "the parse-don't-validate pattern"
 ---
 
 
 *This is the eighteenth installment in a series where we build a toy Next.js on top of Vite. In [Part 17](/17-deployment-adapters), we added SSG. Now we'll tackle a gap in our type safety story: the serialized data that crosses the server/client boundary is typed at compile time but unvalidated at runtime.*
-
-**Concepts introduced:** Schema-first data validation with zod/valibot, inferring TypeScript types from runtime schemas, typed `window.__EIGEN_DATA__` narrowing, schema-aware `defineLoader`, validation in the hydration path, the parse-don't-validate pattern.
 
 ---
 
@@ -286,6 +288,79 @@ Runtime validation closes the last gap in the type safety story. Compile-time ty
 From a Vite perspective, the interesting nuance is that validation code must survive into the client bundle while loader code must not. The `transform` hook's job gets more surgical: it needs to distinguish between "server-only exports" (loader) and "universal exports" (parse, schema). This is the same tree-shaking challenge that real frameworks face — and why conventions like `"use server"` and `.server.ts` files exist. They give the transform hook clear signals about what to strip.
 
 ---
+
+<TestSection title="Testing: schema validation">
+
+Validation schemas are the contract between server and client — they deserve thorough testing. The `PostSchema` is defined in the page component, so import it directly:
+
+```typescript title="src/__tests__/schemas.test.ts"
+import { describe, it, expect } from 'vitest'
+import { PostSchema } from '../pages/posts/[id]'
+
+describe('PostSchema', () => {
+  it('parses valid data', () => {
+    const result = PostSchema.parse({
+      id: 1,
+      title: 'Hello',
+      body: 'World',
+      createdAt: '2026-03-13T00:00:00Z',
+    })
+
+    expect(result.id).toBe(1)
+    expect(result.createdAt).toBeInstanceOf(Date)
+  })
+
+  it('transforms date strings into Date objects', () => {
+    const result = PostSchema.parse({
+      id: 1,
+      title: 'Test',
+      body: 'Body',
+      createdAt: '2026-01-15T12:00:00Z',
+    })
+
+    expect(result.createdAt.getFullYear()).toBe(2026)
+    expect(result.createdAt.getMonth()).toBe(0) // January
+  })
+
+  it('rejects missing required fields', () => {
+    expect(() => PostSchema.parse({ id: 1 })).toThrow()
+  })
+
+  it('rejects wrong types', () => {
+    expect(() =>
+      PostSchema.parse({
+        id: 'not-a-number',
+        title: 'Test',
+        body: 'Body',
+        createdAt: '2026-01-01',
+      }),
+    ).toThrow()
+  })
+
+  it('survives a JSON round-trip', () => {
+    // Simulate the serialization boundary
+    const serverData = {
+      id: 42,
+      title: 'Post',
+      body: 'Content',
+      createdAt: new Date('2026-06-01').toISOString(),
+    }
+    const serialized = JSON.stringify(serverData)
+    const deserialized = JSON.parse(serialized)
+
+    // Without the schema: createdAt is a string
+    expect(typeof deserialized.createdAt).toBe('string')
+
+    // With the schema: createdAt is a Date
+    const parsed = PostSchema.parse(deserialized)
+    expect(parsed.createdAt).toBeInstanceOf(Date)
+  })
+})
+```
+
+The "JSON round-trip" test is the most important one — it reproduces the exact serialization boundary that causes the `Date` → `string` bug described in this chapter. The test proves that the schema's `.transform()` restores the correct type after deserialization.
+
+</TestSection>
 
 ## What's next
 

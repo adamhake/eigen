@@ -1,6 +1,11 @@
 {
   "root": false,
   "extends": "//",
+  "css": {
+    "parser": {
+      "tailwindDirectives": true
+    }
+  },
   "linter": {
     "domains": {
       "next": "recommended",

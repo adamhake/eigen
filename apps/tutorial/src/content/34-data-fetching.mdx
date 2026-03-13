@@ -1,13 +1,16 @@
 ---
 title: "Part 34: Data Fetching Strategies"
 description: "Request deduplication, parallel loader execution, and client-side cache management with TanStack Query."
+concepts:
+  - "request deduplication"
+  - "parallel vs. waterfall loading"
+  - "SSR-to-client cache handoff"
+  - "isomorphic fetch"
+  - "background refetching"
 ---
 
 
 *This module builds the data fetching strategy layer — the framework infrastructure that sits between "a loader calls fetch" and "the user sees data." It covers request deduplication, fetch-level caching, parallel loader execution, client-side cache management, and TanStack Query integration for seamless SSR-to-client handoff.*
-
-**Concepts introduced:** Request deduplication via a render-scoped cache, extended `fetch` with caching semantics, parallel vs. waterfall loader execution, the SSR → client cache handoff pattern, `prefetchQuery` in loaders for TanStack Query integration, `staleTime` / `gcTime` configuration, background refetching, isomorphic fetch normalization, the `queryClient` virtual module.
-
 ---
 
 ## The problems with naive data fetching

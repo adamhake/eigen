@@ -1,16 +1,52 @@
 ---
-title: "Building a React Framework with Vite"
+title: "The Eigen Series"
 description: "A 36-part tutorial building a fully-featured React meta-framework from scratch using Vite's plugin API."
 ---
 
+The Eigen Series is a 36-part tutorial where you build a fully-featured React meta-framework from scratch using [Vite's](https://vite.dev/) plugin API. By the end, you won't just know *how* to use frameworks like [Next.js](https://nextjs.org/) and [TanStack Start](https://tanstack.com/start) — you'll understand how they work, why they make the architectural decisions they do, and how to build your own.
 
-**A 36-part tutorial where you build a fully-featured React meta-framework from scratch using Vite's plugin API.** You'll understand not just *how* to use frameworks like Next.js and TanStack Start — you'll understand how they work, why they make the architectural decisions they do, and how to build your own.
+## Why build a framework?
 
-The framework is called **Eigen** (from the German/physics term meaning "inherent" or "own" — as in eigenvalue). By the end of the series, Eigen handles file-based routing, server-side rendering, streaming, server functions, static site generation, React Server Components, edge deployment, and more — all powered by Vite plugins and fully typed with TypeScript.
+Every module teaches the same core lesson: **a framework is a coordinated set of [Vite](https://vite.dev/) plugins that generate code.** `resolveId` provides module identity. `load` generates code from build-time knowledge. `transform` rewrites code per environment. Once you see this pattern, frameworks stop being magic — they're just code generation.
 
-**Prerequisites:** Solid React and TypeScript knowledge. Comfort with Node.js and ESM. Familiarity with what Next.js does at a high level.
+By the end of the series, your framework handles file-based routing, server-side rendering, streaming, server functions, static site generation, React Server Components, edge deployment, and more — all powered by Vite plugins and fully typed with TypeScript.
 
-**Start the series:** [Part 0: The Mental Model](/00-the-mental-model)
+<Callout type="info" title="Why 'Eigen'?">
+The name comes from the German/physics term meaning "inherent" or "own" — as in eigenvalue. It reflects the goal of the series: understanding the *inherent* mechanics of how frameworks work, and building your *own*.
+</Callout>
+
+## How to read this series
+
+<Steps>
+<Step>
+### Phase I: Foundations
+
+Build a working SSR framework from scratch. Covers every core [Vite](https://vite.dev/) plugin API: `resolveId`, `load`, `transform`, `configureServer`, `handleHotUpdate`, and `buildApp`.
+</Step>
+<Step>
+### Phase II: Production Features
+
+Add streaming SSR, server functions, SSG, deployment adapters, edge runtimes, and observability. This is what separates a toy framework from one you'd use in production.
+</Step>
+<Step>
+### Phase III: The Modern Web
+
+React Server Components, `"use cache"`, Partial Prerendering, AI streaming, View Transitions, and more. The bleeding edge of framework architecture.
+</Step>
+<Step>
+### Deep Dives
+
+Self-contained modules on auth, SEO, images, data fetching, and error handling. Can be read independently after Phase I.
+</Step>
+</Steps>
+
+### A note on testing
+
+Throughout the series, you'll find collapsible **test sections** in key chapters — collapsed by default so they don't interrupt the narrative. These show how to test what you just built: unit-testing route parsing, snapshot-testing transform output, verifying middleware chains. They're optional reading, but they reinforce the concepts and demonstrate that framework code is unusually testable (most of it is pure functions). [Part 36](/36-testing-your-framework) ties everything together with a complete testing strategy, from Vitest setup through plugin tests to full integration tests.
+
+**Prerequisites:** Solid React and TypeScript knowledge. Comfort with Node.js and ESM. Familiarity with what [Next.js](https://nextjs.org/) does at a high level.
+
+**[Start the series: Part 0 — The Mental Model →](/00-the-mental-model)**
 
 ---
 
@@ -35,15 +71,13 @@ By the end of this phase, you'll have a complete framework: file-based routing w
 | 10 | **Dev Overlay** | An in-browser diagnostic panel: performance waterfall, cache inspector, streaming monitor, type generation log, route explorer. Built with `transformIndexHtml`, a dev WebSocket channel, and virtual modules |
 | 11 | **Putting It All Together** | Composing plugins into `eigen()`, the `buildApp` hook, `MiniOptions` configuration, the three-layer type architecture (static types, generated types, virtual module types) |
 
-**~20,000 words · Result: A working, deployable SSR framework with type-safe routing**
-
 ---
 
 ## Phase II: Production Features
 
 *Ship it for real.*
 
-This phase adds the features that separate a toy framework from one you'd use in production: streaming SSR, nested layouts, a middleware pipeline, server functions with the TanStack builder pattern, static site generation, deployment adapters, runtime validation, edge runtime support, and OpenTelemetry instrumentation. By the end, Eigen handles everything a real application needs.
+This phase adds the features that separate a toy framework from one you'd use in production: streaming SSR, nested layouts, a middleware pipeline, server functions with the [TanStack](https://tanstack.com/) builder pattern, static site generation, deployment adapters, runtime validation, edge runtime support, and OpenTelemetry instrumentation. By the end, Eigen handles everything a real application needs.
 
 | Part | Title | What you learn |
 |---|---|---|
@@ -56,8 +90,6 @@ This phase adds the features that separate a toy framework from one you'd use in
 | 18 | **Runtime Validation** | Schema-first loaders with zod/valibot, inferring TypeScript types from schemas, the `parse` function surviving client bundles while `loader` is stripped, schema-library-agnostic design |
 | 19 | **Edge Runtimes** | Custom Vite environments, `workerd` resolve conditions, `Request`/`Response` Web APIs, environment-polymorphic types, three-phase `buildApp`, `@cloudflare/vite-plugin` |
 | 20 | **Observability** | OpenTelemetry SDK, request spans, middleware/loader/render child spans, auto-instrumentation via `transform`, adapter-specific exporters, performance budgets, metrics |
-
-**~18,000 words · Result: A production-capable framework with streaming, server functions, SSG, deployment adapters, and observability**
 
 ---
 
@@ -93,25 +125,4 @@ These modules go deep on specific concerns. Each is self-contained and can be re
 | 33 | **Authentication & Authorization** | `AuthConfig<TUser>`, session middleware, typed `ctx.user`, `useSession` hook, route-level access control, CSRF protection, auth library integration (Better Auth, Auth.js) |
 | 34 | **Data Fetching Strategy** | Request deduplication, parallel loader execution, TanStack Query integration (`prefetchQuery` → `dehydrate` → `HydrationBoundary`), isomorphic fetch, prefetching |
 | 35 | **Error Boundaries & Loading States** | Route-scoped error boundaries, typed `ErrorBoundaryProps<'/path'>`, loader vs. render errors, `retryLoader()`, `loading.tsx` convention, pending UI with `useTransition` |
-
-**~25,000 words · Result: A framework that rivals production meta-frameworks in capability and developer experience**
-
----
-
-## How to read this series
-
-**If you want to understand Vite deeply:** Read Phase I start to finish. Every module builds on the previous one, and by Part 11 you'll understand the plugin API, virtual modules, SSR, and the Environment API at a level that most framework users never reach.
-
-**If you want to understand framework architecture:** Read Phases I and II. You'll know how streaming, server functions, middleware, SSG, adapters, and edge deployment work at the Vite plugin level — the same architecture that powers TanStack Start, Remix, and Astro.
-
-**If you want the complete picture:** Read all three phases. Phase III covers the bleeding edge — RSC, `"use cache"`, PPR, AI streaming — and the deep-dive modules cover the practical concerns (auth, SEO, images, data fetching) that make a framework usable for real applications.
-
-**If you're building something specific:** The deep-dive modules (30–35) are self-contained. Jump to Authentication if you need auth patterns, or Image Optimization if you need responsive images, without reading the full series.
-
----
-
-## The throughline
-
-Every module teaches the same lesson at increasing scale: **a framework is a coordinated set of Vite plugins that generate code.** `resolveId` provides module identity. `load` generates code from build-time knowledge. `transform` rewrites code per environment. `configureServer` handles the dev experience. `buildApp` orchestrates production output. And TypeScript declarations, generated alongside the runtime code, give developers type safety over all of it.
-
-The framework doesn't add magic. It generates code.
+| 36 | **Testing Your Framework** | Vitest setup, the testing pyramid (unit → plugin → integration → E2E), snapshot-testing transforms, testing with `ssrLoadModule`, serialization boundary tests, the test-as-documentation pattern |

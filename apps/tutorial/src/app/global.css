@@ -1,3 +1,42 @@
 @import "tailwindcss";
-@import "fumadocs-ui/css/vitepress.css";
+@import "fumadocs-ui/css/neutral.css";
 @import "fumadocs-ui/css/preset.css";
+
+/* Custom brand theme: Dark Ash, White, Chartreuse, Ivory, Steel */
+@theme {
+  --color-fd-background: #f4f4f1;
+  --color-fd-foreground: #232628;
+  --color-fd-muted: #eaeae7;
+  --color-fd-muted-foreground: #5a5e61;
+  --color-fd-popover: #f8f8f6;
+  --color-fd-popover-foreground: #232628;
+  --color-fd-card: #f8f8f5;
+  --color-fd-card-foreground: #232628;
+  --color-fd-border: #9ea8ad66;
+  --color-fd-primary: #6b6b0f;
+  --color-fd-primary-foreground: #ffffff;
+  --color-fd-secondary: #eaeae7;
+  --color-fd-secondary-foreground: #232628;
+  --color-fd-accent: #9ea8ad40;
+  --color-fd-accent-foreground: #232628;
+  --color-fd-ring: #9ea8ad;
+}
+
+.dark {
+  --color-fd-background: #232628;
+  --color-fd-foreground: #f2f2e8;
+  --color-fd-muted: #2e3134;
+  --color-fd-muted-foreground: #9ea8ad;
+  --color-fd-popover: #2a2d30;
+  --color-fd-popover-foreground: #e8e8dc;
+  --color-fd-card: #2a2d30;
+  --color-fd-card-foreground: #f2f2e8;
+  --color-fd-border: #9ea8ad30;
+  --color-fd-primary: #cccc33;
+  --color-fd-primary-foreground: #232628;
+  --color-fd-secondary: #2e3134;
+  --color-fd-secondary-foreground: #f2f2e8;
+  --color-fd-accent: #9ea8ad30;
+  --color-fd-accent-foreground: #f2f2e8;
+  --color-fd-ring: #9ea8ad;
+}

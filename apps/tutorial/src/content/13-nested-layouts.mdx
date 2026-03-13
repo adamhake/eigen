@@ -1,12 +1,15 @@
 ---
 title: "Part 13: Nested Layouts"
 description: "Recursive filesystem scanning, hierarchical virtual module generation, and composing component trees from directories."
+concepts:
+  - "nested layouts"
+  - "hierarchical code generation"
+  - "parent-to-child data flow"
+  - "directory-driven component trees"
 ---
 
 
 *This is the thirteenth installment in a series where we build a toy Next.js on top of Vite. In [Part 12](/12-streaming-ssr), we added streaming SSR. Now we'll implement nested layouts — a `layout.tsx` convention where each directory level can wrap its child routes in shared UI, exactly like Next.js App Router's layout system.*
-
-**Concepts introduced:** Recursive filesystem scanning, hierarchical virtual module generation, composing component trees from directory structure, typed layout data, parent-to-child data flow across route segments, the layout/page rendering pipeline.
 
 ---
 
@@ -423,7 +426,7 @@ ${layoutEntries}
 
 A key behavior of nested layouts: when navigating between sibling routes (e.g., `/dashboard/settings` → `/dashboard/analytics`), the `DashboardLayout` should not unmount and remount. Only the content below it changes.
 
-In our current client-side router (Part 4), every navigation replaces the entire component tree. To support layout persistence, the router needs to diff the layout stacks:
+In our current client-side router (`packages/eigen/router.tsx` from Part 11), every navigation replaces the entire component tree. To support layout persistence, the router needs to diff the layout stacks:
 
 ```tsx
 function Router() {

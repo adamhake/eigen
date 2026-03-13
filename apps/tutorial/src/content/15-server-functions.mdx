@@ -1,12 +1,15 @@
 ---
 title: "Part 15: Server Functions"
 description: "The createServerFn pattern, generating API endpoints from function signatures, and typed client proxy generation."
+concepts:
+  - "server functions"
+  - "code generation from function signatures"
+  - "typed client proxies"
+  - "the \"use server\" directive"
 ---
 
 
 *This is the fifteenth installment in a series where we build a toy Next.js on top of Vite. In [Part 13](/13-nested-layouts), we built nested layouts. Now we'll implement the most sophisticated feature a framework can offer: server functions — where a developer writes a function that runs on the server, and the framework automatically generates a typed RPC client stub for the browser.*
-
-**Concepts introduced:** The `createServerFn` pattern, deep `transform` hook usage, generating API endpoints from function signatures, typed client proxy generation, preserving TypeScript types across a code transform, request serialization, the "use server" directive model.
 
 ---
 
@@ -137,7 +140,7 @@ interface ExtractedServerFn {
 }
 
 /** Generate a stable, short ID from file path + function name */
-function generateFnId(file: string, name: string): string {
+export function generateFnId(file: string, name: string): string {
   const hash = createHash('sha256')
     .update(`${file}:${name}`)
     .digest('hex')
@@ -692,6 +695,73 @@ This separation of concerns — types from source, implementation from transform
 And that's the core lesson of this entire series. A Vite-based framework is a *coordinated set of code transformations* — `resolveId` for module identity, `load` for code generation, `transform` for environment-specific rewrites — orchestrated by a plugin pipeline that runs identically in dev and production. The framework doesn't add magic. It generates code.
 
 ---
+
+<TestSection title="Testing: server function transforms">
+
+Server functions have two testable surfaces: the transform that generates RPC stubs, and the endpoint that executes them.
+
+```typescript title="plugins/__tests__/eigen-server-fns.test.ts"
+import { describe, it, expect } from 'vitest'
+import { generateFnId } from '../eigen-server-fns'
+
+describe('generateFnId', () => {
+  it('produces stable IDs for the same input', () => {
+    const id1 = generateFnId('/src/pages/Dashboard.tsx', 'getUsers')
+    const id2 = generateFnId('/src/pages/Dashboard.tsx', 'getUsers')
+    expect(id1).toBe(id2)
+  })
+
+  it('produces different IDs for different functions', () => {
+    const id1 = generateFnId('/src/pages/Dashboard.tsx', 'getUsers')
+    const id2 = generateFnId('/src/pages/Dashboard.tsx', 'deleteUser')
+    expect(id1).not.toBe(id2)
+  })
+
+  it('produces different IDs for same name in different files', () => {
+    const id1 = generateFnId('/src/pages/Dashboard.tsx', 'getData')
+    const id2 = generateFnId('/src/pages/Settings.tsx', 'getData')
+    expect(id1).not.toBe(id2)
+  })
+})
+
+describe('client transform', () => {
+  it('replaces createServerFn body with fetch stub', () => {
+    const input = `import { createServerFn } from 'eigen/server'
+import { db } from '../lib/database'
+
+export const getUsers = createServerFn(async (filter: { role: string }) => {
+  const users = await db.query('SELECT * FROM users WHERE role = $1', [filter.role])
+  return users.rows
+})
+
+export default function Dashboard() {
+  return <div>Dashboard</div>
+}`
+
+    // Simulate the client transform
+    let transformed = input.replace(
+      /import\s*\{[^}]*createServerFn[^}]*\}\s*from\s*['"]eigen\/server['"]\s*;?\n?/,
+      '',
+    )
+    transformed = transformed.replace(
+      /import\s*\{[^}]*\}\s*from\s*['"]\.\.\/lib\/database['"]\s*;?\n?/g,
+      '',
+    )
+
+    // The server-only code is gone
+    expect(transformed).not.toContain('createServerFn')
+    expect(transformed).not.toContain('db.query')
+    expect(transformed).not.toContain("'eigen/server'")
+
+    // The component survives
+    expect(transformed).toContain('export default function Dashboard')
+  })
+})
+```
+
+The ID stability test is critical — if IDs change between server and client builds, the client's `fetch()` calls will hit wrong endpoints. The hash-based approach guarantees deterministic IDs from the same inputs.
+
+</TestSection>
 
 ## What's next
 

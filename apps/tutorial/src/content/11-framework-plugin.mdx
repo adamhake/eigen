@@ -1,12 +1,14 @@
 ---
 title: "Part 11: The Framework Plugin"
 description: "Composing plugins, the buildApp hook, plugin options, and the three-layer type architecture."
+concepts:
+  - "plugin composition"
+  - "the framework as a plugin"
+  - "public type surface design"
 ---
 
 
 *This is the twelfth installment in a series where we build a toy Next.js on top of Vite. In [Part 10](/10-dev-overlay), we built the dev overlay. Now we'll compose everything into a distributable framework plugin and examine the architecture of the whole system.*
-
-**Concepts introduced:** Composing plugins, the `buildApp` hook, plugin options, the framework's public type surface, the three-layer type architecture.
 
 ---
 
@@ -251,6 +253,130 @@ This three-layer pattern is universal across typed frameworks. TanStack Router h
 | HMR | `handleHotUpdate` + React Fast Refresh | Same | Turbopack HMR |
 
 The architectural patterns are identical. The differences are in scale (Eigen handles 3 routes; Next.js handles thousands), robustness (Eigen uses regex; Next.js uses SWC), and deployment surface (Eigen has one server file; Next.js supports dozens of platforms).
+
+---
+
+## Extracting the runtime
+
+Since Part 2, `Router`, `Link`, and `matchRoute` have lived inline in the app's entry file. Now that Eigen has a proper package structure, it's time to move them into the framework:
+
+```tsx title="packages/eigen/router.tsx"
+import { useState, useEffect, Suspense } from 'react'
+import { routes } from 'eigen/routes'
+import type { RouteDefinition } from 'eigen/types'
+import type { RoutePaths, RouteParamsMap } from 'eigen/route-types'
+
+interface RouteMatch {
+  route: RouteDefinition
+  params: Record<string, string>
+}
+
+function matchRoute(pathname: string): RouteMatch | null {
+  for (const route of routes) {
+    if (route.path === pathname) return { route, params: {} }
+
+    const routeParts = route.path.split('/')
+    const pathParts = pathname.split('/')
+    if (routeParts.length !== pathParts.length) continue
+
+    const params: Record<string, string> = {}
+    const match = routeParts.every((part, i) => {
+      if (part.startsWith(':')) {
+        params[part.slice(1)] = pathParts[i]
+        return true
+      }
+      return part === pathParts[i]
+    })
+
+    if (match) return { route, params }
+  }
+  return null
+}
+
+export function Router() {
+  const [pathname, setPathname] = useState(window.location.pathname)
+  const data = window.__EIGEN_DATA__
+
+  useEffect(() => {
+    const handler = () => setPathname(window.location.pathname)
+    window.addEventListener('popstate', handler)
+    return () => window.removeEventListener('popstate', handler)
+  }, [])
+
+  const match = matchRoute(pathname)
+  if (!match) return <h1>404</h1>
+
+  const Component = match.route.component
+  return (
+    <Suspense fallback={<div>Loading...</div>}>
+      <Component params={match.params} data={data} />
+    </Suspense>
+  )
+}
+
+interface LinkProps<T extends RoutePaths> {
+  to: T
+  params?: RouteParamsMap[T]
+  children: React.ReactNode
+}
+
+export function Link<T extends RoutePaths>({ to, params, children }: LinkProps<T>) {
+  let href: string = to
+  if (params) {
+    href = to.replace(/:(\w+)/g, (_, key: string) => {
+      return (params as Record<string, string>)[key] ?? `:${key}`
+    })
+  }
+
+  return (
+    <a
+      href={href}
+      onClick={(e) => {
+        e.preventDefault()
+        window.history.pushState({}, '', href)
+        window.dispatchEvent(new PopStateEvent('popstate'))
+      }}
+    >
+      {children}
+    </a>
+  )
+}
+```
+
+This is the same code from Part 2, just moved. `matchRoute` stays private — it's an implementation detail, not a public API. `Router` and `Link` are the framework's public runtime exports.
+
+Update the barrel export:
+
+```typescript title="packages/eigen/index.ts"
+export type { PageProps, LoaderFn, RouteDefinition } from './types'
+export type { ApiHandler, ApiContext } from './api-types'
+export { defineLoader } from './helpers'
+export { Router, Link } from './router'
+```
+
+Now `entry-client.tsx` becomes thin:
+
+```tsx title="src/entry-client.tsx"
+import { hydrateRoot } from 'react-dom/client'
+import { Router, Link } from 'eigen'
+
+function App() {
+  return (
+    <div>
+      <nav>
+        <Link to="/">Home</Link> | <Link to="/about">About</Link>
+      </nav>
+      <Router />
+    </div>
+  )
+}
+
+const root = document.getElementById('root')
+if (!root) throw new Error('Root element not found')
+hydrateRoot(root, <App />)
+```
+
+The entry point does what entry points should do: mount the app, nothing more. The routing logic lives in the framework.
 
 ---
 

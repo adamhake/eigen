@@ -1,12 +1,14 @@
 ---
 title: "Part 5: Typed Loaders"
 description: "Loader conventions, satisfies for constrained type inference, and the defineLoader helper."
+concepts:
+  - "data loading conventions"
+  - "constrained type inference"
+  - "client-side data endpoints"
 ---
 
 
 *This is the sixth installment in a series where we build a toy Next.js on top of Vite. In [Part 4](/04-hydration), we connected server and client with hydration. Now we'll build the data loading layer — the `loader` pattern that Next.js calls `getServerSideProps` and Remix calls `loader` — with full TypeScript inference.*
-
-**Concepts introduced:** Loader conventions, `satisfies` for constrained type inference, `defineLoader` helper, three levels of type inference sophistication, client-side data fetching endpoint, `configureServer` for data middleware.
 
 ---
 

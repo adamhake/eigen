@@ -1,13 +1,16 @@
 ---
 title: "Part 35: Error Boundaries and Loading States"
 description: "Route-scoped error boundaries, file-based error/loading/not-found conventions, and the reset() recovery pattern."
+concepts:
+  - "route-scoped error boundaries"
+  - "file-based error/loading conventions"
+  - "error recovery patterns"
+  - "streaming-compatible loading states"
+  - "error serialization across SSR"
 ---
 
 
 *This module builds Eigen's error and loading state system — route-scoped error boundaries that preserve type safety, file-based `error.tsx` and `loading.tsx` conventions with generated types, granular error recovery, streaming-aware loading states, and pending UI for client-side navigations.*
-
-**Concepts introduced:** Route-scoped React error boundaries, file-based `error.tsx` / `loading.tsx` / `not-found.tsx` conventions, typed error component props, error boundary placement in the layout hierarchy, loader error vs. render error distinction, the `reset()` recovery pattern, streaming-compatible loading states, pending UI with `useTransition` and the Navigation API, error serialization across the SSR boundary, the `onError` callback in streaming SSR, global vs. segment-level error handling.
-
 ---
 
 ## The design challenge

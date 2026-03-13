@@ -1,12 +1,15 @@
 ---
 title: "Part 24: View Transitions and Speculation Rules"
 description: "The View Transitions API, cross-document transitions, and combining Speculation Rules with prerendering."
+concepts:
+  - "view transitions"
+  - "cross-document animations"
+  - "speculative prerendering"
+  - "zero-latency navigations"
 ---
 
 
 *This is the twenty-fourth installment in a series where we build a toy Next.js on top of Vite. In [Part 23](/23-advanced-router), we replaced our router with the Navigation API. Now we'll layer on two more browser APIs — View Transitions for animated navigations and Speculation Rules for browser-native prerendering — to give Eigen the instant, animated feel of a native app.*
-
-**Concepts introduced:** The View Transitions API (`document.startViewTransition`), `view-transition-name` CSS property, `::view-transition-old`/`::view-transition-new` pseudo-elements, cross-document view transitions via `@view-transition`, Speculation Rules API (`<script type="speculationrules">`), prefetch vs. prerender eagerness, generating speculation rules from the route tree, combining transitions with prerendering for zero-latency navigations.
 
 ---
 

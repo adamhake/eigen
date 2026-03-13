@@ -1,12 +1,16 @@
 ---
 title: "Part 28: Real-Time Primitives"
 description: "WebSocket upgrade handling, typed event channels, and createRealtimeChannel as a framework primitive."
+concepts:
+  - "WebSocket primitives"
+  - "typed event channels"
+  - "room multiplexing"
+  - "server-to-client push"
+  - "HMR vs. application WebSocket"
 ---
 
 
 *This is the twenty-eighth installment in a series where we build a toy Next.js on top of Vite. In [Part 27](/27-ai-streaming), we built AI streaming. Now we'll add real-time communication — WebSocket connections, typed event channels, and the framework infrastructure that supports persistent connections alongside request/response server functions.*
-
-**Concepts introduced:** WebSocket upgrade handling in `configureServer`, typed event emitters, `createRealtimeChannel` as a framework primitive, room/topic multiplexing, reconnection strategies, server-to-client push, integrating real-time state with React, `useSubscription` hooks, the relationship between HMR WebSocket and application WebSocket.
 
 ---
 

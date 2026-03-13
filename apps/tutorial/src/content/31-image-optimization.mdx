@@ -1,13 +1,16 @@
 ---
 title: "Part 31: Image Optimization"
 description: "Build-time image processing with sharp, responsive srcset generation, blur placeholders, and DAM integration."
+concepts:
+  - "build-time image processing"
+  - "responsive images and srcset"
+  - "format negotiation (WebP/AVIF)"
+  - "blur placeholders (LQIP)"
+  - "image CDN integration"
 ---
 
 
 *In this installment, we build an image optimization pipeline — a Vite plugin that processes images at build time and a React component that serves responsive, format-optimized images with blur placeholders. We also integrate with external DAMs like Cloudinary for on-the-fly transformations.*
-
-**Concepts introduced:** The `load` hook for image processing, [`sharp`](https://sharp.pixelplumbing.com/) (a high-performance Node.js image processing library) for build-time image transforms, responsive `srcset` generation, WebP/AVIF format conversion, blur placeholder generation (LQIP — Low-Quality Image Placeholder), the `<Image>` component, `transformIndexHtml` for preload hints, DAM URL transformation for Cloudinary/Imgix, image CDN patterns, the `resolveId` hook for virtual image modules.
-
 ---
 
 ## The problem: images on the modern web

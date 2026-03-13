@@ -1,14 +1,16 @@
 ---
 title: "Part 1: A Bare Vite SPA"
 description: "Project structure, the dev server, index.html as entry point, dependency pre-bundling, and HMR."
+concepts:
+  - "HTML-first dev servers"
+  - "on-demand module serving"
+  - "dependency pre-bundling"
+  - "hot module replacement"
 ---
 
 
 *This is the second installment in a series where we build a toy Next.js on top of Vite. In [Part 0](/00-the-mental-model), we covered the mental model — Vite's dual nature, the plugin pipeline, virtual modules, and the Environment API. Now we'll set up the project and observe the dev server in action.*
 
-**Concepts introduced:** Vite project structure, TypeScript configuration for framework development, the dev server, `index.html` as entry point, dependency pre-bundling, HMR.
-
----
 
 ## Setting up the project
 
@@ -16,7 +18,7 @@ description: "Project structure, the dev server, index.html as entry point, depe
 mkdir eigen && cd eigen
 pnpm init
 pnpm add vite react react-dom @vitejs/plugin-react
-pnpm add -D typescript @types/react @types/react-dom
+pnpm add -D typescript @types/react @types/react-dom @types/node vitest
 ```
 
 We'll end up with a project that has two distinct zones of TypeScript: **app code** (React components, entry points — runs in the browser and/or Node SSR) and **tooling code** (Vite config, plugins, the dev server script — runs in Node only). These need different TypeScript configurations.
@@ -37,10 +39,6 @@ We'll end up with a project that has two distinct zones of TypeScript: **app cod
     <Folder name="plugins" comment="Vite plugins (tooling code)" />
     <Folder name="src" defaultOpen>
       <File name="main.tsx" comment="App entry point" />
-      <Folder name="pages" defaultOpen>
-        <File name="Home.tsx" />
-        <File name="About.tsx" />
-      </Folder>
     </Folder>
   </Folder>
 </Files>
@@ -171,40 +169,16 @@ This has several implications for framework development:
 ### `src/main.tsx`
 
 ```tsx title="src/main.tsx"
-import { createRoot } from 'react-dom/client'
+import { createRoot } from "react-dom/client";
 
 function App() {
-  return <h1>Hello from Eigen Framework</h1>
+  return <h1>Hello from Eigen Framework</h1>;
 }
-
-createRoot(document.getElementById('root')!).render(<App />)
+const root = document.getElementById("root");
+if (!root) throw new Error("Root element not found");
+createRoot(root).render(<App />);
 ```
 
-### `src/pages/Home.tsx`
-
-```tsx title="src/pages/Home.tsx"
-export default function Home() {
-  return (
-    <div>
-      <h1>Home Page</h1>
-      <p>Welcome to Eigen Framework.</p>
-    </div>
-  )
-}
-```
-
-### `src/pages/About.tsx`
-
-```tsx title="src/pages/About.tsx"
-export default function About() {
-  return (
-    <div>
-      <h1>About</h1>
-      <p>A toy Next.js built on Vite.</p>
-    </div>
-  )
-}
-```
 
 The pages aren't wired up to routing yet — that's Part 2. For now, they're just files sitting in the `src/pages/` directory, waiting to be discovered by our route plugin.
 
@@ -232,15 +206,7 @@ Click on the `/src/main.tsx` request and look at the response. You'll see transf
 
 ### Dependency pre-bundling
 
-Check the terminal where `npx vite` is running. On first startup, you'll see something like:
-
-```
-Pre-bundling dependencies:
-  react
-  react-dom/client
-```
-
-Vite detected that your code imports these packages and ran esbuild to convert them from CommonJS (React's default format) to ESM, combining internal files into single modules. The results are cached in `node_modules/.vite/deps/`.
+When the dev server starts, Vite scans your imports and detects that `react` and `react-dom/client` need to be pre-bundled. It runs esbuild to convert them from CommonJS (React's default format) to ESM, combining each package's internal files into a single module. The results are cached in `node_modules/.vite/deps/`.
 
 Look at the Network tab paths: the pre-bundled dependencies are served from `/node_modules/.vite/deps/`, not from the original `node_modules/react/` directory. They have a content hash in their cache headers, so the browser caches them aggressively. On subsequent page loads, the browser fetches them from its HTTP cache without contacting the dev server.
 
@@ -248,22 +214,23 @@ Your own source files in `/src/` are *not* pre-bundled. They're transformed on t
 
 ### HMR in action
 
-Edit `src/main.tsx` — change the heading text and save. The browser updates without a full page reload. Open the Console tab and you'll see HMR log messages:
+Edit `src/main.tsx` — change the heading text and save. The browser updates instantly. You'll see an HMR log in the terminal:
 
 ```
-[vite] hot updated: /src/main.tsx
+[vite] (client) hmr update /src/main.tsx
 ```
 
-What happened:
+But look closely — you'll also see a **page reload**, not a hot update. That's because `main.tsx` has a side effect (the `createRoot(...).render(...)` call), so React Fast Refresh can't safely hot-replace it. The plugin only injects HMR boundaries into modules that exclusively export React components. When a module doesn't qualify, Vite invalidates it and the update bubbles up to the root, triggering a full reload.
 
-1. Vite's file watcher (chokidar) detected the save.
+The reload is fast enough that it looks instant, but the distinction matters. Here's what happened under the hood:
+
+1. Vite's file watcher detected the save.
 2. Vite found the changed module in the module graph.
 3. Vite walked up the dependency tree looking for an **HMR boundary** — a module that has registered a `import.meta.hot.accept()` handler.
-4. `@vitejs/plugin-react` injected an HMR boundary into every React component via its `transform` hook. So `main.tsx` itself is a boundary.
-5. Vite sent an update message via WebSocket to the `@vite/client` script running in the browser.
-6. The browser re-imported the module and React's Fast Refresh re-rendered the component without losing state.
+4. `@vitejs/plugin-react` injects HMR boundaries into modules that only export React components. `main.tsx` has side effects, so it doesn't qualify.
+5. With no boundary found, Vite fell back to a full page reload.
 
-If you have a component with `useState`, try changing the JSX without changing the state logic. You'll see the component re-render with the new markup while preserving its state. This is React Fast Refresh, enabled by the HMR boundary code that `@vitejs/plugin-react` injects.
+In the next part, when we add page components in separate files and import them from `main.tsx`, edits to those components *will* get true HMR — a hot update with no reload and no state loss. The entry point almost always triggers full reloads, but component modules deeper in the tree get fast, stateful updates.
 
 ### TypeScript and type checking
 

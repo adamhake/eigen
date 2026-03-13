@@ -1,12 +1,15 @@
 ---
 title: "Part 12: Streaming SSR"
 description: "renderToPipeableStream, Suspense-driven streaming, the shell vs content model, and streaming through Express."
+concepts:
+  - "streaming server rendering"
+  - "Suspense-driven progressive loading"
+  - "the shell vs. content model"
+  - "error handling in streams"
 ---
 
 
 *This is the twelfth installment in a series where we build a toy Next.js on top of Vite. In [Part 11](/11-framework-plugin), we composed Eigen into a distributable framework plugin. Now we'll replace our synchronous `renderToString` SSR with React's streaming API, enabling progressive page loads powered by Suspense boundaries.*
-
-**Concepts introduced:** `renderToPipeableStream`, Suspense-driven streaming, shell vs. content model, `onShellReady` / `onAllReady`, streaming through Express, typed stream results, `transformIndexHtml` in a streaming context, error handling in streams.
 
 ---
 

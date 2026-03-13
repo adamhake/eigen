@@ -1,12 +1,15 @@
 ---
 title: "Part 7: The transform Hook"
 description: "Code transformation with applyToEnvironment, regex vs AST-based stripping, and server/client boundaries."
+concepts:
+  - "compile-time code transformation"
+  - "server/client boundary enforcement"
+  - "the \"use server\" / \"use client\" model"
+  - "regex vs. AST-based transforms"
 ---
 
 
 *This is the eighth installment in a series where we build a toy Next.js on top of Vite. In [Part 6](/06-production-builds), we built the production pipeline. Now we'll tackle the most powerful tool in the plugin API: the `transform` hook, which lets you rewrite source code before it's executed.*
-
-**Concepts introduced:** The `transform` hook, `applyToEnvironment`, regex-based vs. AST-based code stripping, the TypeScript compiler API for transforms, server/client boundary enforcement, the "use server" / "use client" model.
 
 ---
 
@@ -45,6 +48,40 @@ This is the "server-side imports leaking to client bundles" issue. It's a real p
 ```typescript title="plugins/eigen-strip-loaders.ts"
 import type { Plugin } from 'vite'
 
+/** Strip loader exports and server-only imports from client code */
+export function stripLoaderForClient(code: string): string {
+  // Strip the loader export.
+  // This regex handles:
+  //   export async function loader(...) { ... }
+  //   export const loader = defineLoader(...)
+  //   export const loader = (async () => { ... }) satisfies LoaderFn
+  let stripped = code.replace(
+    /export\s+(?:const\s+loader\s*=[\s\S]*?(?:;|\n(?=export|import|\/\/))|(?:async\s+)?function\s+loader\s*\([^)]*\)\s*(?::\s*[^{]*?)?\{[\s\S]*?\n\})/,
+    '// [eigen] loader stripped for client bundle',
+  )
+
+  // Also strip defineLoader and LoaderFn imports if unused
+  stripped = stripped.replace(
+    /import\s*\{[^}]*defineLoader[^}]*\}\s*from\s*['"]eigen\/helpers['"]\s*;?\n?/,
+    '',
+  )
+  stripped = stripped.replace(
+    /import\s+type\s*\{[^}]*LoaderFn[^}]*\}\s*from\s*['"]eigen\/types['"]\s*;?\n?/,
+    '',
+  )
+
+  // Strip server-only imports that are only used by the loader.
+  // This is a simplified version — a real framework would do
+  // import analysis to determine which imports are loader-only.
+  // For now, strip imports marked with a comment convention:
+  stripped = stripped.replace(
+    /import\s+.*\/\/\s*server-only\s*\n/g,
+    '// [eigen] server-only import stripped\n',
+  )
+
+  return stripped
+}
+
 export default function eigenStripLoaders(): Plugin {
   return {
     name: 'eigen-strip-loaders',
@@ -63,36 +100,7 @@ export default function eigenStripLoaders(): Plugin {
         return  // No loader — don't transform
       }
 
-      // Strip the loader export.
-      // This regex handles:
-      //   export async function loader(...) { ... }
-      //   export const loader = defineLoader(...)
-      //   export const loader = (async () => { ... }) satisfies LoaderFn
-      let stripped = code.replace(
-        /export\s+(?:const\s+loader\s*=[\s\S]*?(?:;|\n(?=export|import|\/\/))|(?:async\s+)?function\s+loader\s*\([^)]*\)\s*(?::\s*[^{]*?)?\{[\s\S]*?\n\})/,
-        '// [eigen] loader stripped for client bundle',
-      )
-
-      // Also strip defineLoader and LoaderFn imports if unused
-      stripped = stripped.replace(
-        /import\s*\{[^}]*defineLoader[^}]*\}\s*from\s*['"]eigen\/helpers['"]\s*;?\n?/,
-        '',
-      )
-      stripped = stripped.replace(
-        /import\s+type\s*\{[^}]*LoaderFn[^}]*\}\s*from\s*['"]eigen\/types['"]\s*;?\n?/,
-        '',
-      )
-
-      // Strip server-only imports that are only used by the loader.
-      // This is a simplified version — a real framework would do
-      // import analysis to determine which imports are loader-only.
-      // For now, strip imports marked with a comment convention:
-      stripped = stripped.replace(
-        /import\s+.*\/\/\s*server-only\s*\n/g,
-        '// [eigen] server-only import stripped\n',
-      )
-
-      return { code: stripped, map: null }
+      return { code: stripLoaderForClient(code), map: null }
     },
   }
 }
@@ -249,6 +257,70 @@ The `transform` hook is essentially a compiler pass — you receive source code 
 This is why production frameworks invest in proper AST parsing. The `transform` hook is the most powerful tool in the Vite plugin API, and also the most dangerous — a buggy transform can silently corrupt application code.
 
 ---
+
+<TestSection title="Testing: transform output">
+
+Transform hooks are code-in, code-out — making them straightforward to test. The key technique is **snapshot testing**: capture the transform's output and compare it against a known-good baseline. Since we extracted `stripLoaderForClient` as an exported function above, tests import it directly:
+
+```typescript title="plugins/__tests__/eigen-strip-loaders.test.ts"
+import { describe, it, expect } from 'vitest'
+import { stripLoaderForClient } from '../eigen-strip-loaders'
+
+describe('stripLoaderForClient', () => {
+  it('strips a const loader export', () => {
+    const input = `
+import { db } from '../lib/database' // server-only
+import type { PageProps } from 'eigen/types'
+
+export const loader = defineLoader('/posts/:id', async ({ params }) => {
+  return db.query('SELECT * FROM posts WHERE id = $1', [params.id])
+});
+
+export default function PostPage({ data }) {
+  return <h1>{data.title}</h1>
+}
+`
+    const output = stripLoaderForClient(input)
+
+    // The loader is gone
+    expect(output).not.toContain('defineLoader')
+    expect(output).not.toContain('db.query')
+
+    // The component survives
+    expect(output).toContain('export default function PostPage')
+
+    // Server-only import is stripped
+    expect(output).toContain('[eigen] server-only import stripped')
+  })
+
+  it('leaves files without loaders untouched', () => {
+    const input = `export default function About() { return <h1>About</h1> }`
+    // Quick check returns early — no transform needed
+    expect(input).not.toMatch(
+      /export\s+(const|async\s+function|function)\s+loader/,
+    )
+  })
+
+  it('preserves non-loader exports', () => {
+    const input = `
+export const metadata = { title: 'Post' }
+
+export const loader = async () => {
+  return { posts: [] }
+};
+
+export default function Page() { return null }
+`
+    const output = stripLoaderForClient(input)
+    expect(output).toContain('export const metadata')
+    expect(output).not.toContain('export const loader')
+  })
+})
+```
+
+Snapshot tests are especially valuable for transforms — if a regex change accidentally corrupts the output, the snapshot diff shows exactly what broke. Run `npx vitest run --update` to regenerate snapshots after intentional changes.
+
+</TestSection>
 
 ## What's next
 

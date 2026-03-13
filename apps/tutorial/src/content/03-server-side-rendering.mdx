@@ -1,12 +1,15 @@
 ---
 title: "Part 3: Server-Side Rendering"
 description: "Vite's SSR mode, ssrLoadModule, the programmatic createServer API, and dual module graphs."
+concepts:
+  - "server-side rendering"
+  - "dual module graphs"
+  - "HTML as a template"
+  - "programmatic dev server"
 ---
 
 
 *This is the fourth installment in a series where we build a toy Next.js on top of Vite. In [Part 2](/02-route-discovery-plugin), we built a route discovery plugin with type-safe virtual modules. Now we'll add server-side rendering — the feature that transforms a Vite SPA into a full-stack framework.*
-
-**Concepts introduced:** Vite's SSR mode, `server.ssrLoadModule`, `createServer` programmatic API, `transformIndexHtml`, dual module graphs, typing `ssrLoadModule` results.
 
 ---
 
@@ -100,7 +103,40 @@ export async function render(pathname: string): Promise<RenderResult> {
 
 When Vite loads this module through the SSR environment, the `import { routes } from 'eigen/routes'` statement triggers the route plugin's `load` hook. Because `this.environment.name === 'ssr'`, the plugin generates server-side code with static imports and loader references. The `render` function receives a URL pathname, matches it to a route, calls the loader (if present), renders the component to an HTML string, and returns the result alongside the serialized data.
 
-Notice the `matchRoute` function appears in both the server and client entries. This duplication is deliberate — the route matching logic must be identical on both sides to ensure hydration consistency. A production framework would extract this into a shared module that both entries import.
+Notice the `matchRoute` function appears in both the server and client entries. The route matching logic must be identical on both sides to ensure hydration consistency. Extract it into a shared module that both entries import:
+
+```typescript title="packages/eigen/match-route.ts"
+import type { RouteDefinition } from './types'
+
+export interface RouteMatch {
+  route: RouteDefinition
+  params: Record<string, string>
+}
+
+export function matchRoute(pathname: string, routes: RouteDefinition[]): RouteMatch | null {
+  for (const route of routes) {
+    if (route.path === pathname) return { route, params: {} }
+
+    const routeParts = route.path.split('/')
+    const pathParts = pathname.split('/')
+    if (routeParts.length !== pathParts.length) continue
+
+    const params: Record<string, string> = {}
+    const match = routeParts.every((part, i) => {
+      if (part.startsWith(':')) {
+        params[part.slice(1)] = pathParts[i]
+        return true
+      }
+      return part === pathParts[i]
+    })
+
+    if (match) return { route, params }
+  }
+  return null
+}
+```
+
+Both `entry-server.tsx` and `entry-client.tsx` now import `matchRoute` from `eigen/match-route` instead of defining their own copy. Single source of truth, no duplication.
 
 ---
 
@@ -269,6 +305,58 @@ This is the fundamental architecture of every Vite-based SSR framework. The dev 
 The custom server (`server.ts`) is the framework's development runtime. It creates a Vite instance, uses it as middleware, and wraps it with SSR handling. In production, this entire file is replaced by a simpler server that imports pre-built bundles. The gap between dev and prod is where deployment adapters (Netlify, Vercel, Cloudflare) live.
 
 ---
+
+<TestSection title="Testing: route matching">
+
+The `matchRoute` function is shared between server and client — and it determines whether users see the right page. Since we extracted it into `eigen/match-route` above, tests import it directly:
+
+```typescript title="src/__tests__/match-route.test.ts"
+import { describe, it, expect } from 'vitest'
+import { matchRoute } from 'eigen/match-route'
+
+const routes = [
+  { path: '/', component: () => null },
+  { path: '/about', component: () => null },
+  { path: '/posts/:id', component: () => null },
+  { path: '/users/:userId/posts/:postId', component: () => null },
+]
+
+describe('matchRoute', () => {
+  it('matches static routes exactly', () => {
+    const result = matchRoute('/about', routes)
+    expect(result?.route.path).toBe('/about')
+    expect(result?.params).toEqual({})
+  })
+
+  it('extracts params from dynamic segments', () => {
+    const result = matchRoute('/posts/42', routes)
+    expect(result?.route.path).toBe('/posts/:id')
+    expect(result?.params).toEqual({ id: '42' })
+  })
+
+  it('handles multiple dynamic segments', () => {
+    const result = matchRoute('/users/7/posts/99', routes)
+    expect(result?.params).toEqual({ userId: '7', postId: '99' })
+  })
+
+  it('returns null for unmatched paths', () => {
+    expect(matchRoute('/nonexistent', routes)).toBeNull()
+  })
+
+  it('does not match when segment count differs', () => {
+    expect(matchRoute('/posts/42/comments', routes)).toBeNull()
+  })
+
+  it('matches the root path', () => {
+    const result = matchRoute('/', routes)
+    expect(result?.route.path).toBe('/')
+  })
+})
+```
+
+Notice the test for segment count mismatch — without that guard, `/posts/42/comments` would partially match `/posts/:id` and produce wrong results. This is the kind of edge case that tests catch before users do.
+
+</TestSection>
 
 ## What's next
 

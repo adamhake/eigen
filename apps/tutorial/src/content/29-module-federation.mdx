@@ -1,12 +1,16 @@
 ---
 title: "Part 29: Module Federation"
 description: "Micro-frontend composition with Vite's Module Federation plugin, runtime loading, and shared React instances."
+concepts:
+  - "micro-frontend architecture"
+  - "runtime module loading"
+  - "shared dependency negotiation"
+  - "independent deployment"
+  - "server-side vs. client-side composition"
 ---
 
 
 *This is the twenty-ninth and final installment in a series where we build a toy Next.js on top of Vite. In [Part 28](/28-realtime-websockets), we added real-time WebSocket communication. Now we'll explore Module Federation — composing independently-deployed applications into a unified UI, where different teams ship different parts of the product as separate Vite builds that integrate at runtime.*
-
-**Concepts introduced:** Module Federation concepts (host/remote, shared dependencies), Vite's `@module-federation/vite` plugin, runtime module loading, shared React instances, typed remote module contracts, independent deployment, the "micro-frontend" architecture, version negotiation for shared libraries, server-side composition vs. client-side composition.
 
 ---
 

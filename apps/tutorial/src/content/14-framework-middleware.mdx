@@ -1,12 +1,15 @@
 ---
 title: "Part 14: Framework Middleware"
 description: "The middleware chain pattern, typed context accumulation, and beforeLoad hooks."
+concepts:
+  - "the middleware chain pattern"
+  - "typed context accumulation"
+  - "per-route vs. global middleware"
+  - "auth guards"
 ---
 
 
 *This is the fourteenth installment in a series where we build a toy Next.js on top of Vite. In [Part 13](/13-nested-layouts), we built nested layouts. Now we'll implement a framework-level middleware system — a typed request pipeline that runs before loaders and route handlers, enabling authentication, redirects, context injection, and request transformation.*
-
-**Concepts introduced:** Framework middleware vs. server middleware, the middleware chain pattern, typed context accumulation, `beforeLoad` hooks, redirect responses from middleware, auth guard patterns, request/response header manipulation, middleware composition, per-route vs. global middleware, the middleware virtual module.
 
 ---
 
@@ -213,7 +216,7 @@ export const loader = defineLoader('/dashboard', async ({ params, ctx }) => {
 The server entry runs middleware before calling loaders:
 
 ```typescript title="entry-server.tsx"
-async function executeMiddleware(
+export async function executeMiddleware(
   middlewares: MiddlewareFn[],
   baseCtx: BaseContext,
 ): Promise<{ context: Record<string, unknown>; response?: Response }> {
@@ -379,6 +382,76 @@ Framework middleware is a typed function pipeline that runs between route matchi
 The type accumulation pattern (each middleware extends the context type for downstream consumers) is the TypeScript equivalent of a functional pipeline. It's the same pattern used in tRPC's middleware, TanStack Start's server function middleware, and Express's `req` extension pattern — but with compile-time type tracking instead of runtime `req.user = ...` mutations.
 
 ---
+
+<TestSection title="Testing: middleware chains">
+
+The middleware execution engine is pure async logic with no HTTP or Vite dependencies — test it directly. The `executeMiddleware` function is exported from `entry-server.tsx`, and the types and `RedirectResponse` class are exported from `packages/eigen/middleware.ts`:
+
+```typescript title="src/__tests__/middleware.test.ts"
+import { describe, it, expect, vi } from 'vitest'
+import { executeMiddleware } from '../entry-server'
+import { RedirectResponse } from 'eigen/middleware'
+import type { BaseContext, MiddlewareFn } from 'eigen/middleware'
+
+function makeCtx(overrides?: Partial<BaseContext>): BaseContext {
+  return {
+    request: new Request('http://localhost/'),
+    params: {},
+    pathname: '/',
+    ...overrides,
+  }
+}
+
+describe('executeMiddleware', () => {
+  it('accumulates context from each middleware', async () => {
+    const mw1: MiddlewareFn = async () => ({ user: 'alice' })
+    const mw2: MiddlewareFn = async () => ({ role: 'admin' })
+
+    const { context } = await executeMiddleware([mw1, mw2], makeCtx())
+
+    expect(context).toMatchObject({ user: 'alice', role: 'admin' })
+  })
+
+  it('short-circuits on Response return', async () => {
+    const blocker: MiddlewareFn = async () =>
+      new Response('Forbidden', { status: 403 })
+    const shouldNotRun = vi.fn(async () => ({}))
+
+    const { response } = await executeMiddleware(
+      [blocker, shouldNotRun],
+      makeCtx(),
+    )
+
+    expect(response?.status).toBe(403)
+    expect(shouldNotRun).not.toHaveBeenCalled()
+  })
+
+  it('handles redirect throws', async () => {
+    const authGuard: MiddlewareFn = async () => {
+      throw new RedirectResponse('/login')
+    }
+
+    const { response } = await executeMiddleware([authGuard], makeCtx())
+
+    expect(response?.status).toBe(302)
+    expect(response?.headers.get('location')).toContain('/login')
+  })
+
+  it('runs middleware in order', async () => {
+    const order: string[] = []
+    const mw1: MiddlewareFn = async () => { order.push('first'); return {} }
+    const mw2: MiddlewareFn = async () => { order.push('second'); return {} }
+
+    await executeMiddleware([mw1, mw2], makeCtx())
+
+    expect(order).toEqual(['first', 'second'])
+  })
+})
+```
+
+The test for short-circuiting is especially important — it verifies that an auth guard (returning a 403 or redirecting) prevents downstream middleware from running. Without this guarantee, a misconfigured middleware chain could leak data from protected routes.
+
+</TestSection>
 
 ## What's next
 

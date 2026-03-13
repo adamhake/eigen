@@ -1,12 +1,15 @@
 ---
 title: "Part 19: Edge Runtimes"
 description: "Custom Vite environments, the DevEnvironment factory, resolve conditions, and building for multiple runtimes."
+concepts:
+  - "custom Vite environments"
+  - "multi-runtime builds"
+  - "Web APIs vs. Node APIs"
+  - "environment-polymorphic code"
 ---
 
 
 *This is the nineteenth installment in a series where we build a toy Next.js on top of Vite. In [Part 18](/18-runtime-validation), we added runtime validation. Now we'll use the Environment API (introduced in Vite 6) to add a third environment targeting Cloudflare Workers — a fundamentally different runtime with different global APIs, different constraints, and different deployment characteristics.*
-
-**Concepts introduced:** Custom Vite environments, `DevEnvironment` factory, the `react-server` condition, environment-polymorphic types, `Request`/`Response` Web APIs vs Node's `IncomingMessage`/`ServerResponse`, `@cloudflare/vite-plugin` and `createWorkerdEnvironment`, `childEnvironments`, building for multiple runtimes from a single config.
 
 ---
 

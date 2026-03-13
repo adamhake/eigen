@@ -1,12 +1,15 @@
 ---
 title: "Part 2: File-Based Route Discovery"
 description: "Writing a Vite plugin with resolveId/load for virtual modules, file watching, and generated type declarations."
+concepts:
+  - "virtual modules"
+  - "file-system routing"
+  - "the resolve/load pattern"
+  - "generated type declarations"
 ---
 
 
 *This is the third installment in a series where we build a toy Next.js on top of Vite. In [Part 1](/01-bare-vite-spa), we set up the project and observed the dev server in action. Now we'll write our first Vite plugin — the route discovery system that makes everything else possible.*
-
-**Concepts introduced:** Writing a Vite plugin in TypeScript, `resolveId`/`load` for virtual modules, `configResolved`, `configureServer` for file watching, generated TypeScript declarations, template literal types for route params.
 
 ---
 
@@ -73,17 +76,19 @@ The `RouteParams` type deserves close attention. It's a **recursive conditional 
 ```typescript
 // Step through RouteParams<'/posts/:id/:slug'>:
 
-// First match: T extends `${string}:${infer Param}/${infer Rest}`
-//   Param = 'id'
-//   Rest = ':slug'
-//   Result: { id: string } & RouteParams<':slug'>
+// First: T extends `${string}:${infer Param}/${infer Rest}`
+//   Param = 'id', Rest = ':slug'
+type Step1 = RouteParams<'/posts/:id/:slug'>
+//   → { id: string } & RouteParams<':slug'>
 
-// Recurse: RouteParams<':slug'>
-//   Matches: T extends `${string}:${infer Param}`
+// Recurse: T extends `${string}:${infer Param}`
 //   Param = 'slug'
-//   Result: { slug: string }
+type Step2 = RouteParams<':slug'>
+//   → { slug: string }
 
-// Final: { id: string } & { slug: string } = { id: string; slug: string }
+// Final result:
+type Result = RouteParams<'/posts/:id/:slug'>
+//   → { id: string; slug: string }
 ```
 
 For a static route like `/about`, none of the template literal patterns match, so the result is `Record<string, never>` — an empty params object.
@@ -100,9 +105,11 @@ This is the same technique TanStack Router uses for its fully-typed route params
 
 ## The route discovery plugin
 
+Here's the complete plugin file. We'll walk through each section after the listing:
+
 ```typescript title="plugins/eigen-routes.ts"
-import { resolve } from 'path'
-import { readdirSync, writeFileSync, mkdirSync } from 'fs'
+import { resolve } from 'node:path'
+import { readdirSync, writeFileSync, mkdirSync } from 'node:fs'
 import type { Plugin, ResolvedConfig } from 'vite'
 
 interface DiscoveredRoute {
@@ -112,7 +119,7 @@ interface DiscoveredRoute {
   paramNames: string[]
 }
 
-function fileToRoute(filename: string): { path: string; paramNames: string[] } {
+export function fileToRoute(filename: string): { path: string; paramNames: string[] } {
   const paramNames: string[] = []
 
   const name = filename
@@ -127,7 +134,7 @@ function fileToRoute(filename: string): { path: string; paramNames: string[] } {
   return { path, paramNames }
 }
 
-function discoverRoutes(pagesDir: string): DiscoveredRoute[] {
+export function discoverRoutes(pagesDir: string): DiscoveredRoute[] {
   const files = readdirSync(pagesDir, { recursive: true })
     .filter((f): f is string => typeof f === 'string' && f.endsWith('.tsx'))
 
@@ -141,15 +148,7 @@ function discoverRoutes(pagesDir: string): DiscoveredRoute[] {
     }
   })
 }
-```
 
-The `fileToRoute` function converts filesystem paths to route paths following the Next.js pages router convention: `Home.tsx` → `/`, `About.tsx` → `/about`, `posts/[id].tsx` → `/posts/:id`. The `[param]` → `:param` conversion extracts the parameter names, which we'll need for type generation.
-
-### Generating type declarations
-
-This function writes a `.d.ts` file that gives TypeScript full knowledge of the route topology:
-
-```typescript
 function generateRouteDeclarations(
   routes: DiscoveredRoute[],
   outDir: string,
@@ -186,33 +185,7 @@ ${paramEntries}
   mkdirSync(outDir, { recursive: true })
   writeFileSync(resolve(outDir, 'eigen-routes.d.ts'), dts)
 }
-```
 
-For a project with `Home.tsx`, `About.tsx`, and `posts/[id].tsx`, this generates:
-
-```typescript
-declare module 'eigen/route-types' {
-  export type RoutePaths = '/' | '/about' | '/posts/:id'
-
-  export interface RouteParamsMap {
-    '/': Record<string, never>
-    '/about': Record<string, never>
-    '/posts/:id': { id: string }
-  }
-}
-```
-
-Now TypeScript knows every valid route path and what parameters each one expects. This is pure compile-time information — none of it exists at runtime.
-
-<TypeDeepDive title="TypeScript: `declare module` and ambient declarations">
-
-`declare module 'some-module'` tells TypeScript about a module's types without providing any implementation code. For virtual modules — which don't exist as files on disk — this is the *only* way TypeScript can know what an import contains. The declaration file acts as a contract: the plugin's `load` hook must produce code whose exports match the declared shape, but TypeScript trusts the declaration at compile time without verifying it. This technique is also called "ambient module declaration," and it's the same mechanism used by `@types/*` packages to type third-party JavaScript libraries.
-
-</TypeDeepDive>
-
-### The plugin itself
-
-```typescript
 export default function eigenRoutes(): Plugin {
   const virtualModuleId = 'eigen/routes'
   const resolvedVirtualModuleId = '\0' + virtualModuleId
@@ -296,6 +269,38 @@ export const routes = [\n${routeArray}\n]
 }
 ```
 
+### Helper functions
+
+**`fileToRoute`** converts filesystem paths to route paths following the Next.js pages router convention: `Home.tsx` → `/`, `About.tsx` → `/about`, `posts/[id].tsx` → `/posts/:id`. The `[param]` → `:param` conversion extracts the parameter names, which we'll need for type generation.
+
+**`discoverRoutes`** scans the pages directory recursively and maps each `.tsx` file through `fileToRoute`.
+
+### Type declarations
+
+**`generateRouteDeclarations`** writes a `.d.ts` file that gives TypeScript full knowledge of the route topology. For a project with `Home.tsx`, `About.tsx`, and `posts/[id].tsx`, it generates:
+
+```typescript
+declare module 'eigen/route-types' {
+  export type RoutePaths = '/' | '/about' | '/posts/:id'
+
+  export interface RouteParamsMap {
+    '/': Record<string, never>
+    '/about': Record<string, never>
+    '/posts/:id': { id: string }
+  }
+}
+```
+
+Now TypeScript knows every valid route path and what parameters each one expects. This is pure compile-time information — none of it exists at runtime.
+
+<TypeDeepDive title="TypeScript: `declare module` and ambient declarations">
+
+`declare module 'some-module'` tells TypeScript about a module's types without providing any implementation code. For virtual modules — which don't exist as files on disk — this is the *only* way TypeScript can know what an import contains. The declaration file acts as a contract: the plugin's `load` hook must produce code whose exports match the declared shape, but TypeScript trusts the declaration at compile time without verifying it. This technique is also called "ambient module declaration," and it's the same mechanism used by `@types/*` packages to type third-party JavaScript libraries.
+
+</TypeDeepDive>
+
+### Plugin hooks
+
 Let's walk through each hook:
 
 **`configResolved`** runs after all config processing is done. We store the project root and pages directory, and immediately generate declarations so the IDE has type information from the moment the dev server starts. Without this, the developer would see type errors until the first page was requested.
@@ -312,7 +317,7 @@ Let's walk through each hook:
 
 Add the generated declaration directory to your tsconfig:
 
-```json
+```json title="tsconfig.node.json"
 {
   "compilerOptions": {
     "typeRoots": ["./node_modules/@types", "./node_modules/.eigen"]
@@ -338,7 +343,7 @@ export default defineConfig({
 })
 ```
 
-Update `src/main.tsx` to consume the generated routes with type-safe navigation:
+Update `src/main.tsx` to consume the generated routes with type-safe navigation. We're defining `Router` and `Link` inline here to keep things simple — in a real framework, these would live in the framework package (e.g., `packages/eigen/router.tsx`). We'll extract them in Part 11 once the framework plugin takes shape.
 
 ```tsx title="src/main.tsx"
 import React, { Suspense, useState, useEffect } from 'react'
@@ -456,6 +461,8 @@ The `Link` component is generic over `T extends RoutePaths`. When you write `<Li
 
 ## A type-safe page component
 
+This page won't fully work yet — we haven't introduced SSR or wired up loaders (that's Parts 3–5). But it shows what a type-safe page component looks like and how the types we've built connect:
+
 ```tsx title="src/pages/posts/[id].tsx"
 import type { PageProps } from 'eigen/types'
 
@@ -505,6 +512,58 @@ Type safety in a framework is a **code generation problem**. The plugin discover
 The plugin is the single source of truth. It writes two parallel representations of the same information: JavaScript for execution, TypeScript for verification. When the filesystem changes, both representations update. This is the architectural pattern that makes TanStack Router's type-safe routing possible, and it's the same pattern we'll use for loaders, API routes, and eventually server functions.
 
 ---
+
+<TestSection title="Testing: route discovery">
+
+The route discovery plugin is built from pure functions — ideal targets for unit tests. Since `fileToRoute` and `discoverRoutes` are already exported from the plugin, tests can import them directly:
+
+```typescript title="plugins/__tests__/eigen-routes.test.ts"
+import { describe, it, expect } from 'vitest'
+import { fileToRoute } from '../eigen-routes'
+
+describe('fileToRoute', () => {
+  it('converts Home.tsx to /', () => {
+    expect(fileToRoute('Home.tsx')).toEqual({
+      path: '/',
+      paramNames: [],
+    })
+  })
+
+  it('converts About.tsx to /about', () => {
+    expect(fileToRoute('About.tsx')).toEqual({
+      path: '/about',
+      paramNames: [],
+    })
+  })
+
+  it('extracts dynamic params from [id].tsx', () => {
+    expect(fileToRoute('posts/[id].tsx')).toEqual({
+      path: '/posts/:id',
+      paramNames: ['id'],
+    })
+  })
+
+  it('handles multiple dynamic segments', () => {
+    expect(fileToRoute('users/[userId]/posts/[postId].tsx')).toEqual({
+      path: '/users/:userid/posts/:postid',
+      paramNames: ['userId', 'postId'],
+    })
+  })
+
+  it('strips /index from nested index routes', () => {
+    expect(fileToRoute('blog/index.tsx')).toEqual({
+      path: '/blog',
+      paramNames: [],
+    })
+  })
+})
+```
+
+These tests document the routing conventions: the `Home.tsx` → `/` special case, the `[param]` → `:param` conversion, and the `index` stripping. If a future change breaks a convention, the test names explain *what* broke and *why* it matters.
+
+Run with `npx vitest run plugins/` — since these are pure functions with no Vite dependencies, the tests are fast and isolated.
+
+</TestSection>
 
 ## What's next
 

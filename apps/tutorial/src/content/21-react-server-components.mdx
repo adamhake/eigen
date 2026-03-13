@@ -1,12 +1,15 @@
 ---
 title: "Part 21: React Server Components"
 description: "The rsc environment, use client directives, RSC streaming payloads, and three-phase rendering."
+concepts:
+  - "React Server Components"
+  - "the \"use client\" boundary"
+  - "three-phase rendering"
+  - "server component streaming payloads"
 ---
 
 
 *This is the twenty-first installment in a series where we build a toy Next.js on top of Vite. In [Part 20](/20-observability), we added observability. Now we'll implement React Server Components — the feature that brings together everything we've built: multiple environments, streaming, code transformation, and the boundary between server and client code.*
-
-**Concepts introduced:** The `rsc` environment with `react-server` condition, `"use client"` directives, RSC streaming payloads, `renderToReadableStream` from `react-server-dom`, client references, the `@vitejs/plugin-rsc` official plugin, three-phase rendering (RSC → SSR → hydration), `"use server"` as RSC's server function model.
 
 ---
 

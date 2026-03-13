@@ -1,13 +1,15 @@
 ---
 title: "Part 30: Route Metadata and SEO"
 description: "The generateMetadata convention, dynamic OG tags, JSON-LD structured data, and sitemap generation."
+concepts:
+  - "route-level metadata"
+  - "dynamic Open Graph tags"
+  - "JSON-LD structured data"
+  - "sitemap generation"
 ---
 
 
 *In this installment, we add the metadata layer — route-specific `<head>` content, dynamic Open Graph tags, JSON-LD structured data, and build-time generation of sitemaps and robots.txt. This is how frameworks enable SEO without requiring developers to manually manage `<head>` tags.*
-
-**Concepts introduced:** `generateMetadata` convention, `transformIndexHtml` for head injection, streaming `<head>` updates, dynamic OG tags from loader data, JSON-LD structured data, sitemap.xml generation from the route tree, robots.txt generation, canonical URLs, the `<Head>` component pattern vs. the metadata export pattern.
-
 ---
 
 ## The metadata convention

@@ -1,12 +1,16 @@
 ---
 title: "Part 25: The use cache Directive"
 description: "Compiler-driven caching with cacheLife and cacheTag semantics, cache key derivation, and stale-while-revalidate."
+concepts:
+  - "compiler-driven caching"
+  - "cache key derivation"
+  - "stale-while-revalidate"
+  - "on-demand revalidation"
+  - "cache scoping (remote, private)"
 ---
 
 
 *This is the twenty-fifth installment in a series where we build a toy Next.js on top of Vite. In [Part 24](/24-view-transitions-speculation), we added View Transitions and Speculation Rules. Now we'll implement the third member of React's directive family: `"use cache"` — which turns caching from a runtime concern into a compile-time transformation.*
-
-**Concepts introduced:** The `"use cache"` directive, `cacheLife` and `cacheTag` semantics, cache key derivation from function arguments, `transform` hook generation of cache wrappers, `"use cache: remote"` for distributed caching, `"use cache: private"` for request-scoped caching, stale-while-revalidate patterns, on-demand revalidation via `revalidateTag`.
 
 ---
 

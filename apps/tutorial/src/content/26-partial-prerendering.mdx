@@ -1,12 +1,15 @@
 ---
 title: "Part 26: Partial Prerendering"
 description: "Static shell generation at build time with Suspense boundaries as dynamic insertion points."
+concepts:
+  - "partial prerendering"
+  - "static shells with dynamic holes"
+  - "the build-time / request-time split"
+  - "streaming into pre-rendered HTML"
 ---
 
 
 *This is the twenty-sixth installment in a series where we build a toy Next.js on top of Vite. In [Part 25](/25-use-cache), we implemented the `"use cache"` directive. Now we'll build Partial Prerendering (PPR) — the architecture where a single route has a static shell rendered at build time and dynamic holes filled at request time via Suspense boundaries.*
-
-**Concepts introduced:** PPR architecture, static shell generation at build time, Suspense boundaries as dynamic insertion points, combining SSG and SSR in a single response, the build-time / request-time rendering split, `"use cache"` as the mechanism for static shell inclusion, fallback HTML injection, streaming dynamic content into pre-rendered shells.
 
 ---
 
