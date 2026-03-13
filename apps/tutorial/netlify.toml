@@ -1,6 +1,6 @@
 # example netlify.toml
 [build]
-command = "turbo run build --filter tutorial"
+command = "turbo run build --filter @eigen/tutorial"
 publish = "apps/tutorial/.next"
 
 ## Uncomment to use this redirect for Single Page Applications like create-react-app.
