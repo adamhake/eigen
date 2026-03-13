@@ -14,9 +14,9 @@ description: "Project structure, the dev server, index.html as entry point, depe
 
 ```bash
 mkdir eigen && cd eigen
-npm init -y
-npm install vite react react-dom @vitejs/plugin-react
-npm install -D typescript @types/react @types/react-dom
+pnpm init
+pnpm add vite react react-dom @vitejs/plugin-react
+pnpm add -D typescript @types/react @types/react-dom
 ```
 
 We'll end up with a project that has two distinct zones of TypeScript: **app code** (React components, entry points — runs in the browser and/or Node SSR) and **tooling code** (Vite config, plugins, the dev server script — runs in Node only). These need different TypeScript configurations.
@@ -112,8 +112,8 @@ If you use a single tsconfig with `jsx: "react-jsx"`, TypeScript won't complain 
 ### `vite.config.ts`
 
 ```typescript title="vite.config.ts"
-import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+import { defineConfig } from 'vite'
 
 export default defineConfig({
   plugins: [react()],
@@ -140,13 +140,16 @@ The `react()` plugin is separate from the framework plugin we'll build. This is 
 
 ```html title="index.html"
 <!DOCTYPE html>
-<html>
-<head><title>Eigen Framework</title></head>
-<body>
-  <div id="root"></div>
-  <script type="module" src="/src/main.tsx"></script>
-</body>
+<html lang="en">
+  <head>
+    <title>Eigen Framework</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
 </html>
+
 ```
 
 This is one of Vite's most distinctive design decisions: **`index.html` is the entry point of the application**, not a JavaScript or TypeScript file. Vite parses the HTML, finds `<script type="module">` tags, and uses those as the roots of the module graph.
