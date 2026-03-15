@@ -18,8 +18,25 @@ concepts:
 mkdir eigen && cd eigen
 pnpm init
 pnpm add vite react react-dom @vitejs/plugin-react
-pnpm add -D typescript @types/react @types/react-dom @types/node vitest
+pnpm add -D typescript @types/react @types/react-dom @types/node vitest @biomejs/biome
+git init
 ```
+
+Before anything else, set up a `.gitignore`:
+
+```bash title=".gitignore"
+node_modules
+dist
+*.local
+
+# Vite
+.vite
+
+# Eigen generated types
+.eigen
+```
+
+This keeps `node_modules`, build output (`dist`), Vite's dependency pre-bundle cache (`.vite`), and Eigen's generated type declarations (`.eigen`) out of version control. The `*.local` pattern covers `.env.local` files that Vite loads automatically — these often contain secrets and should never be committed. Biome also respects `.gitignore` by default, so files listed here are automatically excluded from linting and formatting.
 
 We'll end up with a project that has two distinct zones of TypeScript: **app code** (React components, entry points — runs in the browser and/or Node SSR) and **tooling code** (Vite config, plugins, the dev server script — runs in Node only). These need different TypeScript configurations.
 
@@ -27,7 +44,9 @@ We'll end up with a project that has two distinct zones of TypeScript: **app cod
 
 <Files>
   <Folder name="eigen" defaultOpen>
+    <File name=".gitignore" comment="Git ignore rules" />
     <File name="index.html" comment="Vite's true entry point" />
+    <File name="biome.json" comment="Linting and formatting" />
     <File name="vite.config.ts" comment="Vite configuration (tooling code)" />
     <File name="tsconfig.json" comment="TypeScript config for app code" />
     <File name="tsconfig.node.json" comment="TypeScript config for tooling code" />
@@ -58,7 +77,7 @@ We'll end up with a project that has two distinct zones of TypeScript: **app cod
     "isolatedModules": true,
     "esModuleInterop": true,
     "paths": {
-      "eigen/*": ["./packages/eigen/*"]
+      "eigen/types": ["./packages/eigen/types.ts"]
     }
   },
   "include": ["src/**/*", "packages/**/*"]
@@ -73,7 +92,7 @@ A few of these settings deserve explanation:
 
 **`noEmit: true`** — Vite handles compilation. TypeScript is only used for type-checking. The `tsc` command never writes output files.
 
-**`paths`** — Maps `eigen/*` imports to our local `packages/eigen/` directory. This simulates what would happen if Eigen were an installed npm package, letting us write `import type { PageProps } from 'eigen/types'` in app code.
+**`paths`** — Maps `eigen/types` to our local `packages/eigen/types.ts` file. This simulates what would happen if Eigen were an installed npm package, letting us write `import type { PageProps } from 'eigen/types'` in app code. We use a specific path rather than a wildcard (`eigen/*`) because later parts introduce virtual modules like `eigen/routes` whose types come from generated `.d.ts` declarations — a wildcard would intercept those imports and prevent TypeScript from finding the ambient declarations.
 
 ### `tsconfig.node.json` — Tooling code
 
@@ -105,16 +124,81 @@ If you use a single tsconfig with `jsx: "react-jsx"`, TypeScript won't complain 
 
 ---
 
+## Linting and formatting
+
+We'll use [Biome](https://biomejs.dev) for both linting and formatting. Biome is a single Rust binary that replaces ESLint and Prettier — it's fast enough to run on every save without a noticeable delay, and its defaults are sensible for TypeScript React projects.
+
+Initialize it:
+
+```bash
+pnpm biome init
+```
+
+Then replace the generated `biome.json` with:
+
+```json title="biome.json"
+{
+  "$schema": "https://biomejs.dev/schemas/2.4.6/schema.json",
+  "assist": {
+    "actions": {
+      "source": {
+        "organizeImports": "on"
+      }
+    }
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": true
+    }
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "tab"
+  },
+  "files": {
+    "includes": ["**", "!dist/**", "!node_modules/.eigen/**"]
+  }
+}
+```
+
+Biome respects `.gitignore` by default, so `node_modules` and `.vite` are already excluded. The `files.includes` array starts with `**` to match everything, then uses negated patterns (`!`) to exclude `dist` and `node_modules/.eigen` (our generated type declarations) as a safeguard — Biome's `.gitignore` integration depends on being inside a git repo, and these directories contain generated code that should never be linted or formatted regardless.
+
+Add scripts to `package.json`:
+
+```json title="package.json (scripts)"
+{
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "lint": "biome check .",
+    "format": "biome check --fix ."
+  }
+}
+```
+
+`biome check` runs the linter, formatter, and import organizer in a single pass. The `--fix` flag applies safe fixes automatically. There's no need for separate `lint` and `format` commands in CI — `biome check` catches both categories.
+
+If you're using VS Code, install the [Biome extension](https://marketplace.visualstudio.com/items?itemName=biomejs.biome) and set it as the default formatter for TypeScript and TSX files. Biome will format on save and show lint diagnostics inline.
+
+---
+
 ## The configuration file
 
 ### `vite.config.ts`
 
 ```typescript title="vite.config.ts"
+import { resolve } from 'node:path'
 import react from '@vitejs/plugin-react'
 import { defineConfig } from 'vite'
 
 export default defineConfig({
   plugins: [react()],
+  resolve: {
+    alias: {
+      'eigen/types': resolve(__dirname, 'packages/eigen/types.ts'),
+    },
+  },
 })
 ```
 
