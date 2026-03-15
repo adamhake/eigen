@@ -354,12 +354,18 @@ Note that you need to run the dev server at least once (`npx vite`) for the decl
 Update `vite.config.ts`:
 
 ```typescript title="vite.config.ts"
-import { defineConfig } from 'vite'
+import { resolve } from 'node:path'
 import react from '@vitejs/plugin-react'
+import { defineConfig } from 'vite'
 import eigenRoutes from './plugins/eigen-routes'
 
 export default defineConfig({
   plugins: [react(), eigenRoutes()],
+  resolve: {
+    alias: {
+      'eigen/types': resolve(__dirname, 'packages/eigen/types.ts'),
+    },
+  },
 })
 ```
 
