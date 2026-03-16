@@ -7,7 +7,13 @@ function shortenSidebarTitles(tree: ReturnType<typeof source.getPageTree>) {
     ...tree,
     children: tree.children.map((node) => {
       if (node.type === "page" && typeof node.name === "string") {
-        return { ...node, name: node.name.replace(/\s*—\s*.+$/, "") };
+        return {
+          ...node,
+          name: node.name
+            .replace(/\s*—\s*.+$/, "")
+            .replace(/^Part /, "")
+            .replace(/^(\d):/, "0$1:"),
+        };
       }
       return node;
     }),

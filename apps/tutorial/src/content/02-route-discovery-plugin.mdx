@@ -23,7 +23,7 @@ Our route plugin has three jobs:
 
 3. **Generate TypeScript declarations** — Write a `.d.ts` file that tells TypeScript about all known route paths and their parameter types, so the `Link` component and loaders get full type safety.
 
-This three-part pattern — filesystem scan → runtime JavaScript → type declarations — is the core of every typed framework's routing system. TanStack Router does it with `routeTree.gen.ts`. Next.js does a version of it internally (though with less type exposure). We're going to build it from scratch.
+This three-part pattern — filesystem scan → runtime JavaScript → type declarations — is the core of every typed framework's routing system. [TanStack Router](https://tanstack.com/router) does it with `routeTree.gen.ts`. [Next.js](https://nextjs.org) does a version of it internally (though with less type exposure). We're going to build it from scratch.
 
 ---
 
@@ -58,11 +58,19 @@ export type LoaderFn<
 	TData = unknown,
 > = (context: { params: RouteParams<TPath> }) => Promise<TData> | TData;
 
-/** Internal route definition used by the framework runtime */
+/**
+ * Internal route definition used by the framework runtime.
+ * Uses wide types (Record<string, string>) because the runtime doesn't
+ * know which specific route matched at compile time. The narrow,
+ * per-route typing (RouteParams<'/posts/:id'>) lives in PageProps
+ * and LoaderFn — those are for application code, not framework internals.
+ */
 export interface RouteDefinition {
 	path: string;
 	component: React.ComponentType<Record<string, unknown>>;
-	loader?: LoaderFn;
+	loader?: (context: {
+		params: Record<string, string>;
+	}) => Promise<unknown> | unknown;
 }
 ```
 
@@ -96,7 +104,7 @@ Template literal types let TypeScript parse string types character by character,
 
 </TypeDeepDive>
 
-This is the same technique TanStack Router uses for its fully-typed route params. The key insight is that TypeScript's type system is powerful enough to parse strings at compile time, which means route parameter types can be derived from route path strings without any runtime cost.
+This is the same technique [TanStack Router](https://tanstack.com/router) uses for its fully-typed route params. The key insight is that TypeScript's type system is powerful enough to parse strings at compile time, which means route parameter types can be derived from route path strings without any runtime cost.
 
 ---
 
@@ -291,7 +299,7 @@ export const routes = [\n${routeArray}\n]
 
 ### Helper functions
 
-**`fileToRoute`** converts filesystem paths to route paths following the Next.js pages router convention: `Home.tsx` → `/`, `About.tsx` → `/about`, `posts/[id].tsx` → `/posts/:id`. The `[param]` → `:param` conversion extracts the parameter names, which we'll need for type generation.
+**`fileToRoute`** converts filesystem paths to route paths following the [Next.js pages router](https://nextjs.org/docs/pages/building-your-application/routing) convention: `Home.tsx` → `/`, `About.tsx` → `/about`, `posts/[id].tsx` → `/posts/:id`. The `[param]` → `:param` conversion extracts the parameter names, which we'll need for type generation.
 
 **`discoverRoutes`** scans the pages directory recursively and maps each `.tsx` file through `fileToRoute`.
 
@@ -315,7 +323,7 @@ Now TypeScript knows every valid route path and what parameters each one expects
 
 <TypeDeepDive title="TypeScript: `declare module` and ambient declarations">
 
-`declare module 'some-module'` tells TypeScript about a module's types without providing any implementation code. For virtual modules — which don't exist as files on disk — this is the *only* way TypeScript can know what an import contains. The declaration file acts as a contract: the plugin's `load` hook must produce code whose exports match the declared shape, but TypeScript trusts the declaration at compile time without verifying it. This technique is also called "ambient module declaration," and it's the same mechanism used by `@types/*` packages to type third-party JavaScript libraries.
+`declare module 'some-module'` tells TypeScript about a module's types without providing any implementation code. For virtual modules — which don't exist as files on disk — this is the *only* way TypeScript can know what an import contains. The declaration file acts as a contract: the plugin's `load` hook must produce code whose exports match the declared shape, but TypeScript trusts the declaration at compile time without verifying it. This technique is also called "ambient module declaration," and it's the same mechanism used by [`@types/*`](https://github.com/DefinitelyTyped/DefinitelyTyped) packages to type third-party JavaScript libraries.
 
 </TypeDeepDive>
 
@@ -327,7 +335,7 @@ Let's walk through each hook:
 
 **`resolveId`** intercepts the import `'eigen/routes'` and returns our internal ID (prefixed with `\0`). This tells Vite "I'll handle this module — don't look for it on disk."
 
-**`load`** generates the virtual module's source code. It checks `this.environment?.name` to determine whether it's generating for the client or server environment, and produces different code for each. The client version uses `React.lazy()` for code splitting; the server version uses static imports and includes the `loader` exports.
+**`load`** generates the virtual module's source code. It checks [`this.environment?.name`](https://vite.dev/guide/api-environment) to determine whether it's generating for the client or server environment, and produces different code for each. The client version uses [`React.lazy()`](https://react.dev/reference/react/lazy) for code splitting; the server version uses static imports and includes the `loader` exports.
 
 **`configureServer`** sets up a file watcher on the pages directory. When a file is added, deleted, or renamed, it regenerates the type declarations and invalidates the virtual module in Vite's module graph. The `server.ws.send({ type: 'full-reload' })` tells the browser to refresh, since the route table has changed structurally.
 
@@ -343,7 +351,7 @@ Add the generated declaration file to your app tsconfig so TypeScript picks up t
 }
 ```
 
-We write declarations to `node_modules/.eigen/` rather than a project-level directory for a reason: it's conventionally gitignored (via `node_modules/`), so generated files don't pollute version control. TanStack Router takes a different approach — its `routeTree.gen.ts` is a committed file — but the `.eigen` approach avoids merge conflicts and keeps the git history focused on human-authored code.
+We write declarations to `node_modules/.eigen/` rather than a project-level directory for a reason: it's conventionally gitignored (via `node_modules/`), so generated files don't pollute version control. [TanStack Router](https://tanstack.com/router) takes a different approach — its `routeTree.gen.ts` is a committed file — but the `.eigen` approach avoids merge conflicts and keeps the git history focused on human-authored code.
 
 Note that you need to run the dev server at least once (`npx vite`) for the declarations to be generated. The `configResolved` hook writes `node_modules/.eigen/eigen-routes.d.ts` on startup — until that file exists, TypeScript will report missing module errors.
 
@@ -369,7 +377,7 @@ export default defineConfig({
 })
 ```
 
-Update `src/main.tsx` to consume the generated routes with type-safe navigation. We're defining `Router` and `Link` inline here to keep things simple — in a real framework, these would live in the framework package (e.g., `packages/eigen/router.tsx`). We'll extract them in Part 11 once the framework plugin takes shape.
+Update `src/main.tsx` to consume the generated routes with type-safe navigation. We're defining `Router` and `Link` inline here to keep things simple — in a real framework, these would live in the framework package (e.g., `packages/eigen/router.tsx`). We'll extract them in [Part 11](/11-framework-plugin) once the framework plugin takes shape.
 
 ```tsx title="src/main.tsx"
 import React, { Suspense, useState, useEffect } from 'react'
@@ -489,7 +497,7 @@ The `Link` component is generic over `T extends RoutePaths`. When you write `<Li
 
 ## A type-safe page component
 
-This page won't fully work yet — we haven't introduced SSR or wired up loaders (that's Parts 3–5). But it shows what a type-safe page component looks like and how the types we've built connect:
+This page won't fully work yet — we haven't introduced SSR or wired up loaders (that's [Parts 3](/03-server-side-rendering)–[5](/05-typed-loaders)). But it shows what a type-safe page component looks like and how the types we've built connect:
 
 ```tsx title="src/pages/posts/[id].tsx"
 import type { PageProps } from 'eigen/types'
@@ -517,13 +525,13 @@ export default function PostPage({ params, data }: Props) {
 }
 ```
 
-The `PageProps<'/posts/:id', { title: string; body: string }>` type ties this component to its route. `RouteParams<'/posts/:id'>` expands to `{ id: string }`, giving `params` its shape. The second generic parameter types the `data` prop (which we'll connect to the loader's return type in Part 5).
+The `PageProps<'/posts/:id', { title: string; body: string }>` type ties this component to its route. `RouteParams<'/posts/:id'>` expands to `{ id: string }`, giving `params` its shape. The second generic parameter types the `data` prop (which we'll connect to the loader's return type in [Part 5](/05-typed-loaders)).
 
 ---
 
 ## What to observe
 
-1. **Install `vite-plugin-inspect`** and add it to your Vite config:
+1. **Install [`vite-plugin-inspect`](https://github.com/antfu-collective/vite-plugin-inspect)** and add it to your Vite config:
 
    ```bash
    pnpm i -D vite-plugin-inspect
@@ -560,7 +568,7 @@ The `PageProps<'/posts/:id', { title: string; body: string }>` type ties this co
 
 Type safety in a framework is a **code generation problem**. The plugin discovers routes at dev-server startup, generates JavaScript (the virtual module) for the runtime, and generates TypeScript declarations (the `.d.ts` file) for the type checker. These two outputs serve different consumers — the browser and the IDE — but are generated from the same source of truth: the filesystem.
 
-The plugin is the single source of truth. It writes two parallel representations of the same information: JavaScript for execution, TypeScript for verification. When the filesystem changes, both representations update. This is the architectural pattern that makes TanStack Router's type-safe routing possible, and it's the same pattern we'll use for loaders, API routes, and eventually server functions.
+The plugin is the single source of truth. It writes two parallel representations of the same information: JavaScript for execution, TypeScript for verification. When the filesystem changes, both representations update. This is the architectural pattern that makes [TanStack Router](https://tanstack.com/router)'s type-safe routing possible, and it's the same pattern we'll use for loaders, API routes, and eventually server functions.
 
 ---
 
@@ -616,6 +624,16 @@ Run with `npx vitest run plugins/` — since these are pure functions with no Vi
 
 </TestSection>
 
+## Further reading
+
+- [Vite Plugin API — Virtual Modules](https://vite.dev/guide/api-plugin#virtual-modules-convention) — Vite's official documentation on the `\0` prefix convention and the `resolveId`/`load` pattern for virtual modules.
+- [TanStack Router File-Based Routing](https://tanstack.com/router/latest/docs/framework/react/routing/file-based-routing) — How TanStack Router implements the same filesystem scan → code generation → type declaration pattern we built here.
+- [TypeScript Template Literal Types](https://www.typescriptlang.org/docs/handbook/2/template-literal-types.html) — The TypeScript handbook on template literal types and `infer`, which power the `RouteParams` type.
+- [TypeScript Declaration Files](https://www.typescriptlang.org/docs/handbook/declaration-files/introduction.html) — How `.d.ts` files and `declare module` work, which is the foundation of our generated type declarations.
+- [Next.js Pages Router](https://nextjs.org/docs/pages/building-your-application/routing) — The file-based routing convention that Eigen's `fileToRoute` function is modeled after.
+
+---
+
 ## What's next
 
-In Part 3, we'll add server-side rendering. This means introducing Vite's `ssrLoadModule` API, creating a custom dev server with Express, and understanding how the two module graphs (client and SSR) work in practice. The virtual module will start generating different code per environment.
+In [Part 3](/03-server-side-rendering), we'll add server-side rendering. This means introducing Vite's [`ssrLoadModule`](https://vite.dev/guide/api-javascript#vitedevserver-ssrloadmodule) API, creating a custom dev server with [H3](https://h3.dev), and understanding how the two module graphs (client and SSR) work in practice. The virtual module will start generating different code per environment.

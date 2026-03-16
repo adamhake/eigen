@@ -86,9 +86,9 @@ We'll end up with a project that has two distinct zones of TypeScript: **app cod
 
 A few of these settings deserve explanation:
 
-**`moduleResolution: "Bundler"`** — This tells TypeScript to use resolution rules that match what a bundler like Vite does. It supports `exports` fields in `package.json`, allows extensionless imports, and handles `import` conditions. Without this, TypeScript might resolve imports differently than Vite, causing phantom type errors or missing types.
+**[`moduleResolution: "Bundler"`](https://www.typescriptlang.org/tsconfig/#moduleResolution)** — This tells TypeScript to use resolution rules that match what a bundler like Vite does. It supports `exports` fields in `package.json`, allows extensionless imports, and handles `import` conditions. Without this, TypeScript might resolve imports differently than Vite, causing phantom type errors or missing types.
 
-**`isolatedModules: true`** — Vite transforms each file independently (via Oxc), without cross-file type information. This flag tells TypeScript to error on patterns that require cross-file analysis, like `const enum` or `export =`. It keeps your code compatible with Vite's transform model.
+**[`isolatedModules: true`](https://www.typescriptlang.org/tsconfig/#isolatedModules)** — Vite transforms each file independently (via [Oxc](https://oxc.rs)), without cross-file type information. This flag tells TypeScript to error on patterns that require cross-file analysis, like `const enum` or `export =`. It keeps your code compatible with Vite's transform model.
 
 **`noEmit: true`** — Vite handles compilation. TypeScript is only used for type-checking. The `tsc` command never writes output files.
 
@@ -206,13 +206,13 @@ This is minimal on purpose. Let's understand what's happening:
 
 **`defineConfig`** is a helper that provides type-safe autocomplete for the config object. It doesn't transform the config — it's a pass-through function with a typed signature. You could export a plain object instead, but you'd lose IDE support.
 
-**`react()`** is `@vitejs/plugin-react`, which returns an array of Vite plugins that handle React-specific concerns:
+**`react()`** is [`@vitejs/plugin-react`](https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react), which returns an array of Vite plugins that handle React-specific concerns:
 
 - **JSX transformation** — Compiles JSX/TSX to `React.createElement` calls (or the automatic runtime `jsx()` calls with `react-jsx`).
 - **Fast Refresh** — Injects HMR boundary code into every React component so that edits hot-reload without losing component state.
-- **Oxc-based transforms** — As of v6, `@vitejs/plugin-react` uses Oxc for React Refresh transforms, eliminating the Babel dependency. (Babel can still be opted into for features like `styled-components` or React Compiler.)
+- **Oxc-based transforms** — As of v6, `@vitejs/plugin-react` uses [Oxc](https://oxc.rs) for React Refresh transforms, eliminating the Babel dependency. (Babel can still be opted into for features like `styled-components` or React Compiler.)
 
-The `react()` plugin is separate from the framework plugin we'll build. This is by design — in the Vite ecosystem, the UI library plugin (React, Vue, Svelte) and the framework plugin (Next.js-like SSR, routing) are independent. TanStack Start's config has the same shape: `plugins: [tanstackStart(), react()]`.
+The `react()` plugin is separate from the framework plugin we'll build. This is by design — in the Vite ecosystem, the UI library plugin (React, Vue, Svelte) and the framework plugin (Next.js-like SSR, routing) are independent. [TanStack Start](https://tanstack.com/start)'s config has the same shape: `plugins: [tanstackStart(), react()]`.
 
 ---
 
@@ -240,7 +240,7 @@ This has several implications for framework development:
 
 **The HTML is the container.** During SSR, the framework's server will read this file, inject rendered markup into it, and serve the result. The `<!--ssr-outlet-->` marker we'll add later is how the framework knows where to insert rendered HTML.
 
-**`transformIndexHtml` is the injection point.** Vite's hook for modifying HTML is how the framework adds SSR content, serialized data (`<script>window.__EIGEN_DATA__ = ...</script>`), asset preload links, and other dynamic elements.
+**[`transformIndexHtml`](https://vite.dev/guide/api-plugin#transformindexhtml) is the injection point.** Vite's hook for modifying HTML is how the framework adds SSR content, serialized data (`<script>window.__EIGEN_DATA__ = ...</script>`), asset preload links, and other dynamic elements.
 
 **The `src` attribute uses an absolute path from the project root.** `/src/main.tsx` is resolved relative to the project root, not relative to the HTML file. Vite intercepts this path and serves the transformed module.
 
@@ -264,7 +264,7 @@ createRoot(root).render(<App />);
 ```
 
 
-The pages aren't wired up to routing yet — that's Part 2. For now, they're just files sitting in the `src/pages/` directory, waiting to be discovered by our route plugin.
+The pages aren't wired up to routing yet — that's [Part 2](/02-route-discovery-plugin). For now, they're just files sitting in the `src/pages/` directory, waiting to be discovered by our route plugin.
 
 ---
 
@@ -310,7 +310,7 @@ The reload is fast enough that it looks instant, but the distinction matters. He
 
 1. Vite's file watcher detected the save.
 2. Vite found the changed module in the module graph.
-3. Vite walked up the dependency tree looking for an **HMR boundary** — a module that has registered a `import.meta.hot.accept()` handler.
+3. Vite walked up the dependency tree looking for an **HMR boundary** — a module that has registered an [`import.meta.hot.accept()`](https://vite.dev/guide/api-hmr#hot-accept) handler.
 4. `@vitejs/plugin-react` injects HMR boundaries into modules that only export React components. `main.tsx` has side effects, so it doesn't qualify.
 5. With no boundary found, Vite fell back to a full page reload.
 
@@ -326,7 +326,7 @@ const x: number = "this is a string"  // Type error!
 
 Save the file. The browser still updates — Vite happily strips the types and serves the code. The type error only surfaces if you run `npx tsc --noEmit` separately, or if your editor's TypeScript language server shows it.
 
-This is by design. Vite uses Oxc for TypeScript transformation, and Oxc strips types without checking them. Type checking is a separate, parallel concern. This separation keeps the dev server fast — Oxc transforms TypeScript orders of magnitude faster than `tsc` because it doesn't do type analysis.
+This is by design. Vite uses [Oxc](https://oxc.rs) for TypeScript transformation, and Oxc strips types without checking them. Type checking is a separate, parallel concern. This separation keeps the dev server fast — Oxc transforms TypeScript orders of magnitude faster than `tsc` because it doesn't do type analysis.
 
 For a framework author, this means you can't rely on Vite to catch type errors in generated code. If your plugin generates a virtual module with a type error, Vite won't tell you. The `.d.ts` declaration files you generate are for the developer's IDE, not for Vite itself.
 
@@ -340,6 +340,16 @@ The dev server's on-demand architecture means startup is instant, but also means
 
 ---
 
+## Further reading
+
+- [Vite Getting Started](https://vite.dev/guide/) — The official guide covers project setup, config, and the dev server in more detail.
+- [Dependency Pre-Bundling](https://vite.dev/guide/dep-pre-bundling) — Why Vite pre-bundles dependencies, how the cache works, and how to troubleshoot when things go wrong.
+- [Vite HMR API](https://vite.dev/guide/api-hmr) — The full reference for `import.meta.hot`, including `accept`, `dispose`, `prune`, and `invalidate`.
+- [TypeScript `moduleResolution` options](https://www.typescriptlang.org/docs/handbook/modules/theory.html#module-resolution) — The TypeScript handbook explains why `"Bundler"` resolution exists and how it differs from `"Node"` and `"NodeNext"`.
+- [Biome Configuration](https://biomejs.dev/reference/configuration/) — Full reference for `biome.json` options, lint rules, and formatter settings.
+
+---
+
 ## What's next
 
-In Part 2, we'll write our first Vite plugin — a file-based route discovery system that scans `src/pages/`, generates a virtual module with the route table, and generates TypeScript declarations so the router has type-safe paths and params. This is where the framework starts to take shape.
+In [Part 2](/02-route-discovery-plugin), we'll write our first Vite plugin — a file-based route discovery system that scans `src/pages/`, generates a virtual module with the route table, and generates TypeScript declarations so the router has type-safe paths and params. This is where the framework starts to take shape.

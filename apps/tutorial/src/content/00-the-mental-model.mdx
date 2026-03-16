@@ -4,7 +4,7 @@ description: "Vite's internals and the architecture decisions behind modern Reac
 ---
 
 
-*This is the first installment in a series where we build a toy version of Next.js on top of Vite. The goal isn't to create a production framework — it's to deeply understand Vite's internals and the architecture decisions that underpin modern React meta-frameworks like Next.js, TanStack Start, and Remix.*
+*This is the first installment in a series where we build a toy version of Next.js on top of Vite. The goal isn't to create a production framework — it's to deeply understand Vite's internals and the architecture decisions that underpin modern React meta-frameworks like [Next.js](https://nextjs.org), [TanStack Start](https://tanstack.com/start), and [Remix](https://remix.run).*
 
 ---
 
@@ -34,7 +34,7 @@ Vite isn't one tool — it's two tools that share a configuration surface.
 
 This is fundamentally different from webpack, which eagerly bundles your entire app before serving anything. Vite's approach means startup is near-instant regardless of project size — it only does work proportional to the page you're looking at, not the entire application.
 
-**In production**, Vite is a pre-configured Rolldown build. Rolldown is a Rust-based bundler (Rollup-compatible) that bundles everything into optimized chunks with tree-shaking, code-splitting, and minification. The dev server doesn't exist. Rolldown takes over entirely, and the output is a set of static files (JavaScript bundles, CSS, assets) ready to be served by any HTTP server.
+**In production**, Vite is a pre-configured [Rolldown](https://rolldown.rs) build. Rolldown is a Rust-based bundler ([Rollup](https://rollupjs.org)-compatible) that bundles everything into optimized chunks with tree-shaking, code-splitting, and minification. The dev server doesn't exist. Rolldown takes over entirely, and the output is a set of static files (JavaScript bundles, CSS, assets) ready to be served by any HTTP server.
 
 This duality is the central tension of framework development with Vite. Your framework plugin has to work in both modes, and behavior that works in dev (lazy, on-demand transformation) may need completely different handling in production (eager, ahead-of-time bundling). A virtual module that dynamically discovers routes by scanning the filesystem works identically in both modes — but a dev server middleware that handles API routes has no production equivalent at all. The framework has to bridge that gap.
 
@@ -53,7 +53,7 @@ Vite reads `vite.config.ts` and resolves the full configuration, merging user co
 <Step>
 ### Server startup
 
-Vite starts an HTTP server (using Node's `http` module and the `connect` middleware framework) and a WebSocket server (for HMR communication with the browser). Each plugin's `configureServer()` hook runs, giving plugins a chance to add custom middleware.
+Vite starts an HTTP server (using Node's [`http`](https://nodejs.org/api/http.html) module and the [`connect`](https://github.com/senchalabs/connect) middleware framework) and a WebSocket server (for HMR communication with the browser). Each plugin's `configureServer()` hook runs, giving plugins a chance to add custom middleware.
 </Step>
 <Step>
 ### Dependency pre-bundling
@@ -85,7 +85,7 @@ This lazy, pull-based architecture is why Vite feels instant in development. It 
 
 ## The plugin pipeline in depth
 
-Vite's plugin system is based on the Rollup plugin interface, extended with a handful of Vite-specific hooks. This is a deliberate design choice — it means the large ecosystem of Rollup-compatible plugins works in Vite out of the box, and plugin authors only need to learn one API. (Vite 8's bundler, Rolldown, implements the same plugin interface.)
+Vite's plugin system is based on the [Rollup plugin interface](https://rollupjs.org/plugin-development/), extended with a handful of [Vite-specific hooks](https://vite.dev/guide/api-plugin#vite-specific-hooks). This is a deliberate design choice — it means the large ecosystem of Rollup-compatible plugins works in Vite out of the box, and plugin authors only need to learn one API. (Vite 8's bundler, Rolldown, implements the same plugin interface.)
 
 ### The three core hooks
 
@@ -167,7 +167,7 @@ This is a common source of confusion. Some hooks run in both dev and build. Othe
 
 The key insight: `resolveId`, `load`, and `transform` work identically in both modes. This is why your virtual module generates the same route table whether Vite is serving it on-demand to a browser or bundling it with Rolldown. The plugin code doesn't need to know which mode it's running in (though it can check `config.command === 'serve'` or `config.command === 'build'` if needed).
 
-The hooks that only run in build — `renderChunk`, `generateBundle`, `writeBundle` — are output generation hooks. We'll use `closeBundle` for SSG (pre-rendering pages after the build is complete) and `generateBundle` for emitting additional assets.
+The hooks that only run in build — `renderChunk`, `generateBundle`, `writeBundle` — are output generation hooks. We'll use `closeBundle` for SSG (pre-rendering pages after the build is complete in [Part 16](/16-static-site-generation)) and `generateBundle` for emitting additional assets.
 
 ---
 
@@ -199,7 +199,7 @@ The `\0` prefix on the *resolved* ID is a Rollup/Rolldown convention. It signals
 
 ### Friendly imports vs. `virtual:` prefix
 
-Many Vite plugins use a `virtual:` prefix for virtual modules (`virtual:my-plugin/config`). This is a community convention that makes it obvious the import doesn't point to a real file. But production frameworks like Next.js, TanStack Start, and Remix don't use this convention — they use normal-looking package imports: `next/navigation`, `@tanstack/react-start`, `react-router`.
+Many Vite plugins use a `virtual:` prefix for virtual modules (`virtual:my-plugin/config`). This is a community convention that makes it obvious the import doesn't point to a real file. But production frameworks like [Next.js](https://nextjs.org), [TanStack Start](https://tanstack.com/start), and [Remix](https://remix.run) don't use this convention — they use normal-looking package imports: `next/navigation`, `@tanstack/react-start`, `react-router`.
 
 They achieve this through the same `resolveId` hook. When you write `import { Link } from 'eigen/navigation'`, the plugin intercepts it and resolves it to generated or internal code. The npm package ships a real `navigation.js` file (for TypeScript resolution and as a fallback), but the plugin replaces it at build time.
 
@@ -216,7 +216,7 @@ Virtual modules are the primary mechanism frameworks use to bridge **build-time 
 
 The plugin encodes this knowledge into generated JavaScript that your app imports like any other module. From the browser's perspective, a virtual module is indistinguishable from a real file.
 
-This is fundamentally different from webpack's loader model or `require.context`. There's no special syntax, no magic comments, no custom module resolution rules. It's just ESM imports resolved to generated code. This means virtual modules compose naturally with TypeScript, with tree-shaking, with code splitting — everything that works with normal imports works with virtual modules.
+This is fundamentally different from [webpack](https://webpack.js.org)'s loader model or `require.context`. There's no special syntax, no magic comments, no custom module resolution rules. It's just ESM imports resolved to generated code. This means virtual modules compose naturally with TypeScript, with tree-shaking, with code splitting — everything that works with normal imports works with virtual modules.
 
 ### Virtual modules and TypeScript
 
@@ -227,7 +227,7 @@ Framework authors solve this by **generating `.d.ts` declaration files** alongsi
 1. **JavaScript** (the virtual module's `load` hook output) — consumed by the browser and the SSR runtime
 2. **TypeScript declarations** (a `.d.ts` file written to disk) — consumed by the IDE and type checker
 
-Both are generated from the same source of truth: the filesystem scan, the resolved config, the discovered routes. We'll implement this pattern in Part 2.
+Both are generated from the same source of truth: the filesystem scan, the resolved config, the discovered routes. We'll implement this pattern in [Part 2](/02-route-discovery-plugin).
 
 ---
 
@@ -247,13 +247,13 @@ This "same plugin, different output" pattern is central to everything we'll buil
 
 Until Vite 5, these two environments were implicit. The `ssr` boolean was threaded through various hook parameters, and plugins had to check it manually — often with awkward patterns like checking `options?.ssr` or `this.environment?.name === 'ssr'`.
 
-Vite 6 formalized the concept with the **Environment API**. Environments are now first-class configuration objects. The default setup creates two — `client` and `ssr` — but framework authors can define additional environments. An `edge` environment targeting Cloudflare Workers, for instance, or an `rsc` environment for React Server Components. Each environment has its own module graph, resolve conditions, and build configuration.
+Vite 6 formalized the concept with the [**Environment API**](https://vite.dev/guide/api-environment). Environments are now first-class configuration objects. The default setup creates two — `client` and `ssr` — but framework authors can define additional environments. An `edge` environment targeting Cloudflare Workers, for instance, or an `rsc` environment for React Server Components. Each environment has its own module graph, resolve conditions, and build configuration.
 
 Inside plugin hooks, `this.environment` gives you the current environment instance. The `applyToEnvironment(environment)` hook lets a plugin declare which environments it should be active in — so a plugin that strips loader exports can run only in the `client` environment.
 
 During production builds, the `buildApp` hook lets a framework orchestrate building all environments in a coordinated sequence. This replaced the old pattern of running `vite build` and `vite build --ssr` as two separate commands.
 
-This is exactly what happened when TanStack Start migrated from Vinxi to native Vite at version 1.121.0. Vinxi's "router" concept — which managed multiple Vite instances for client, server, and API environments — was replaced by Vite's built-in environment support. The config file moved from `app.config.ts` to a standard `vite.config.ts`, and `vinxi build` became `vite build`. The abstraction layer Vinxi provided was absorbed into Vite itself.
+This is exactly what happened when [TanStack Start](https://tanstack.com/start) migrated from [Vinxi](https://vinxi.vercel.app) to native Vite at version 1.121.0. Vinxi's "router" concept — which managed multiple Vite instances for client, server, and API environments — was replaced by Vite's built-in environment support. The config file moved from `app.config.ts` to a standard `vite.config.ts`, and `vinxi build` became `vite build`. The abstraction layer Vinxi provided was absorbed into Vite itself.
 
 For this tutorial, we'll use the two default environments. But the mental model matters: **your plugin is one piece of code generating different outputs for different target runtimes.** The Environment API makes this explicit rather than ad hoc.
 
@@ -319,10 +319,20 @@ export default defineConfig({
 })
 ```
 
-Compare this to TanStack Start's `tanstackStart()` or Remix's `remix()` — the shape is identical. A single function call that returns an array of coordinated plugins. The framework hides the complexity.
+Compare this to [TanStack Start](https://tanstack.com/start)'s `tanstackStart()` or [Remix](https://remix.run)'s `remix()` — the shape is identical. A single function call that returns an array of coordinated plugins. The framework hides the complexity.
+
+---
+
+## Further reading
+
+- [Vite Plugin API](https://vite.dev/guide/api-plugin) — The full reference for all plugin hooks, including ordering, enforcement, and the difference between Rollup-compatible and Vite-specific hooks.
+- [Rolldown Documentation](https://rolldown.rs/guide/introduction) — Rolldown is the Rust-based bundler powering Vite 8. Understanding the Rollup/Rolldown plugin model helps when reading Vite plugin source code.
+- [Vite Environment API](https://vite.dev/guide/api-environment) — The official guide to environments, `this.environment`, `applyToEnvironment`, and `buildApp`.
+- [Vite SSR Guide](https://vite.dev/guide/ssr) — Vite's official walkthrough of server-side rendering, middleware mode, and `ssrLoadModule`.
+- [Why Vite](https://vite.dev/guide/why) — Vite's own explanation of the problems it solves and the design decisions behind its architecture.
 
 ---
 
 ## What's next
 
-In Part 1, we'll set up the project — TypeScript configuration, Vite config, and a bare SPA — and observe how the dev server handles module requests. We'll explore the network waterfall, dependency pre-bundling, and HMR to build intuition for what Vite does before we start extending it.
+In [Part 1](/01-bare-vite-spa), we'll set up the project — TypeScript configuration, Vite config, and a bare SPA — and observe how the dev server handles module requests. We'll explore the network waterfall, dependency pre-bundling, and HMR to build intuition for what Vite does before we start extending it.
