@@ -17,12 +17,12 @@ concepts:
 
 Everything we've built so far runs on the Vite dev server — the on-demand module transformer from Part 0. In development, the browser requests modules individually, and Vite transforms each one on the fly. This is great for DX (instant startup, fast HMR) but terrible for production: hundreds of individual HTTP requests, untransformed source files, no minification, no tree-shaking.
 
-In production, Vite switches to a completely different mode: **Rolldown bundling**. Rolldown is a Rust-based bundler (Rollup-compatible) that processes the *entire* module graph eagerly and produces optimized output:
+In production, Vite switches to a completely different mode: **[Rolldown](https://rolldown.rs) bundling**. Rolldown is a Rust-based bundler ([Rollup](https://rollupjs.org)-compatible) that processes the *entire* module graph eagerly and produces optimized output:
 
 - **Bundling**: Hundreds of source modules are combined into a handful of chunks, eliminating the HTTP request waterfall.
 - **Tree-shaking**: Rolldown analyzes `import`/`export` relationships and removes unused code. If a module exports 10 functions but only 3 are imported, the other 7 are eliminated from the output.
 - **Scope hoisting**: Instead of wrapping each module in a function (like webpack), Rolldown concatenates modules into a single scope, reducing overhead and enabling better minification.
-- **Code splitting**: Dynamic `import()` statements (like our `React.lazy(() => import('./Page'))`) create separate chunks that load on demand.
+- **Code splitting**: Dynamic `import()` statements (like our [`React.lazy`](https://react.dev/reference/react/lazy)`(() => import('./Page'))`) create separate chunks that load on demand.
 - **Minification**: Variable names are shortened, whitespace is removed, and dead code is eliminated.
 - **Hashed filenames**: Output files get content-based hashes (`entry-client-a1b2c3d4.js`), enabling indefinite browser caching — when code changes, the hash changes, and the browser fetches the new version.
 
@@ -37,19 +37,19 @@ For a server-rendered framework, we need **two** Rolldown builds — one for the
 ## Configuring the builds
 
 ```typescript title="vite.config.ts"
-import { defineConfig } from 'vite'
-import react from '@vitejs/plugin-react'
-import eigenRoutes from './plugins/eigen-routes'
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import eigenRoutes from "./plugins/eigen-routes";
 
 export default defineConfig({
-  plugins: [react(), eigenRoutes()],
-  build: {
-    manifest: true,
-    rolldownOptions: {
-      input: 'src/entry-client.tsx',
-    },
-  },
-})
+	plugins: [react(), eigenRoutes()],
+	build: {
+		manifest: true,
+		rolldownOptions: {
+			input: "src/entry-client.tsx",
+		},
+	},
+});
 ```
 
 **`manifest: true`** tells Vite to generate a `.vite/manifest.json` file alongside the build output. This file maps source file paths to their built equivalents:
@@ -130,72 +130,80 @@ The content hashes in filenames (`a1b2c3d4`) mean the browser can cache these fi
 ## The production server
 
 ```typescript title="server.prod.ts"
-import express from 'express'
-import { readFileSync } from 'fs'
+import { readFileSync } from "node:fs";
+import { H3, serve } from "h3/node";
+import { serveStatic } from "h3";
 
-const app = express()
-
-// Serve hashed static assets with aggressive caching
-app.use(
-  '/assets',
-  express.static('dist/client/assets', {
-    maxAge: '1y',         // Cache for a year — hashes handle busting
-    immutable: true,       // Tell the browser this will never change
-  }),
-)
-
-// Serve other static files (favicon, etc.) without aggressive caching
-app.use(express.static('dist/client', { index: false }))
+const app = new H3();
 
 // Read the built HTML template
-const template = readFileSync('dist/client/index.html', 'utf-8')
+const template = readFileSync("dist/client/index.html", "utf-8");
 
 // Read the manifest
 const manifest: Record<string, { file: string; css?: string[] }> = JSON.parse(
-  readFileSync('dist/client/.vite/manifest.json', 'utf-8'),
-)
+	readFileSync("dist/client/.vite/manifest.json", "utf-8"),
+);
 
 // Import the server build
-const { render } = await import('./dist/server/entry-server.js') as {
-  render: (pathname: string) => Promise<{
-    html: string
-    status: number
-    data: unknown
-  }>
-}
+const { render } = (await import("./dist/server/entry-server.js")) as {
+	render: (
+		pathname: string,
+	) => Promise<{
+		html: string;
+		status: number;
+		data: unknown;
+	}>;
+};
 
-app.get('*', async (req, res) => {
-  try {
-    const { html: appHtml, status, data } = await render(req.originalUrl)
+// Serve hashed static assets with aggressive caching
+app.use(
+	"/assets/**",
+	serveStatic({
+		dir: "dist/client/assets",
+		maxAge: 60 * 60 * 24 * 365, // 1 year — hashes handle busting
+	}),
+);
 
-    // Inject preload hints for the entry chunk and its CSS
-    const entry = manifest['src/entry-client.tsx']
-    const preloadLinks = [
-      `<link rel="modulepreload" href="/${entry.file}" />`,
-      ...(entry.css?.map(css => `<link rel="stylesheet" href="/${css}" />`) ?? []),
-    ].join('\n    ')
+// Handle all routes with SSR
+app.all("/**", async (event) => {
+	try {
+		const url = event.url.pathname;
+		const { html: appHtml, status, data } = await render(url);
 
-    const finalHtml = template
-      .replace('<!--ssr-outlet-->', appHtml)
-      .replace(
-        '</head>',
-        `    ${preloadLinks}\n    <script>window.__EIGEN_DATA__ = ${JSON.stringify(data)}</script>\n  </head>`,
-      )
+		// Inject preload hints for the entry chunk and its CSS
+		const entry = manifest["src/entry-client.tsx"];
+		const preloadLinks = [
+			`<link rel="modulepreload" href="/${entry.file}" />`,
+			...(entry.css?.map(
+				(css) => `<link rel="stylesheet" href="/${css}" />`,
+			) ?? []),
+		].join("\n    ");
 
-    res.status(status).set({ 'Content-Type': 'text/html' }).end(finalHtml)
-  } catch (e) {
-    console.error(e)
-    res.status(500).end('Internal server error')
-  }
-})
+		const finalHtml = template
+			.replace("<!--ssr-outlet-->", appHtml)
+			.replace(
+				"</head>",
+				`    ${preloadLinks}\n    <script>window.__EIGEN_DATA__ = ${JSON.stringify(data)}</script>\n  </head>`,
+			);
 
-app.listen(3000, () => console.log('Production server: http://localhost:3000'))
+		return new Response(finalHtml, {
+			status,
+			headers: { "Content-Type": "text/html" },
+		});
+	} catch (e) {
+		console.error(e);
+		return new Response("Internal server error", { status: 500 });
+	}
+});
+
+serve(app, { port: 3000 });
+console.log("Production server: http://localhost:3000");
 ```
 
 Notice what changed from the dev server:
 
 - **No Vite instance.** The dev server created Vite with `createServer()` and used it as middleware. The production server doesn't need Vite at all.
-- **Static file serving replaces Vite's middleware.** Express serves pre-built files from `dist/client/`.
+- **Static file serving replaces Vite's middleware.** H3 serves pre-built files from `dist/client/`.
 - **No `transformIndexHtml`.** The HTML was already processed during the build. Asset URLs are already rewritten.
 - **`import()` instead of `ssrLoadModule`.** The server entry is a pre-built Node module, not a source file that needs on-demand transformation.
 - **Manifest-driven asset injection.** The server reads the manifest to know which script and stylesheet URLs to inject into the HTML.
@@ -249,7 +257,17 @@ The client directory is entirely static — it could be deployed to a CDN. The s
 
 The production build is where "two module graphs" becomes "two output directories." The manifest file is the bridge between them. Every SSR framework has this pattern: build client, build server, use the manifest to connect them at runtime.
 
-In a later installment, we'll see how `buildApp` — the Vite 7+ hook for build orchestration — lets the framework coordinate both builds in a single `vite build` command.
+In [Part 11](/11-framework-plugin), we'll see how [`buildApp`](https://vite.dev/guide/api-plugin#buildapp) — the Vite 7+ hook for build orchestration — lets the framework coordinate both builds in a single `vite build` command.
+
+---
+
+## Further reading
+
+- [Vite Build Guide](https://vite.dev/guide/build) — The official guide to production builds, including Rolldown bundling, code splitting, and asset handling.
+- [Vite SSR Build](https://vite.dev/guide/ssr#building-for-production) — How to configure client and server builds for SSR applications.
+- [Rolldown Documentation](https://rolldown.rs/guide/introduction) — The Rust-based bundler powering Vite's production builds, with Rollup-compatible plugin support.
+- [H3 Documentation](https://h3.dev/guide) — H3's guide for building production servers with web-standard APIs.
+- [Vite Manifest](https://vite.dev/guide/backend-integration#backend-integration) — How the manifest file maps source modules to hashed production assets.
 
 ---
 

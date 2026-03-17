@@ -21,7 +21,7 @@ When you save a file, the update reaches the browser in milliseconds. Here's the
 <Step>
 ### File change detection
 
-Vite uses chokidar (a file system watcher) to monitor source files. When a file is saved, chokidar fires an event.
+Vite uses [chokidar](https://github.com/paulmillr/chokidar) (a file system watcher) to monitor source files. When a file is saved, chokidar fires an event.
 </Step>
 <Step>
 ### Module graph lookup
@@ -31,9 +31,9 @@ Vite finds the changed file in its module graph — an in-memory data structure 
 <Step>
 ### HMR boundary search
 
-Vite walks *up* the dependency tree (from the changed module toward the root) looking for an **HMR boundary** — a module that has registered an `import.meta.hot.accept()` handler. This handler says "I know how to update myself when my dependencies change."
+Vite walks *up* the dependency tree (from the changed module toward the root) looking for an **HMR boundary** — a module that has registered an [`import.meta.hot`](https://vite.dev/guide/api-hmr)`.accept()` handler. This handler says "I know how to update myself when my dependencies change."
 
-`@vitejs/plugin-react` injects HMR boundary code into every React component via its `transform` hook (using Oxc for the Fast Refresh transform). This is why React components hot-reload by default — each component is a boundary.
+[`@vitejs/plugin-react`](https://github.com/vitejs/vite-plugin-react) injects HMR boundary code into every React component via its `transform` hook (using [Oxc](https://oxc.rs) for the [React Fast Refresh](https://github.com/facebook/react/tree/main/packages/react-refresh) transform). This is why React components hot-reload by default — each component is a boundary.
 </Step>
 <Step>
 ### WebSocket update
@@ -57,24 +57,24 @@ Vite's module graph is the central data structure of the dev server. You can ins
 
 ```typescript
 configureServer(server) {
-  server.httpServer?.on('listening', () => {
-    // Wait a moment for the initial module graph to populate
-    setTimeout(() => {
-      const graph = server.moduleGraph
+	server.httpServer?.on("listening", () => {
+		// Wait a moment for the initial module graph to populate
+		setTimeout(() => {
+			const graph = server.moduleGraph;
 
-      // The graph maps module IDs to ModuleNode objects
-      for (const [id, mod] of graph.idToModuleMap) {
-        const importedBy = [...(mod.importers || [])]
-          .map(m => m.id)
-          .filter(Boolean)
+			// The graph maps module IDs to ModuleNode objects
+			for (const [id, mod] of graph.idToModuleMap) {
+				const importedBy = [...(mod.importers || [])]
+					.map((m) => m.id)
+					.filter(Boolean);
 
-        if (importedBy.length > 0) {
-          console.log(`${id}`)
-          console.log(`  ← imported by: ${importedBy.join(', ')}`)
-        }
-      }
-    }, 3000)
-  })
+				if (importedBy.length > 0) {
+					console.log(`${id}`);
+					console.log(`  ← imported by: ${importedBy.join(", ")}`);
+				}
+			}
+		}, 3000);
+	});
 }
 ```
 
@@ -89,7 +89,7 @@ The graph is populated lazily during development. A module only appears in the g
 
 ---
 
-## `handleHotUpdate` — Custom HMR behavior
+## [`handleHotUpdate`](https://vite.dev/guide/api-plugin#handlehotupdate) — Custom HMR behavior
 
 The `handleHotUpdate` hook lets a plugin customize what happens when a file changes. For our route plugin, we need special handling:
 
@@ -98,25 +98,25 @@ The `handleHotUpdate` hook lets a plugin customize what happens when a file chan
 
 ```typescript title="plugins/eigen-routes.ts"
 handleHotUpdate({ file, server }) {
-  if (!file.includes('/pages/') || !file.endsWith('.tsx')) return
+	if (!file.includes("/pages/") || !file.endsWith(".tsx")) return;
 
-  // Regenerate type declarations
-  const routes = discoverRoutes(pagesDir)
-  generateRouteDeclarations(routes, resolve(root, 'node_modules/.eigen'))
+	// Regenerate type declarations
+	const routes = discoverRoutes(pagesDir);
+	generateRouteDeclarations(routes, resolve(root, "node_modules/.eigen"));
 
-  // Invalidate the virtual route module
-  const routeModule = server.moduleGraph.getModuleById(
-    resolvedVirtualModuleId,
-  )
-  if (routeModule) {
-    server.moduleGraph.invalidateModule(routeModule)
+	// Invalidate the virtual route module
+	const routeModule = server.moduleGraph.getModuleById(
+		resolvedVirtualModuleId,
+	);
+	if (routeModule) {
+		server.moduleGraph.invalidateModule(routeModule);
 
-    // For structural changes (new/deleted routes), do a full reload.
-    // For content changes, let React HMR handle it.
-    // We can detect structural changes by comparing route lists,
-    // but for simplicity, always reload when the virtual module changes.
-    return []  // Empty array = "we handled it, don't do default HMR"
-  }
+		// For structural changes (new/deleted routes), do a full reload.
+		// For content changes, let React HMR handle it.
+		// We can detect structural changes by comparing route lists,
+		// but for simplicity, always reload when the virtual module changes.
+		return []; // Empty array = "we handled it, don't do default HMR"
+	}
 }
 ```
 
@@ -155,31 +155,31 @@ flowchart TD
     G --> I["App renders with new\nroute available"]
 ```
 
-This creates a feedback loop: the developer adds a file, and within seconds, the IDE offers autocomplete for the new route's path and params. This is the same cycle that TanStack Router's `@tanstack/router-plugin/vite` implements when it watches the filesystem and regenerates `routeTree.gen.ts`.
+This creates a feedback loop: the developer adds a file, and within seconds, the IDE offers autocomplete for the new route's path and params. This is the same cycle that [TanStack Router](https://tanstack.com/router)'s `@tanstack/router-plugin/vite` implements when it watches the filesystem and regenerates `routeTree.gen.ts`.
 
 ### Debouncing
 
 In practice, file watcher events can fire rapidly (a single save might trigger multiple events, or the developer might be renaming a file which fires a delete + create). Production frameworks debounce the regeneration:
 
 ```typescript
-let regenerateTimeout: NodeJS.Timeout | null = null
+let regenerateTimeout: NodeJS.Timeout | null = null;
 
-server.watcher.on('all', (event, filePath) => {
-  if (!filePath.startsWith(pagesDir) || !filePath.endsWith('.tsx')) return
+server.watcher.on("all", (event, filePath) => {
+	if (!filePath.startsWith(pagesDir) || !filePath.endsWith(".tsx")) return;
 
-  // Debounce: wait 100ms for additional changes before regenerating
-  if (regenerateTimeout) clearTimeout(regenerateTimeout)
-  regenerateTimeout = setTimeout(() => {
-    const routes = discoverRoutes(pagesDir)
-    generateRouteDeclarations(routes, resolve(root, 'node_modules/.eigen'))
+	// Debounce: wait 100ms for additional changes before regenerating
+	if (regenerateTimeout) clearTimeout(regenerateTimeout);
+	regenerateTimeout = setTimeout(() => {
+		const routes = discoverRoutes(pagesDir);
+		generateRouteDeclarations(routes, resolve(root, "node_modules/.eigen"));
 
-    const mod = server.moduleGraph.getModuleById(resolvedVirtualModuleId)
-    if (mod) {
-      server.moduleGraph.invalidateModule(mod)
-      server.ws.send({ type: 'full-reload' })
-    }
-  }, 100)
-})
+		const mod = server.moduleGraph.getModuleById(resolvedVirtualModuleId);
+		if (mod) {
+			server.moduleGraph.invalidateModule(mod);
+			server.ws.send({ type: "full-reload" });
+		}
+	}, 100);
+});
 ```
 
 ---
@@ -193,13 +193,13 @@ An HMR boundary is any module that calls `import.meta.hot.accept()`. This tells 
 ```typescript
 // What @vitejs/plugin-react injects at the end of every component file:
 if (import.meta.hot) {
-  import.meta.hot.accept()
+	import.meta.hot.accept();
 
-  // React Fast Refresh integration:
-  // 1. Registers the component with React's refresh runtime
-  // 2. On hot update, swaps the component's implementation
-  //    without unmounting/remounting (preserving state)
-  RefreshRuntime.register(Home, 'Home')
+	// React Fast Refresh integration:
+	// 1. Registers the component with React's refresh runtime
+	// 2. On hot update, swaps the component's implementation
+	//    without unmounting/remounting (preserving state)
+	RefreshRuntime.register(Home, "Home");
 }
 ```
 
@@ -242,6 +242,16 @@ This is why our `handleHotUpdate` returns an empty array (suppressing default HM
 HMR is the module graph plus the WebSocket. The module graph tracks dependencies. The WebSocket delivers updates. HMR boundaries define where updates stop propagating. Framework plugins use `handleHotUpdate` to customize this behavior for framework-specific concerns — like regenerating route manifests and type declarations.
 
 For a typed framework, HMR has a second dimension: declaration file regeneration. The runtime module graph and the TypeScript declaration graph are parallel structures maintained by the plugin. When the filesystem changes, both update. The module graph update is instant (invalidation). The declaration update requires a file write, which triggers the TypeScript language server to re-check and update autocomplete. This dual update loop is what gives typed frameworks their tight developer feedback cycle.
+
+---
+
+## Further reading
+
+- [Vite HMR API](https://vite.dev/guide/api-hmr) — The full reference for `import.meta.hot`, including `accept`, `dispose`, `invalidate`, and `prune`.
+- [Vite Plugin API: `handleHotUpdate`](https://vite.dev/guide/api-plugin#handlehotupdate) — How plugins customize HMR behavior for framework-specific file changes.
+- [React Fast Refresh](https://github.com/facebook/react/tree/main/packages/react-refresh) — React's hot reloading runtime that preserves component state across edits.
+- [chokidar](https://github.com/paulmillr/chokidar) — The file system watcher library that Vite uses for change detection.
+- [`@vitejs/plugin-react`](https://github.com/vitejs/vite-plugin-react) — The official React plugin for Vite, which injects HMR boundary code via the transform hook.
 
 ---
 

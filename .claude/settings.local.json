@@ -1,9 +1,5 @@
 {
   "permissions": {
-    "allow": [
-      "WebFetch(domain:vite.dev)",
-      "WebFetch(domain:h3.unjs.io)",
-      "Bash(ls:*)"
-    ]
+    "allow": ["WebFetch(domain:vite.dev)", "WebFetch(domain:h3.unjs.io)", "Bash(ls:*)", "Bash(cd:*)"]
   }
 }

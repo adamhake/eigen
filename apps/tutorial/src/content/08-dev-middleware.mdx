@@ -12,7 +12,7 @@ concepts:
 
 ---
 
-## What `configureServer` does
+## What [`configureServer`](https://vite.dev/guide/api-plugin#configureserver) does
 
 `configureServer` gives your plugin access to the Vite dev server instance. Through it, you can add custom HTTP middleware — handlers that run for incoming requests before or after Vite's built-in middleware.
 
@@ -26,17 +26,17 @@ The ordering of middleware matters. `configureServer` supports two patterns:
 
 ```typescript
 configureServer(server) {
-  // Pattern 1: Direct addition — runs BEFORE Vite's middleware
-  server.middlewares.use((req, res, next) => {
-    // This runs before Vite handles static files, HMR, etc.
-  })
+	// Pattern 1: Direct addition — runs BEFORE Vite's middleware
+	server.middlewares.use((req, res, next) => {
+		// This runs before Vite handles static files, HMR, etc.
+	});
 
-  // Pattern 2: Return a function — runs AFTER Vite's middleware
-  return () => {
-    server.middlewares.use((req, res, next) => {
-      // This runs after Vite handles static files, HMR, etc.
-    })
-  }
+	// Pattern 2: Return a function — runs AFTER Vite's middleware
+	return () => {
+		server.middlewares.use((req, res, next) => {
+			// This runs after Vite handles static files, HMR, etc.
+		});
+	};
 }
 ```
 
@@ -75,16 +75,16 @@ If you use pre-middleware, you'd need to manually check every URL and `next()` p
 ```typescript title="packages/eigen/api-types.ts"
 /** Context passed to an API route handler */
 export interface ApiContext {
-  params: Record<string, string>
-  query: Record<string, string>
+	params: Record<string, string>;
+	query: Record<string, string>;
 }
 
 /** An API route handler — generic over the response type */
 export type ApiHandler<TResponse = unknown> = (
-  ctx: ApiContext,
-  req: import('http').IncomingMessage,
-  res: import('http').ServerResponse,
-) => Promise<TResponse> | TResponse
+	ctx: ApiContext,
+	req: import("http").IncomingMessage,
+	res: import("http").ServerResponse,
+) => Promise<TResponse> | TResponse;
 ```
 
 The `ApiHandler` type is generic over the response type. This doesn't enforce the response type at runtime (the handler could return anything), but it gives the developer autocomplete and type checking when writing the handler. The `req` and `res` parameters are the raw Node HTTP objects — a production framework would typically wrap these in a more ergonomic API.
@@ -92,88 +92,88 @@ The `ApiHandler` type is generic over the response type. This doesn't enforce th
 ### The plugin
 
 ```typescript title="plugins/eigen-api.ts"
-import type { Plugin, ViteDevServer } from 'vite'
+import type { Plugin, ViteDevServer } from "vite";
 
 export default function eigenApi(): Plugin {
-  let viteServer: ViteDevServer
+	let viteServer: ViteDevServer;
 
-  return {
-    name: 'eigen-api',
+	return {
+		name: "eigen-api",
 
-    configureServer(server) {
-      viteServer = server
+		configureServer(server) {
+			viteServer = server;
 
-      // Post-middleware: runs after Vite handles static files and modules
-      return () => {
-        server.middlewares.use(async (req, res, next) => {
-          // Only handle /api/ routes
-          if (!req.url?.startsWith('/api/')) return next()
+			// Post-middleware: runs after Vite handles static files and modules
+			return () => {
+				server.middlewares.use(async (req, res, next) => {
+					// Only handle /api/ routes
+					if (!req.url?.startsWith("/api/")) return next();
 
-          try {
-            // Map URL to file: /api/hello → /src/api/hello.ts
-            const urlPath = req.url.split('?')[0]
-            const apiPath = `/src/api${urlPath.replace('/api', '')}.ts`
+					try {
+						// Map URL to file: /api/hello → /src/api/hello.ts
+						const urlPath = req.url.split("?")[0];
+						const apiPath = `/src/api${urlPath.replace("/api", "")}.ts`;
 
-            // Load the API handler through Vite's SSR pipeline
-            // This means TypeScript, ESM, path aliases all work
-            const mod = await viteServer.ssrLoadModule(apiPath) as {
-              default?: (...args: unknown[]) => unknown
-            }
+						// Load the API handler through Vite's SSR pipeline
+						// This means TypeScript, ESM, path aliases all work
+						const mod = (await viteServer.ssrLoadModule(apiPath)) as {
+							default?: (...args: unknown[]) => unknown;
+						};
 
-            if (typeof mod.default !== 'function') {
-              res.writeHead(404)
-              res.end(JSON.stringify({ error: 'Not found' }))
-              return
-            }
+						if (typeof mod.default !== "function") {
+							res.writeHead(404);
+							res.end(JSON.stringify({ error: "Not found" }));
+							return;
+						}
 
-            // Parse query params
-            const url = new URL(req.url, 'http://localhost')
-            const ctx = {
-              params: {},
-              query: Object.fromEntries(url.searchParams),
-            }
+						// Parse query params
+						const url = new URL(req.url, "http://localhost");
+						const ctx = {
+							params: {},
+							query: Object.fromEntries(url.searchParams),
+						};
 
-            // Call the handler
-            const result = await mod.default(ctx, req, res)
+						// Call the handler
+						const result = await mod.default(ctx, req, res);
 
-            // If the handler didn't end the response, send the result as JSON
-            if (!res.writableEnded) {
-              res.setHeader('Content-Type', 'application/json')
-              res.end(JSON.stringify(result))
-            }
-          } catch (e) {
-            if (e instanceof Error) {
-              viteServer.ssrFixStacktrace(e)
-              console.error(e.stack)
-            }
-            res.writeHead(500)
-            res.end(JSON.stringify({ error: 'Internal server error' }))
-          }
-        })
-      }
-    },
-  }
+						// If the handler didn't end the response, send the result as JSON
+						if (!res.writableEnded) {
+							res.setHeader("Content-Type", "application/json");
+							res.end(JSON.stringify(result));
+						}
+					} catch (e) {
+						if (e instanceof Error) {
+							viteServer.ssrFixStacktrace(e);
+							console.error(e.stack);
+						}
+						res.writeHead(500);
+						res.end(JSON.stringify({ error: "Internal server error" }));
+					}
+				});
+			};
+		},
+	};
 }
 ```
 
 ### Writing an API route
 
 ```typescript title="src/api/hello.ts"
-import type { ApiHandler } from 'eigen/api-types'
+import type { ApiHandler } from "eigen/api-types";
 
 interface HelloResponse {
-  message: string
-  timestamp: number
+	message: string;
+	timestamp: number;
 }
 
 const handler: ApiHandler<HelloResponse> = async (ctx) => {
-  return {
-    message: `Hello! Query: ${JSON.stringify(ctx.query)}`,
-    timestamp: Date.now(),
-  }
-}
+	return {
+		message: `Hello! Query: ${JSON.stringify(ctx.query)}`,
+		timestamp: Date.now(),
+	};
+};
 
-export default handler
+export default handler;
 ```
 
 The `ApiHandler<HelloResponse>` annotation tells TypeScript that this handler returns a `HelloResponse`. If you try to return `{ messages: "typo" }`, TypeScript catches the error. The type doesn't enforce anything at runtime — the framework's middleware accepts any return value and serializes it to JSON — but it gives the developer safety when writing the handler.
@@ -194,49 +194,49 @@ This is a significant DX advantage over running API routes in a separate process
 ## The dev/prod gap
 
 <Callout type="warn" title="The dev/prod gap">
-`configureServer` only exists during development. In production, there is no Vite dev server. The production server is a plain Express/Hono/Fastify app that you write separately (or that a deployment adapter generates).
+`configureServer` only exists during development. In production, there is no Vite dev server. The production server is a plain H3/Hono/Fastify app that you write separately (or that a deployment adapter generates).
 </Callout>
 
-This means the API routing logic in `configureServer` has to be reimplemented for production. For our toy framework, the production server would need its own API route handler:
+This means the API routing logic in `configureServer` has to be reimplemented for production. For our toy framework, the production server would need its own API route handler (shown here as pseudocode — the actual production server uses H3 as in [Part 6](/06-production-builds)):
 
 ```typescript title="server.prod.ts"
 // Simplified for brevity — a production server would also need
 // 404 handling for unknown routes, query parameter parsing for
 // dynamic segments, error logging, and graceful shutdown.
-import { readdirSync } from 'fs'
+import { readdirSync } from "fs";
 
 // Pre-load all API route handlers at startup
-const apiHandlers = new Map<string, Function>()
-const apiFiles = readdirSync('dist/server/api', { recursive: true })
+const apiHandlers = new Map<string, Function>();
+const apiFiles = readdirSync("dist/server/api", { recursive: true });
 for (const file of apiFiles) {
-  if (typeof file !== 'string' || !file.endsWith('.js')) continue
-  const route = `/api/${file.replace(/\.js$/, '')}`
-  const mod = await import(`./dist/server/api/${file}`)
-  apiHandlers.set(route, mod.default)
+	if (typeof file !== "string" || !file.endsWith(".js")) continue;
+	const route = `/api/${file.replace(/\.js$/, "")}`;
+	const mod = await import(`./dist/server/api/${file}`);
+	apiHandlers.set(route, mod.default);
 }
 
-app.all('/api/*', async (req, res) => {
-  const handler = apiHandlers.get(req.path)
-  if (!handler) return res.status(404).json({ error: 'Not found' })
-  const result = await handler({ params: {}, query: req.query }, req, res)
-  if (!res.writableEnded) res.json(result)
-})
+app.all("/api/*", async (req, res) => {
+	const handler = apiHandlers.get(req.path);
+	if (!handler) return res.status(404).json({ error: "Not found" });
+	const result = await handler({ params: {}, query: req.query }, req, res);
+	if (!res.writableEnded) res.json(result);
+});
 ```
 
-This gap between dev and prod middleware is why frameworks need **deployment adapters**. TanStack Start uses Nitro (via the `@netlify/vite-plugin-tanstack-start` or equivalent Vercel/Cloudflare plugins) to generate platform-specific server code. Remix has its adapter system. Next.js bakes the production server into its own runtime.
+This gap between dev and prod middleware is why frameworks need **deployment adapters**. [TanStack Start](https://tanstack.com/start) uses [Nitro](https://nitro.build) (via the `@netlify/vite-plugin-tanstack-start` or equivalent Vercel/Cloudflare plugins) to generate platform-specific server code. [Remix](https://remix.run) has its adapter system. [Next.js](https://nextjs.org) bakes the production server into its own runtime.
 
 For our Eigen framework, the dev server middleware is educational — it shows how `configureServer` works. The production equivalent is a separate concern.
 
 ---
 
-## `ssrLoadModule` at the boundary
+## [`ssrLoadModule`](https://vite.dev/guide/api-javascript#vitedevserver-ssrloadmodule) at the boundary
 
 The type assertion pattern appears again:
 
 ```typescript
-const mod = await viteServer.ssrLoadModule(apiPath) as {
-  default?: (...args: unknown[]) => unknown
-}
+const mod = (await viteServer.ssrLoadModule(apiPath)) as {
+	default?: (...args: unknown[]) => unknown;
+};
 ```
 
 `ssrLoadModule` returns `Record<string, any>`. The framework can't statically know the shape of an arbitrary API route module. It uses a convention (default export is a function) and asserts the type.
@@ -267,6 +267,16 @@ This is a recurring pattern in framework development. The plugin generates type 
 `configureServer` is how a framework takes control of the HTTP layer during development. It's middleware all the way down — your plugin adds middleware to Vite's connect stack, and Vite's own module serving is also middleware. The ordering matters, and the post-middleware pattern (return a function) is the safe default for framework authors.
 
 The dev/prod gap is the biggest architectural challenge. Everything in `configureServer` is dev-only. Production needs its own routing, its own static file serving, its own error handling. Deployment adapters exist to bridge this gap, translating the framework's dev-time behavior into platform-specific production code.
+
+---
+
+## Further reading
+
+- [Vite Plugin API: `configureServer`](https://vite.dev/guide/api-plugin#configureserver) — The official reference for adding dev server middleware, including pre- and post-middleware patterns.
+- [Vite `ssrLoadModule`](https://vite.dev/guide/api-javascript#vitedevserver-ssrloadmodule) — How Vite loads and transforms modules for server-side execution.
+- [Connect Middleware](https://github.com/senchalabs/connect) — The middleware framework that Vite's dev server is built on.
+- [Nitro Documentation](https://nitro.build/guide) — The production server toolkit that bridges the dev/prod middleware gap for frameworks like TanStack Start and Nuxt.
+- [H3 Documentation](https://h3.dev/guide) — H3's web-standard HTTP framework, used in our production server.
 
 ---
 

@@ -27,110 +27,119 @@ The dev overlay surfaces all of this in a unified panel, using the same instrume
 
 The overlay consists of:
 
-1. **Server collector** — a `configureServer` middleware that captures timing data for each request phase and stores events in a buffer.
-2. **WebSocket channel** — the server pushes diagnostic events to the browser in real-time via a dedicated WebSocket at `/_eigen/dev-ws` (separate from Vite's HMR WebSocket at `/__vite_ws`).
-3. **Client overlay** — a script injected via `transformIndexHtml` that connects to the WebSocket and renders a floating badge. Rendered inside Shadow DOM to isolate from the application's CSS. Completely absent in production builds because the entire plugin uses `apply: 'serve'`.
+1. **Server collector** — a [`configureServer`](https://vite.dev/guide/api-plugin#configureserver) middleware that captures timing data for each request phase and stores events in a buffer.
+2. **[WebSocket](https://developer.mozilla.org/en-US/docs/Web/API/WebSocket) channel** — the server pushes diagnostic events to the browser in real-time via a dedicated WebSocket at `/_eigen/dev-ws` (separate from Vite's HMR WebSocket at `/__vite_ws`).
+3. **Client overlay** — a script injected via [`transformIndexHtml`](https://vite.dev/guide/api-plugin#transformindexhtml) that connects to the WebSocket and renders a floating badge. Rendered inside [Shadow DOM](https://developer.mozilla.org/en-US/docs/Web/API/Web_components/Using_shadow_DOM) to isolate from the application's CSS. Completely absent in production builds because the entire plugin uses `apply: 'serve'`.
 
 ---
 
 ## The overlay plugin
 
 ```typescript title="plugins/eigen-dev-overlay.ts"
-import type { Plugin, ViteDevServer } from 'vite'
-import { WebSocketServer, WebSocket } from 'ws'
+import type { Plugin, ViteDevServer } from "vite";
+import { WebSocketServer, WebSocket } from "ws";
 
 interface DevEvent {
-  type: string
-  timestamp: number
-  data: Record<string, unknown>
+	type: string;
+	timestamp: number;
+	data: Record<string, unknown>;
 }
 
 export default function eigenDevOverlay(): Plugin {
-  const eventBuffer: DevEvent[] = []
-  const clients = new Set<WebSocket>()
+	const eventBuffer: DevEvent[] = [];
+	const clients = new Set<WebSocket>();
 
-  function emit(event: DevEvent) {
-    eventBuffer.push(event)
-    if (eventBuffer.length > 200) eventBuffer.shift()
+	function emit(event: DevEvent) {
+		eventBuffer.push(event);
+		if (eventBuffer.length > 200) eventBuffer.shift();
 
-    const data = JSON.stringify(event)
-    for (const client of clients) {
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(data)
-      }
-    }
-  }
+		const data = JSON.stringify(event);
+		for (const client of clients) {
+			if (client.readyState === WebSocket.OPEN) {
+				client.send(data);
+			}
+		}
+	}
 
-  // Expose emit globally so other framework code can instrument
-  ;(globalThis as any).__eigenDevCollector = { emit }
+	// Expose emit globally so other framework code can instrument
+	(globalThis as any).__eigenDevCollector = { emit };
 
-  return {
-    name: 'eigen-dev-overlay',
-    apply: 'serve',  // Dev only — completely absent in production
+	return {
+		name: "eigen-dev-overlay",
+		apply: "serve", // Dev only — completely absent in production
 
-    configureServer(server: ViteDevServer) {
-      // Set up the dev diagnostics WebSocket
-      const wss = new WebSocketServer({ noServer: true })
+		configureServer(server: ViteDevServer) {
+			// Set up the dev diagnostics WebSocket
+			const wss = new WebSocketServer({ noServer: true });
 
-      server.httpServer?.on('upgrade', (req, socket, head) => {
-        if (req.url === '/_eigen/dev-ws') {
-          wss.handleUpgrade(req, socket, head, (ws) => {
-            clients.add(ws)
-            // Send buffered events on connect so the overlay
-            // shows recent history, not just future events
-            for (const event of eventBuffer) {
-              ws.send(JSON.stringify(event))
-            }
-            ws.on('close', () => clients.delete(ws))
-          })
-        }
-        // Other upgrade requests (like Vite's HMR) pass through untouched
-      })
+			server.httpServer?.on("upgrade", (req, socket, head) => {
+				if (req.url === "/_eigen/dev-ws") {
+					wss.handleUpgrade(req, socket, head, (ws) => {
+						clients.add(ws);
+						// Send buffered events on connect so the overlay
+						// shows recent history, not just future events
+						for (const event of eventBuffer) {
+							ws.send(JSON.stringify(event));
+						}
+						ws.on("close", () => clients.delete(ws));
+					});
+				}
+				// Other upgrade requests (like Vite's HMR) pass through untouched
+			});
 
-      // Instrument the request pipeline
-      return () => {
-        server.middlewares.use((req, res, next) => {
-          // Don't instrument overlay's own requests or static assets
-          if (req.url?.startsWith('/_eigen/')) return next()
-          if (req.url?.startsWith('/@') || req.url?.startsWith('/node_modules')) return next()
+			// Instrument the request pipeline
+			return () => {
+				server.middlewares.use((req, res, next) => {
+					// Don't instrument overlay's own requests or static assets
+					if (req.url?.startsWith("/_eigen/")) return next();
+					if (
+						req.url?.startsWith("/@") ||
+						req.url?.startsWith("/node_modules")
+					)
+						return next();
 
-          const requestId = crypto.randomUUID()
-          const startTime = performance.now()
+					const requestId = crypto.randomUUID();
+					const startTime = performance.now();
 
-          emit({
-            type: 'request:start',
-            timestamp: Date.now(),
-            data: { requestId, method: req.method, url: req.url },
-          })
+					emit({
+						type: "request:start",
+						timestamp: Date.now(),
+						data: {
+							requestId,
+							method: req.method,
+							url: req.url,
+						},
+					});
 
-          // Wrap res.end to capture completion timing
-          const originalEnd = res.end.bind(res)
-          res.end = function (...args: any[]) {
-            const duration = performance.now() - startTime
-            emit({
-              type: 'request:end',
-              timestamp: Date.now(),
-              data: {
-                requestId,
-                url: req.url,
-                statusCode: res.statusCode,
-                duration: Math.round(duration * 100) / 100,
-              },
-            })
-            return originalEnd(...args)
-          } as typeof res.end
+					// Wrap res.end to capture completion timing
+					const originalEnd = res.end.bind(res);
+					res.end = function (...args: any[]) {
+						const duration = performance.now() - startTime;
+						emit({
+							type: "request:end",
+							timestamp: Date.now(),
+							data: {
+								requestId,
+								url: req.url,
+								statusCode: res.statusCode,
+								duration:
+									Math.round(duration * 100) / 100,
+							},
+						});
+						return originalEnd(...args);
+					} as typeof res.end;
 
-          next()
-        })
-      }
-    },
+					next();
+				});
+			};
+		},
 
-    // Inject the overlay client script into the HTML.
-    // NOTE: This is a long inline script for tutorial clarity.
-    // A production framework would serve this as a virtual module
-    // or a separate file loaded via a <script src="..."> tag.
-    transformIndexHtml(html: string) {
-      const overlayScript = `
+		// Inject the overlay client script into the HTML.
+		// NOTE: This is a long inline script for tutorial clarity.
+		// A production framework would serve this as a virtual module
+		// or a separate file loaded via a <script src="..."> tag.
+		transformIndexHtml(html: string) {
+			const overlayScript = `
         <script type="module">
           // Connect to the dev diagnostics WebSocket
           const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
@@ -226,10 +235,10 @@ export default function eigenDevOverlay(): Plugin {
             }
           })
         </script>
-      `
-      return html.replace('</body>', `${overlayScript}\n</body>`)
-    },
-  }
+      `;
+			return html.replace("</body>", `${overlayScript}\n</body>`);
+		},
+	};
 }
 ```
 
@@ -241,48 +250,48 @@ The overlay plugin sets up the collection infrastructure. Other framework code u
 
 ```typescript title="packages/eigen/dev.ts"
 interface DevEvent {
-  type: string
-  timestamp: number
-  data: Record<string, unknown>
+	type: string;
+	timestamp: number;
+	data: Record<string, unknown>;
 }
 
 export function devEmit(event: DevEvent): void {
-  if (!import.meta.env.DEV) return  // Dead code in production
-  ;(globalThis as any).__eigenDevCollector?.emit(event)
+	if (!import.meta.env.DEV) return; // Dead code in production
+	(globalThis as any).__eigenDevCollector?.emit(event);
 }
 ```
 
-The `import.meta.env.DEV` check is the zero-cost guarantee. In production builds, Vite statically replaces `import.meta.env.DEV` with `false`. Rolldown's dead code elimination removes the entire function body. The `devEmit` call, its arguments, and any event object construction are all stripped from the production bundle. This means we can instrument *everything* without worrying about runtime cost.
+The [`import.meta.env.DEV`](https://vite.dev/guide/env-and-mode#env-variables) check is the zero-cost guarantee. In production builds, Vite statically replaces `import.meta.env.DEV` with `false`. Rolldown's dead code elimination removes the entire function body. The `devEmit` call, its arguments, and any event object construction are all stripped from the production bundle. This means we can instrument *everything* without worrying about runtime cost.
 
 As we build features in later parts, each will emit events:
 
 ```typescript
 // In loader execution (Part 5)
-const start = performance.now()
-const data = await route.loader({ params, ctx })
+const start = performance.now();
+const data = await route.loader({ params, ctx });
 devEmit({
-  type: 'loader:end',
-  timestamp: Date.now(),
-  data: {
-    route: route.path,
-    duration: performance.now() - start,
-    exceedsBudget: (performance.now() - start) > 200,
-  },
-})
+	type: "loader:end",
+	timestamp: Date.now(),
+	data: {
+		route: route.path,
+		duration: performance.now() - start,
+		exceedsBudget: performance.now() - start > 200,
+	},
+});
 
 // In middleware chain (Part 14)
 devEmit({
-  type: 'middleware:executed',
-  timestamp: Date.now(),
-  data: { name: 'auth', duration: 17, addedContextKeys: ['user', 'session'] },
-})
+	type: "middleware:executed",
+	timestamp: Date.now(),
+	data: { name: "auth", duration: 17, addedContextKeys: ["user", "session"] },
+});
 
 // In cache wrapper (Part 25)
 devEmit({
-  type: 'cache:hit',
-  timestamp: Date.now(),
-  data: { key: 'getPost_b4e2:42', age: 12000, tags: ['post-42'] },
-})
+	type: "cache:hit",
+	timestamp: Date.now(),
+	data: { key: "getPost_b4e2:42", age: 12000, tags: ["post-42"] },
+});
 ```
 
 Each emitted event flows through the WebSocket to the overlay. The badge updates. The expanded panel shows request history. `Alt+Shift+D` dumps everything to the console. The instrumentation is additive — each new framework feature automatically enriches the dev overlay without changing the overlay plugin itself.
@@ -294,7 +303,7 @@ Each emitted event flows through the WebSocket to the overlay. The badge updates
 The overlay renders inside Shadow DOM:
 
 ```typescript
-const shadow = overlay.attachShadow({ mode: 'open' })
+const shadow = overlay.attachShadow({ mode: "open" });
 ```
 
 Without Shadow DOM, the application's CSS would affect the overlay. Tailwind's CSS reset would strip the overlay's default styles. Scoped component styles might accidentally target overlay elements. And the overlay's own styles (fixed positioning, dark theme, monospace font) would leak into the application.
@@ -325,21 +334,21 @@ This Phase I version of the overlay is deliberately minimal: a badge and a reque
 
 - **Part 14** (Middleware) adds middleware execution spans
 - **Part 15** (Server Functions) adds RPC call logging
-- **Part 20** (Observability) connects the same events to OpenTelemetry exporters
+- **Part 20** (Observability) connects the same events to [OpenTelemetry](https://opentelemetry.io) exporters
 - **Part 25** (Cache) adds cache hit/miss tracking
 
 The extensibility point is simple: any code that calls `devEmit()` contributes to the overlay's data stream. The overlay client can be upgraded to show richer visualizations (performance waterfalls, cache inspectors, streaming monitors) as the framework evolves. Third-party plugins can participate too:
 
 ```typescript
 // In a custom plugin's configureServer hook
-import { devEmit } from 'eigen/dev'
+import { devEmit } from "eigen/dev";
 
 // Emit custom events that appear in the overlay
 devEmit({
-  type: 'custom:database-query',
-  timestamp: Date.now(),
-  data: { query: 'SELECT * FROM users', duration: 45 },
-})
+	type: "custom:database-query",
+	timestamp: Date.now(),
+	data: { query: "SELECT * FROM users", duration: 45 },
+});
 ```
 
 ---
@@ -365,6 +374,16 @@ devEmit({
 The dev overlay demonstrates that DX features are *built from the same Vite primitives* as the framework itself: `configureServer` for the WebSocket and request instrumentation, `transformIndexHtml` for injecting the client script, and `import.meta.env.DEV` for zero-cost production removal.
 
 The `devEmit` pattern is the foundation for all framework instrumentation. It's a one-line function call that framework code sprinkles into loaders, middleware, cache wrappers, and server functions. In development, these calls feed a real-time diagnostic stream. In production, they're completely eliminated. Same source code, different build output — the same principle that drives everything in Eigen.
+
+---
+
+## Further reading
+
+- [Vite Plugin API: `transformIndexHtml`](https://vite.dev/guide/api-plugin#transformindexhtml) — The hook used to inject the overlay client script into the HTML during development.
+- [Shadow DOM (MDN)](https://developer.mozilla.org/en-US/docs/Web/API/Web_components/Using_shadow_DOM) — How Shadow DOM provides CSS and DOM encapsulation for the overlay.
+- [WebSocket API (MDN)](https://developer.mozilla.org/en-US/docs/Web/API/WebSocket) — The browser API for real-time bidirectional communication with the dev server.
+- [Vite Environment Variables](https://vite.dev/guide/env-and-mode#env-variables) — How `import.meta.env.DEV` enables zero-cost production removal of dev-only code.
+- [OpenTelemetry](https://opentelemetry.io/docs/) — The observability framework that the `devEmit` pattern connects to in Part 20 for production tracing.
 
 ---
 
