@@ -1,5 +1,14 @@
 {
   "permissions": {
-    "allow": ["WebFetch(domain:vite.dev)", "WebFetch(domain:h3.unjs.io)", "Bash(ls:*)", "Bash(cd:*)"]
+    "allow": [
+      "WebFetch(domain:vite.dev)",
+      "WebFetch(domain:h3.unjs.io)",
+      "Bash(ls:*)",
+      "Bash(cd:*)",
+      "Bash(npm search:*)",
+      "Bash(npm view:*)",
+      "WebSearch",
+      "WebFetch(domain:oxc.rs)"
+    ]
   }
 }

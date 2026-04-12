@@ -365,15 +365,16 @@ Update `vite.config.ts`:
 import { resolve } from 'node:path'
 import react from '@vitejs/plugin-react'
 import { defineConfig } from 'vite'
-import eigenRoutes from './plugins/eigen-routes'
+import eigenRoutes from './plugins/eigen-routes' // [!code ++]
 
 export default defineConfig({
-  plugins: [react(), eigenRoutes()],
-  resolve: {
-    alias: {
-      'eigen/types': resolve(__dirname, 'packages/eigen/types.ts'),
-    },
-  },
+  plugins: [react()], // [!code --]
+  plugins: [react(), eigenRoutes()], // [!code ++]
+  resolve: { // [!code ++]
+    alias: { // [!code ++]
+      'eigen/types': resolve(__dirname, 'packages/eigen/types.ts'), // [!code ++]
+    }, // [!code ++]
+  }, // [!code ++]
 })
 ```
 
@@ -540,12 +541,13 @@ The `PageProps<'/posts/:id', { title: string; body: string }>` type ties this co
    ```typescript title="vite.config.ts"
    import { resolve } from 'node:path'
    import react from '@vitejs/plugin-react'
-   import inspect from 'vite-plugin-inspect'
+   import inspect from 'vite-plugin-inspect' // [!code ++]
    import { defineConfig } from 'vite'
    import eigenRoutes from './plugins/eigen-routes'
 
    export default defineConfig({
-     plugins: [react(), eigenRoutes(), inspect()],
+     plugins: [react(), eigenRoutes()], // [!code --]
+     plugins: [react(), eigenRoutes(), inspect()], // [!code ++]
      resolve: {
        alias: {
          'eigen/types': resolve(__dirname, 'packages/eigen/types.ts'),

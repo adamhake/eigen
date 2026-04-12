@@ -18,7 +18,7 @@ concepts:
 mkdir eigen && cd eigen
 pnpm init
 pnpm add vite react react-dom @vitejs/plugin-react
-pnpm add -D typescript @types/react @types/react-dom @types/node vitest @biomejs/biome
+pnpm add -D typescript @types/react @types/react-dom @types/node vitest oxfmt oxlint
 git init
 ```
 
@@ -36,7 +36,7 @@ dist
 .eigen
 ```
 
-This keeps `node_modules`, build output (`dist`), Vite's dependency pre-bundle cache (`.vite`), and Eigen's generated type declarations (`.eigen`) out of version control. The `*.local` pattern covers `.env.local` files that Vite loads automatically — these often contain secrets and should never be committed. Biome also respects `.gitignore` by default, so files listed here are automatically excluded from linting and formatting.
+This keeps `node_modules`, build output (`dist`), Vite's dependency pre-bundle cache (`.vite`), and Eigen's generated type declarations (`.eigen`) out of version control. The `*.local` pattern covers `.env.local` files that Vite loads automatically — these often contain secrets and should never be committed.
 
 We'll end up with a project that has two distinct zones of TypeScript: **app code** (React components, entry points — runs in the browser and/or Node SSR) and **tooling code** (Vite config, plugins, the dev server script — runs in Node only). These need different TypeScript configurations.
 
@@ -46,7 +46,8 @@ We'll end up with a project that has two distinct zones of TypeScript: **app cod
   <Folder name="eigen" defaultOpen>
     <File name=".gitignore" comment="Git ignore rules" />
     <File name="index.html" comment="Vite's true entry point" />
-    <File name="biome.json" comment="Linting and formatting" />
+    <File name=".oxfmtrc.json" comment="Formatting" />
+    <File name=".oxlintrc.json" comment="Linting" />
     <File name="vite.config.ts" comment="Vite configuration (tooling code)" />
     <File name="tsconfig.json" comment="TypeScript config for app code" />
     <File name="tsconfig.node.json" comment="TypeScript config for tooling code" />
@@ -126,43 +127,34 @@ If you use a single tsconfig with `jsx: "react-jsx"`, TypeScript won't complain 
 
 ## Linting and formatting
 
-We'll use [Biome](https://biomejs.dev) for both linting and formatting. Biome is a single Rust binary that replaces ESLint and Prettier — it's fast enough to run on every save without a noticeable delay, and its defaults are sensible for TypeScript React projects.
+We'll use [oxfmt](https://oxc.rs/docs/guide/usage/formatter) for formatting and [oxlint](https://oxc.rs/docs/guide/usage/linter) for linting. Both are Rust binaries from the [OXC](https://oxc.rs) project — the same toolchain that powers Vite's TypeScript transforms and Rolldown's parser. They're fast enough to run on every save without a noticeable delay, and their defaults are sensible for TypeScript React projects.
 
-Initialize it:
+Create `.oxfmtrc.json` at the project root:
 
-```bash
-pnpm biome init
-```
-
-Then replace the generated `biome.json` with:
-
-```json title="biome.json"
+```json title=".oxfmtrc.json"
 {
-  "$schema": "https://biomejs.dev/schemas/2.4.6/schema.json",
-  "assist": {
-    "actions": {
-      "source": {
-        "organizeImports": "on"
-      }
-    }
-  },
-  "linter": {
-    "enabled": true,
-    "rules": {
-      "recommended": true
-    }
-  },
-  "formatter": {
-    "enabled": true,
-    "indentStyle": "tab"
-  },
-  "files": {
-    "includes": ["**", "!dist/**", "!node_modules/.eigen/**"]
-  }
+  "$schema": "./node_modules/oxfmt/configuration_schema.json",
+  "useTabs": true,
+  "sortImports": true,
+  "ignorePatterns": ["dist", "node_modules/.eigen"]
 }
 ```
 
-Biome respects `.gitignore` by default, so `node_modules` and `.vite` are already excluded. The `files.includes` array starts with `**` to match everything, then uses negated patterns (`!`) to exclude `dist` and `node_modules/.eigen` (our generated type declarations) as a safeguard — Biome's `.gitignore` integration depends on being inside a git repo, and these directories contain generated code that should never be linted or formatted regardless.
+oxfmt uses Prettier-compatible options — `useTabs`, `printWidth`, `singleQuote`, etc. all work the same way. The `sortImports` option replaces a separate import organizer. The `ignorePatterns` array excludes `dist` and `node_modules/.eigen` (our generated type declarations) — these contain generated code that should never be formatted.
+
+Then create `.oxlintrc.json`:
+
+```json title=".oxlintrc.json"
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "categories": {
+    "correctness": "error"
+  },
+  "ignorePatterns": ["dist", "node_modules/.eigen"]
+}
+```
+
+oxlint organizes rules into categories. The `correctness` category covers the rules you'll want in any project — catching real bugs like unreachable code, invalid regex, and misused hooks. Other categories like `suspicious`, `pedantic`, and `style` can be enabled as you see fit.
 
 Add scripts to `package.json`:
 
@@ -171,15 +163,16 @@ Add scripts to `package.json`:
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "lint": "biome check .",
-    "format": "biome check --fix ."
+    "lint": "oxlint",
+    "format": "oxfmt",
+    "format:check": "oxfmt --check"
   }
 }
 ```
 
-`biome check` runs the linter, formatter, and import organizer in a single pass. The `--fix` flag applies safe fixes automatically. There's no need for separate `lint` and `format` commands in CI — `biome check` catches both categories.
+`oxlint` checks for lint errors. `oxfmt` formats all files in place. The `--check` flag makes oxfmt exit with a non-zero code if any file would change, which is useful for CI. Use `oxlint --fix` to auto-fix lint issues.
 
-If you're using VS Code, install the [Biome extension](https://marketplace.visualstudio.com/items?itemName=biomejs.biome) and set it as the default formatter for TypeScript and TSX files. Biome will format on save and show lint diagnostics inline.
+If you're using VS Code, install the [oxc extension](https://marketplace.visualstudio.com/items?itemName=nicolo-ribaudo.oxc-vscode) for inline lint diagnostics and format-on-save.
 
 ---
 
@@ -346,7 +339,8 @@ The dev server's on-demand architecture means startup is instant, but also means
 - [Dependency Pre-Bundling](https://vite.dev/guide/dep-pre-bundling) — Why Vite pre-bundles dependencies, how the cache works, and how to troubleshoot when things go wrong.
 - [Vite HMR API](https://vite.dev/guide/api-hmr) — The full reference for `import.meta.hot`, including `accept`, `dispose`, `prune`, and `invalidate`.
 - [TypeScript `moduleResolution` options](https://www.typescriptlang.org/docs/handbook/modules/theory.html#module-resolution) — The TypeScript handbook explains why `"Bundler"` resolution exists and how it differs from `"Node"` and `"NodeNext"`.
-- [Biome Configuration](https://biomejs.dev/reference/configuration/) — Full reference for `biome.json` options, lint rules, and formatter settings.
+- [oxfmt Configuration](https://oxc.rs/docs/guide/usage/formatter) — Full reference for `.oxfmtrc.json` options and formatter settings.
+- [oxlint Configuration](https://oxc.rs/docs/guide/usage/linter/config) — Full reference for `.oxlintrc.json` options, lint categories, and rule configuration.
 
 ---
 

@@ -17,7 +17,13 @@ concepts:
 
 Server-side rendering requires Vite to do two things simultaneously: serve the client app to the browser (with HMR, code splitting, and lazy loading) *and* run our React components on the server to produce HTML strings.
 
-This is where the ["two module graphs" concept from Part 0](/00-the-mental-model#the-two-module-graphs) becomes concrete. The client module graph resolves imports for the browser. The SSR module graph resolves imports for Node. The same virtual module — `eigen/routes` — generates different code in each graph, because the server needs static imports and loaders while the client needs lazy imports and no loaders.
+This is where the ["two module graphs" concept from Part 0](/00-the-mental-model#the-two-module-graphs) becomes concrete. The client module graph resolves imports for the browser. The SSR module graph resolves imports for the server. The same virtual module — `eigen/routes` — generates different code in each graph, because the server needs static imports and loaders while the client needs lazy imports and no loaders.
+
+<Callout type="info" title="&quot;Server&quot; doesn't always mean Node">
+
+The SSR module graph targets whatever non-browser environment runs your app. During development that's usually Node, but in production it could be Cloudflare Workers, Deno, Bun, or a Netlify Edge Function — each with its own runtime APIs and constraints. The key distinction is *client vs. not-client*: the browser gets one module graph, and everything else shares the other. Vite's [Environment API](https://vite.dev/guide/api-environment) takes this further by letting you define multiple named server environments, but the two-graph mental model is enough for now.
+
+</Callout>
 
 ```mermaid
 sequenceDiagram
@@ -98,7 +104,7 @@ This is a new file in `packages/eigen/`, so we need to register it in both TypeS
   "compilerOptions": {
     "paths": {
       "eigen/types": ["./packages/eigen/types.ts"],
-      "eigen/match-route": ["./packages/eigen/match-route.ts"]
+      "eigen/match-route": ["./packages/eigen/match-route.ts"] // [!code ++]
     }
   }
 }
@@ -118,7 +124,7 @@ export default defineConfig({
   resolve: {
     alias: {
       'eigen/types': resolve(__dirname, 'packages/eigen/types.ts'),
-      'eigen/match-route': resolve(__dirname, 'packages/eigen/match-route.ts'),
+      'eigen/match-route': resolve(__dirname, 'packages/eigen/match-route.ts'), // [!code ++]
     },
   },
 })
@@ -167,20 +173,29 @@ When Vite loads this module through the SSR environment, the `import { routes } 
 
 ## Updating the HTML template
 
-The server needs to inject rendered HTML into `index.html`. Add an SSR outlet marker, and change the script entry from `main.tsx` to `entry-client.tsx` (which we'll create in Part 4):
+The server needs to inject rendered HTML into `index.html`. Add an SSR outlet marker, and change the script entry from `main.tsx` to `entry-client.tsx`:
 
 ```html title="index.html"
 <!DOCTYPE html>
 <html lang="en">
 <head><title>Eigen Framework</title></head>
 <body>
-  <div id="root"><!--ssr-outlet--></div>
-  <script type="module" src="/src/entry-client.tsx"></script>
+  <div id="root"></div> <!-- [!code --] -->
+  <div id="root"><!--ssr-outlet--></div> <!-- [!code ++] -->
+  <script type="module" src="/src/main.tsx"></script> <!-- [!code --] -->
+  <script type="module" src="/src/entry-client.tsx"></script> <!-- [!code ++] -->
 </body>
 </html>
 ```
 
-The `<!--ssr-outlet-->` comment is a placeholder that the server replaces with rendered HTML. The `entry-client.tsx` script will handle hydration — taking over the server-rendered HTML and making it interactive. Until we create that file in Part 4, the page will render server-side HTML but won't be interactive.
+The `<!--ssr-outlet-->` comment is a placeholder that the server replaces with rendered HTML. The `entry-client.tsx` script will handle hydration — taking over the server-rendered HTML and making it interactive. We'll implement hydration in [Part 4](/04-hydration), but we need the file to exist now so Vite doesn't error when it tries to resolve the `<script>` tag. Create a placeholder:
+
+```tsx title="src/entry-client.tsx"
+// Hydration will be added in Part 4.
+// For now, the server-rendered HTML is static — no client-side
+// interactivity. You can verify SSR is working by viewing the
+// page source in your browser.
+```
 
 ---
 
@@ -263,8 +278,16 @@ async function start() {
 		}
 	});
 
-	serve(app, { port: 3000 });
+	const server = serve(app, { port: 3000 });
 	console.log("http://localhost:3000");
+
+	// Graceful shutdown — close Vite's file watchers and
+	// WebSocket server so the process can actually exit
+	process.on("SIGINT", async () => {
+		await server.close();
+		await vite.close();
+		process.exit(0);
+	});
 }
 
 start();
@@ -368,7 +391,7 @@ In production, `transformIndexHtml` isn't called (there's no dev server). Instea
 
 ## Key insight
 
-This is the fundamental architecture of every Vite-based SSR framework. The dev server simultaneously handles two module graphs: one for the browser (ESM, code splitting, HMR) and one for the server (Node, synchronous imports, `ssrLoadModule`). Your plugin generates different code for each. This is what [Vinxi](https://vinxi.vercel.app) abstracted with its "router" concept, and what Vite formalizes with the [Environment API](https://vite.dev/guide/api-environment).
+This is the fundamental architecture of every Vite-based SSR framework. The dev server simultaneously handles two module graphs: one for the browser (ESM, code splitting, HMR) and one for the server (server-side imports, `ssrLoadModule`). Your plugin generates different code for each. This is what [Vinxi](https://vinxi.vercel.app) abstracted with its "router" concept, and what Vite formalizes with the [Environment API](https://vite.dev/guide/api-environment).
 
 The custom server (`server.ts`) is the framework's development runtime. It creates a Vite instance, layers it with H3 for SSR, and serves both module transforms and rendered pages. In production, this entire file is replaced by a [Nitro](https://nitro.build)-built server that imports pre-built bundles. The gap between dev and prod is where deployment adapters (Netlify, Vercel, Cloudflare) live — we'll build those in [Part 17](/17-deployment-adapters).
 
