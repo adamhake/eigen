@@ -7,7 +7,7 @@
  * 720-wide prose column and scale down from there.
  *
  * Conventions:
- * - `tone="accent"` marks the one thing the figure is about (chartreuse).
+ * - `tone="accent"` marks the one thing the figure is about (brand primary).
  * - `tone="muted"` de-emphasises context; `tone="ghost"` is a dashed outline
  *   for things that are absent, virtual or optional.
  * - Labels are short; the sentence-length explanation goes in `caption`.

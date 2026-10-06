@@ -12,7 +12,13 @@ export async function GET(_req: Request, { params }: RouteContext<"/og/[...slug]
   if (!page) notFound();
 
   return new ImageResponse(
-    <DefaultImage title={page.data.title} description={page.data.description} site="The Eigen Series" />,
+    <DefaultImage
+      title={page.data.title}
+      description={page.data.description}
+      site="The Eigen Series"
+      primaryColor="rgba(47,211,238,0.3)"
+      primaryTextColor="rgb(47,211,238)"
+    />,
     {
       width: 1200,
       height: 630,
