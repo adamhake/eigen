@@ -364,12 +364,8 @@ import eigenStripLoaders from "./plugins/eigen-strip-loaders"; // [!code ++]
 export default defineConfig({
   plugins: [react(), eigenRoutes(), eigenStripLoaders(), inspect()], // [!code ++]
   plugins: [react(), eigenRoutes(), inspect()], // [!code --]
-  resolve: {
-    /* ...aliases from previous parts */
-  },
-  build: {
-    /* ...manifest and onwarn from Part 6 */
-  },
+  resolve: {/* ...aliases from previous parts */},
+  build: {/* ...manifest and onwarn from Part 6 */},
 });
 ```
 

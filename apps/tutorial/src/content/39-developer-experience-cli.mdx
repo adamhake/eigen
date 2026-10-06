@@ -512,13 +512,11 @@ function init(modules: { typescript: typeof ts }) {
       const token = findTokenAtPosition(sourceFile, position, ts);
       if (isLinkToProp(token, ts)) {
         // Read the generated route types to suggest completions
-        const routeEntries = getKnownRoutes(info.project).map(
-          (route): ts.CompletionEntry => ({
-            name: route,
-            kind: ts.ScriptElementKind.string,
-            sortText: "0", // Sort before other completions
-          }),
-        );
+        const routeEntries = getKnownRoutes(info.project).map((route): ts.CompletionEntry => ({
+          name: route,
+          kind: ts.ScriptElementKind.string,
+          sortText: "0", // Sort before other completions
+        }));
 
         return {
           isGlobalCompletion: false,
