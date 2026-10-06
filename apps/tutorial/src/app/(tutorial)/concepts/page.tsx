@@ -1,9 +1,10 @@
-import Link from "next/link";
-import { ExternalLinkIcon } from "lucide-react";
 import { DocsBody, DocsDescription, DocsPage, DocsTitle } from "fumadocs-ui/layouts/docs/page";
-import { source } from "@/lib/source";
-import { conceptDefinitions } from "@/lib/concepts";
+import { ExternalLinkIcon } from "lucide-react";
+import Link from "next/link";
+
 import { HashScroll } from "@/components/hash-scroll";
+import { conceptDefinitions } from "@/lib/concepts";
+import { source } from "@/lib/source";
 
 interface ConceptEntry {
   concept: string;
@@ -47,8 +48,7 @@ export default function ConceptsPage() {
       <HashScroll />
       <DocsTitle>Concept Index</DocsTitle>
       <DocsDescription>
-        Every concept covered in the series, with definitions and links to the
-        articles where each appears.
+        Every concept covered in the series, with definitions and links to the articles where each appears.
       </DocsDescription>
       <DocsBody>
         <div className="not-prose flex flex-col gap-3">
@@ -59,9 +59,7 @@ export default function ConceptsPage() {
               className="scroll-mt-20 rounded-lg border border-fd-border bg-fd-card p-4"
             >
               <div className="flex items-start justify-between gap-4">
-                <h2 className="text-sm font-semibold text-fd-foreground capitalize">
-                  {concept}
-                </h2>
+                <h2 className="text-sm font-semibold text-fd-foreground capitalize">{concept}</h2>
                 {url && (
                   <a
                     href={url}
@@ -74,11 +72,7 @@ export default function ConceptsPage() {
                   </a>
                 )}
               </div>
-              {description && (
-                <p className="mt-1 text-sm text-fd-muted-foreground leading-relaxed">
-                  {description}
-                </p>
-              )}
+              {description && <p className="mt-1 text-sm text-fd-muted-foreground leading-relaxed">{description}</p>}
               <div className="mt-3 flex flex-wrap gap-x-1 gap-y-1">
                 {articles.map((article, i) => (
                   <span key={article.url} className="inline-flex items-center">
@@ -88,9 +82,7 @@ export default function ConceptsPage() {
                     >
                       {article.title.replace(/^Part \d+:\s*/, "")}
                     </Link>
-                    {i < articles.length - 1 && (
-                      <span className="text-fd-border mx-1">&middot;</span>
-                    )}
+                    {i < articles.length - 1 && <span className="text-fd-border mx-1">&middot;</span>}
                   </span>
                 ))}
               </div>

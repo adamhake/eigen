@@ -4,6 +4,7 @@ import { Step, Steps } from "fumadocs-ui/components/steps";
 import { Tab, Tabs } from "fumadocs-ui/components/tabs";
 import defaultMdxComponents from "fumadocs-ui/mdx";
 import type { MDXComponents } from "mdx/types";
+
 import { Mermaid } from "@/components/mdx/mermaid";
 import { TestSection } from "@/components/test-section";
 import { TypeDeepDive } from "@/components/type-deep-dive";

@@ -1,6 +1,7 @@
 import { RootProvider } from "fumadocs-ui/provider/next";
 import type { Metadata } from "next";
 import { Source_Code_Pro } from "next/font/google";
+
 import "./global.css";
 
 const sourceCodePro = Source_Code_Pro({

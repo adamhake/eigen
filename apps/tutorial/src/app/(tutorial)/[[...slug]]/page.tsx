@@ -2,6 +2,7 @@ import { DocsBody, DocsDescription, DocsPage, DocsTitle } from "fumadocs-ui/layo
 import { createRelativeLink } from "fumadocs-ui/mdx";
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
+
 import { LLMCopyButton, ViewOptions } from "@/components/ai/page-actions";
 import { ConceptBadges } from "@/components/mdx/badge";
 import { gitConfig } from "@/lib/layout.shared";
