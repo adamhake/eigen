@@ -1,3 +1,4 @@
+import { rehypeCodeDefaultOptions } from "fumadocs-core/mdx-plugins";
 import { metaSchema, pageSchema } from "fumadocs-core/source/schema";
 import { defineConfig, defineDocs } from "fumadocs-mdx/config";
 import { z } from "zod";
@@ -20,5 +21,11 @@ export const docs = defineDocs({
 });
 
 export default defineConfig({
-  mdxOptions: {},
+  mdxOptions: {
+    rehypeCodeOptions: {
+      ...rehypeCodeDefaultOptions,
+      // Vite's own theme: calm, low-saturation syntax colours that suit the palette.
+      themes: { light: "vitesse-light", dark: "vitesse-dark" },
+    },
+  },
 });

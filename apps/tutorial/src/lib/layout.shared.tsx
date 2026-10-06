@@ -1,10 +1,11 @@
 import type { BaseLayoutProps } from "fumadocs-ui/layouts/shared";
 
-// fill this with your actual GitHub info, for example:
 export const gitConfig = {
-  user: "fuma-nama",
-  repo: "fumadocs",
+  user: "adamhake",
+  repo: "eigen",
   branch: "main",
+  /** Where the MDX content lives, relative to the repository root. */
+  contentDir: "apps/tutorial/src/content",
 };
 
 export function baseOptions(): BaseLayoutProps {
