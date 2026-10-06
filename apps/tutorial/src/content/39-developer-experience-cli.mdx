@@ -642,6 +642,8 @@ async function checkRouteDirectory(root: string): Promise<Diagnostic[]> {
 
 Send diagnostics through the overlay's collector from [Part 10](/10-dev-overlay). Two details matter. Eigen's dev server runs in middleware mode ([Part 3](/03-server-side-rendering)), so `server.httpServer` is `null` and there's no `'listening'` event to wait for. And the checks finish long before any browser connects — a broadcast at startup would reach nobody. Part 10's collector solves the second problem already: it buffers events and replays them to each overlay that connects to `/_eigen/dev-ws`.
 
+<DiagnosticsFlowDiagram />
+
 ```typescript title="packages/eigen/plugins/diagnostics.ts"
 import type { Plugin } from "vite";
 import { runHealthChecks } from "../diagnostics/health";
@@ -653,10 +655,13 @@ export function eigenDiagnosticsPlugin(): Plugin {
 
     async configureServer(server) {
       const diagnostics = await runHealthChecks(server.config.root);
-      if (diagnostics.length === 0) return; // Buffered by Part 10's collector and replayed when the overlay connects.
+      if (diagnostics.length === 0) return;
+
+      // Buffered by Part 10's collector and replayed when the overlay connects.
       // (Plugin code runs in Node without Vite's transforms, so call the
       // collector directly rather than devEmit, which relies on import.meta.env.)
-      (globalThis as any).__eigenDevCollector?.emit({
+      const collector = (globalThis as any).__eigenDevCollector;
+      collector?.emit({
         type: "diagnostics",
         timestamp: Date.now(),
         data: { diagnostics },

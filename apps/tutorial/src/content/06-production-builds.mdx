@@ -33,20 +33,7 @@ In production, Vite switches to a completely different mode: **[Rolldown](https:
 
 For a server-rendered framework, we need **two** Rolldown builds — one for the client (browser-targeted, code-split, hashed) and one for the server (Node-targeted, unhashed entry). These are the same two module graphs from [Part 0](/00-the-mental-model#the-two-module-graphs), now producing two output directories instead of two on-demand pipelines. They're connected by the built `index.html` (which already references the hashed client entry) and a manifest file.
 
-```mermaid
-flowchart LR
-    subgraph dev["Development (Part 5)"]
-        DS["Vite dev server"] --> CG["Client graph (on-demand)"]
-        DS --> SG["SSR graph (module runner)"]
-        DS --> DM["plugin middleware<br/>/_eigen/data"]
-    end
-    subgraph prod["Production (this part)"]
-        VB["vite build × 2"] --> DC["dist/client/<br/>(index.html + hashed chunks + manifest)"]
-        VB --> DSV["dist/server/<br/>(entry-server.js)"]
-        DC -- "index.html template" --> H3["server.prod.ts (H3)"]
-        DSV --> H3
-    end
-```
+<DevVsProdBuildDiagram />
 
 ---
 
@@ -312,20 +299,7 @@ Compared to the dev server in [Part 3](/03-server-side-rendering#the-custom-dev-
 
 The data endpoint is the new piece. In dev, [Part 5's plugin middleware](/05-typed-loaders#the-data-endpoint) handled `/_eigen/data` because `configureServer` had a Vite instance whose SSR environment could import `eigen/routes`. Production has no Vite, no plugin, no `configureServer` — but it does have `loadData` exported from the pre-built bundle, which is enough. Same `runLoader` underneath, same JSON contract on the wire, different glue.
 
-```mermaid
-flowchart LR
-    subgraph dev["Dev: Part 5"]
-        D1["Browser"] --> D2["Vite middleware"]
-        D2 --> D3["plugin /_eigen/data"]
-        D3 --> D4["ssr runner.import('eigen/routes')"]
-        D4 --> D5["runLoader(path, routes)"]
-    end
-    subgraph prod["Prod: this part"]
-        P1["Browser"] --> P2["H3 /_eigen/data"]
-        P2 --> P3["loadData(path)"]
-        P3 --> P5["runLoader(path, routes)"]
-    end
-```
+<DataEndpointPortDiagram />
 
 <Callout type="info" title="Why a separate file from `server.ts`?">
 
@@ -376,6 +350,8 @@ grep -l jsonplaceholder dist/client/assets/*.js
 ```
 
 The `posts/[id]` page chunk contains the loader, `fetch("https://jsonplaceholder…")` and all. You might expect tree-shaking to remove it, since the client branch of `eigen/routes` never reads `.loader`. But that branch loads each page with `React.lazy(() => import("/src/pages/posts/[id].tsx"))`. A dynamic `import()` resolves to the module's _namespace object_, and here that object is handed straight to `React.lazy`. Rolldown can't prove which properties of it will be read, so it keeps every export. (Bundlers can tree-shake a dynamic import only when the code destructures specific names right at the call site, such as `import("./x").then(({ default: Page }) => …)`.)
+
+<LazyChunkExportsDiagram />
 
 So in this part, loader code ships to the browser. It never _runs_ there (the client gets data from `/_eigen/data`), but it costs bytes, and it can leak server-side details. Worse, if a loader's file imports a Node-only module (`import { readFile } from "node:fs"`), Vite replaces that module with an empty browser stub and prints a warning ("Module "node:fs" has been externalized for browser compatibility"), and the page chunk carries a broken reference. Removing loaders from the client is a job for the `transform` hook, and that's [Part 7](/07-transform-hook).
 

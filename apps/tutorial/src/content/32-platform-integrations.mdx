@@ -198,6 +198,8 @@ export const loader = defineLoader("/posts/:id", async ({ params }) => {
 
 The import `eigen/db` is a virtual module that the Neon integration plugin provides. It generates different code per environment — WebSocket-pooled connections for Node, HTTP queries for edge. In the client environment, Part 7's transform removes the `loader` export and then the now-unused `eigen/db` import, so the database module never reaches the browser; and if some other client code imports it by mistake, any call throws a clear error.
 
+<DbDriverByEnvironmentDiagram />
+
 ### Drizzle ORM integration
 
 For a richer DX, the integration can expose a Drizzle client:

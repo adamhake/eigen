@@ -5,7 +5,7 @@ import { Tab, Tabs } from "fumadocs-ui/components/tabs";
 import defaultMdxComponents from "fumadocs-ui/mdx";
 import type { MDXComponents } from "mdx/types";
 
-import { Mermaid } from "@/components/mdx/mermaid";
+import * as diagrams from "@/components/diagrams";
 import { TestSection } from "@/components/test-section";
 import { TypeDeepDive } from "@/components/type-deep-dive";
 
@@ -22,7 +22,7 @@ export function getMDXComponents(components?: MDXComponents): MDXComponents {
     Folder,
     TestSection,
     TypeDeepDive,
-    Mermaid,
+    ...diagrams,
     ...components,
   };
 }

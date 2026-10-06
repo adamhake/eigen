@@ -93,6 +93,8 @@ If your app uses [Part 33](/33-authentication-authorization)'s auth, its global 
 
 **Client (after hydration):** a React 19 form action. React calls it inside a transition with the form's `FormData`, which is what makes `useFormStatus` and `useOptimistic` work, and resets the form after a successful submission.
 
+<FormEnhancementDiagram />
+
 ```tsx title="packages/eigen/forms.tsx"
 import type { ComponentProps } from "react";
 import type { ServerFn } from "./server";

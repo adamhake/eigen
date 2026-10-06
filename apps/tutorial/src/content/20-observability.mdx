@@ -303,15 +303,7 @@ We show `renderToString` for brevity; the real pipeline streams (Part 12). With 
 
 The resulting trace looks like:
 
-```
-GET /posts/:id                              [350ms]
-├── eigen.route.match                       [0.2ms]
-├── eigen.middleware                         [15ms]
-│   └── pg.query (verify session)           [12ms]
-├── eigen.loader                            [280ms]
-│   └── pg.query (SELECT * FROM posts)     [275ms]
-└── eigen.render.ssr                        [45ms]
-```
+<RequestSpanTreeDiagram />
 
 Now you can see _exactly_ where the 350ms went: 275ms in the database query, 12ms in session verification, 45ms in React rendering. The `pg.query` spans come from `@opentelemetry/instrumentation-pg`, registered through NodeSDK's `instrumentations` option. They nest under `eigen.loader` and `eigen.middleware` only because those spans are _active_ — with plain `startSpan`, they would all attach to the request span instead.
 

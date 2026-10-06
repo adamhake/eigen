@@ -19,17 +19,7 @@ In a large organization, a single Vite build becomes a bottleneck. The marketing
 
 Module Federation allows each team to build and deploy independently. The "host" application loads "remote" modules at runtime from other deployed applications. Each remote is a separate Vite build with its own deployment pipeline:
 
-```mermaid
-block-beta
-  columns 2
-  block:host:2
-    columns 2
-    Nav["Navigation\n(Host's own component)"]:2
-    Dashboard["Remote: Dashboard\n(Team A's build)\ncdn.a.com/remoteEntry.js"]
-    Marketplace["Remote: Marketplace\n(Team B's build)\ncdn.b.com/remoteEntry.js"]
-    Checkout["Remote: Checkout\n(Team C's build)\ncdn.c.com/remoteEntry.js"]:2
-  end
-```
+<FederationHostDiagram />
 
 Each remote is built, tested, and deployed independently. The host loads them at runtime.
 

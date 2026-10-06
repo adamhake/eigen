@@ -42,23 +42,7 @@ configureServer(server) {
 
 The execution order is:
 
-```mermaid
-flowchart TD
-    A["Incoming HTTP Request"] --> B["1. Pre-middlewares<br/>(added directly in configureServer)"]
-    B --> C["2. Vite Internal Middleware"]
-    C --> C1["CORS, host check, proxy"]
-    C1 --> C2["public/ directory files"]
-    C2 --> C3["Module transform middleware<br/>(.tsx → JS on demand, /@vite/client)"]
-    C3 --> C4["Static files from the project root"]
-    C4 --> C5["HTML fallback: rewrite URL to index.html<br/>(only when appType is 'spa' or 'mpa')"]
-    C5 --> D["3. Post-middlewares<br/>(added in returned function)"]
-    D --> E["4. index.html transform + 404<br/>(only when appType is 'spa' or 'mpa')"]
-    E --> F["Response"]
-
-    style B fill:#4f46e5,color:#fff
-    style D fill:#4f46e5,color:#fff
-    style C fill:#1e1e2e,color:#cdd6f4
-```
+<ViteMiddlewareStackDiagram />
 
 Two details in that picture are easy to get wrong:
 
@@ -293,6 +277,8 @@ app.all("/**", async (event) => { /* ... */ });
 ```
 
 (Add `import type { ApiHandler } from "./packages/eigen/api-types";` at the top of `server.prod.ts`.) The route is the dev middleware's logic re-expressed against a different runtime. The handler lookup becomes a map from the glob instead of a file check and a module-runner import, and the Node `res.writeHead`/`res.end` calls become `Response.json`. H3 tries the more specific `/api/**` route before the `/**` fallback, so API requests never reach the SSR renderer.
+
+<ApiRouteDevProdDiagram />
 
 This gap between dev and prod middleware is why frameworks need **deployment adapters**. [TanStack Start](https://tanstack.com/start) builds for Netlify and Cloudflare with platform-specific Vite plugins (`@netlify/vite-plugin-tanstack-start`, `@cloudflare/vite-plugin`) and uses [Nitro](https://nitro.build)'s `nitro/vite` plugin for other targets such as Node and Vercel. [Remix](https://remix.run)/React Router has its adapter system. [Next.js](https://nextjs.org) bakes the production server into its own runtime. We'll build Eigen's adapters in [Part 17](/17-deployment-adapters).
 

@@ -24,24 +24,7 @@ The SSR module graph targets whatever non-browser environment runs your app. Dur
 
 </Callout>
 
-```mermaid
-sequenceDiagram
-    participant Browser
-    participant H3 as H3 Server
-    participant Vite
-    participant SSR as SSR Environment
-
-    Browser->>H3: GET /posts/42
-    H3->>Vite: Vite middleware (no match, passes through)
-    H3->>Vite: vite.transformIndexHtml(url, template)
-    Vite-->>H3: HTML with /@vite/client injected
-    H3->>Vite: ssrEnv.runner.import('/src/entry-server.tsx')
-    Vite->>SSR: resolveId → load → transform
-    SSR-->>H3: { render }
-    H3->>SSR: render('/posts/42')
-    SSR-->>H3: { html, status, data }
-    H3-->>Browser: Complete HTML + __EIGEN_DATA__
-```
+<SsrRequestSequenceDiagram />
 
 ---
 
@@ -96,6 +79,8 @@ export function matchRoute(pathname: string, routes: RouteDefinition[]): RouteMa
 ## Safe data serialization
 
 The server will also embed each page's loader data in the HTML as an inline `<script>`, so the client can pick it up during hydration. Dropping raw `JSON.stringify` output into a `<script>` is a classic injection bug: if any string in the data contains `</script>`, the browser ends the script element right there and parses whatever follows as HTML. Loader data routinely contains user-generated text, so this has to be handled once, in the framework:
+
+<ScriptEscapingDiagram />
 
 ```typescript title="packages/eigen/serialize.ts"
 const SCRIPT_ESCAPES: Record<string, string> = {

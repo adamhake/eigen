@@ -191,6 +191,8 @@ serve(app, { port: 3000 });
 
 Because Eigen chose H3 back in Part 3 and Web streams in Part 12, the code is Web-standard on both sides — `Request` in, `renderToReadableStream`, `Response` out. What differs is everything _around_ that code: the Node server is a long-running process that calls `serve()` on a port, while a Worker is just a module with a `fetch` export that the platform invokes per request. And the two are built differently: the edge environment resolves `react-dom/server` and every other dependency through the `workerd`/`worker`/`edge-light` conditions and bundles them all (`noExternal: true`), while the `ssr` build resolves the `node` builds and leaves `node_modules` external. Same source, different resolve conditions and bundling — that's what an environment is.
 
+<EdgeVsNodeBuildDiagram />
+
 ---
 
 ## Environment-polymorphic types

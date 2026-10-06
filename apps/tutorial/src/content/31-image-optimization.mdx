@@ -28,6 +28,8 @@ concepts:
 
 For images imported from the project's `src/` directory, the Vite plugin processes them with `sharp`. (Files in `public/` are copied verbatim and never go through the module graph, so they can't be optimized this way.) The plugin writes each variant to a cache directory and then imports it with Vite's standard `?url` suffix, so Vite's own asset pipeline handles hashing, `base`, dev serving, and copying into `dist/client/assets` — and the client and SSR builds agree on every URL:
 
+<ImagePipelineDiagram />
+
 ```typescript title="plugins/eigen-images.ts"
 import type { Plugin } from "vite";
 import { createHash } from "node:crypto";

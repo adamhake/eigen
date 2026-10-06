@@ -59,17 +59,7 @@ Add a test script to `package.json`:
 
 A framework's test suite naturally falls into four layers:
 
-```mermaid
-graph TD
-    A["E2E Tests\n(Playwright — browser renders correct HTML)"] --> B["Integration Tests\n(full SSR render pipeline — loaders + middleware + components)"]
-    B --> C["Plugin Tests\n(resolveId / load / transform with real Vite context)"]
-    C --> D["Unit Tests\n(pure functions — fileToRoute, matchRoute, schemas)"]
-
-    style D fill:#10b981,color:#fff,stroke:#059669,stroke-width:2px
-    style C fill:#3b82f6,color:#fff,stroke:#2563eb,stroke-width:2px
-    style B fill:#8b5cf6,color:#fff,stroke:#7c3aed,stroke-width:2px
-    style A fill:#f59e0b,color:#fff,stroke:#d97706,stroke-width:2px
-```
+<TestingPyramidDiagram />
 
 | Layer           | What it tests                                                 | Speed       | Example                                                                         |
 | --------------- | ------------------------------------------------------------- | ----------- | ------------------------------------------------------------------------------- |
@@ -213,6 +203,8 @@ describe("eigen-routes plugin (integration)", () => {
   });
 });
 ```
+
+<TestingBuildOutputsDiagram />
 
 The fixture's `posts/[id].tsx` exports a loader that returns the string `'FIXTURE_LOADER_MARKER'`, which gives the test something unambiguous to search for. (Searching for a word like `lazy` doesn't work: React's own source contains it, so it is in every client bundle.) The assertions target what the plugins actually generate — separate dynamic chunks for lazy pages on the client, and the loader surviving only on the server ([Part 7](/07-transform-hook) strips it from the client).
 

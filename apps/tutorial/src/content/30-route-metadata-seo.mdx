@@ -368,6 +368,8 @@ Both are written to the client output directory during the build. Sitemap `<loc>
 
 With nested layouts (Part 13), metadata from parent layouts merges with child page metadata. A root layout might set the site name and default OG image; a page overrides the title and description:
 
+<MetadataMergeDiagram />
+
 ```typescript
 // src/pages/layout.tsx — root layout metadata (layouts export static metadata)
 export const metadata: RouteMetadata = {

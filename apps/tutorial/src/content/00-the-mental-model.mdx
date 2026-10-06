@@ -40,6 +40,8 @@ This is fundamentally different from webpack, which eagerly bundles your entire 
 
 **In production**, Vite is a pre-configured [Rolldown](https://rolldown.rs) build. Rolldown is a Rust-based bundler ([Rollup](https://rollupjs.org)-compatible) that bundles everything into optimized chunks with tree-shaking, code-splitting, and minification. The dev server doesn't exist. Rolldown takes over entirely, and the output is a set of static files (JavaScript bundles, CSS, assets) ready to be served by any HTTP server.
 
+<ViteDualityDiagram />
+
 This duality is the central tension of framework development with Vite. Your framework plugin has to work in both modes, and behavior that works in dev (lazy, on-demand transformation) may need completely different handling in production (eager, ahead-of-time bundling). A virtual module that dynamically discovers routes by scanning the filesystem works identically in both modes — but a dev server middleware that handles API routes has no production equivalent at all. The framework has to bridge that gap.
 
 ---
@@ -101,13 +103,7 @@ Vite's plugin system is based on the [Rollup plugin interface](https://rollupjs.
 
 Every module request flows through three hooks:
 
-```mermaid
-flowchart TD
-    A["Browser requests /src/App.tsx"] --> B["resolveId()"]
-    B -- "What file does this import point to?" --> C["load()"]
-    C -- "What is the raw content of this file?" --> D["transform()"]
-    D -- "Transform the source code (TSX → JS, etc.)" --> E["Browser gets transformed ESM"]
-```
+<PluginPipelineDiagram />
 
 **`resolveId(source, importer)`** takes an import specifier (like `'./App'` or `'react'`) and the module that imported it. It returns the absolute path or ID of the resolved module. Most of the time, Vite's default resolution handles this (it follows Node's resolution algorithm for bare specifiers and standard path resolution for relative imports). But a plugin can intercept this to redirect imports — to different files, to virtual modules, or to externalized packages.
 
@@ -250,6 +246,8 @@ In a server-rendered application, Vite maintains two separate module graphs simu
 **The SSR module graph** serves modules to Node.js (or another server runtime). It uses Node-targeted resolve conditions (so `import 'react-dom/server'` resolves correctly), and executes modules in-process via Vite's **ModuleRunner** (`server.environments.ssr.runner.import()`) instead of serving them over HTTP. (Older guides use `server.ssrLoadModule()`, the legacy API the runner replaces.)
 
 When your plugin's hooks run, the same plugin instance handles both graphs. A single `resolveId` or `transform` call needs to know which environment it's operating in, because it may need to generate different code for each. For example, a route plugin might generate `React.lazy(() => import('./Page'))` for the client (enabling code splitting) but `import Page from './Page'` for the server (synchronous import, no Suspense boundary needed).
+
+<EnvironmentSplitDiagram />
 
 This "same plugin, different output" pattern is central to everything we'll build. The plugin is the single source of truth. It generates the right code for the right environment.
 

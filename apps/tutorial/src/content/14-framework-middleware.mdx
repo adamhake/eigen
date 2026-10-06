@@ -18,18 +18,6 @@ In [Part 8](/08-dev-middleware), we used `configureServer` to add Connect-style 
 
 Framework middleware is different. It runs inside the framework's routing pipeline — _after_ route matching but _before_ loaders and rendering. It receives a web-standard `Request` plus the matched route's params, it runs identically in dev and production, and it can inject typed context that flows through to loaders.
 
-```mermaid
-flowchart TD
-    A["HTTP Request\n(page or /_eigen/data)"] --> B["Vite static asset handling\n(CSS, JS, images)"]
-    B -->|"not a static asset"| C["Route matching"]
-    C -->|"matched route found"| D["Framework middleware chain\n(global, then per-route)"]
-    D -->|"context accumulated,\nno Response returned or redirect thrown"| E["Layout loaders → Page loader"]
-    E --> F["Render HTML or return JSON"]
-    D -->|"Response / redirect"| G["Short-circuit"]
-
-    style D fill:#4f46e5,color:#fff,stroke:#6366f1,stroke-width:2px
-```
-
 ---
 
 ## The middleware type system
@@ -349,7 +337,9 @@ The augmentation is a claim, not a proof: nothing checks that `src/middleware.ts
 
 ## The middleware execution engine
 
-Middleware has to run before _every_ loader call — not just the HTML render. In [Part 5](/05-typed-loaders#the-data-endpoint), client-side navigations fetch loader data from `/_eigen/data`, which called `runLoader` directly. If middleware only ran inside the page render, an anonymous user could skip the auth guard by requesting `/_eigen/data?path=/dashboard`. So both paths go through one function, `runRoute`, which replaces `runLoader`. It lives in the framework package next to the other runtime modules (register `eigen/run-route` in `resolve.alias` and tsconfig `paths`):
+Middleware has to run before _every_ loader call — not just the HTML render. In [Part 5](/05-typed-loaders#the-data-endpoint), client-side navigations fetch loader data from `/_eigen/data`, which called `runLoader` directly. If middleware only ran inside the page render, an anonymous user could skip the auth guard by requesting `/_eigen/data?path=/dashboard`. So both paths go through one function, `runRoute`, which replaces `runLoader`. It lives in the framework package next to the other runtime modules (register `eigen/run-route` in `resolve.alias` and tsconfig `paths`).
+
+<RunRoutePipelineDiagram />
 
 ```typescript title="packages/eigen/run-route.ts"
 import type { RouteMatch } from "eigen/match-route";

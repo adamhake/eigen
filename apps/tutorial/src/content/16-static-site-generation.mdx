@@ -240,6 +240,8 @@ Add `eigenSSG()` to the plugin array returned by `eigen()`, after the main `eige
 
 ### Why `buildApp` instead of `generateBundle` or `closeBundle`
 
+<SsgBuildOrderDiagram />
+
 - **`generateBundle`** runs _inside_ one environment's build, before its files are written. The server bundle we need to import doesn't exist on disk yet.
 - **`closeBundle`** runs after an environment's files are written — but once _per environment build_, so the hook fires after the client build too, before the server exists. Worse, `closeBundle` is a _parallel_ hook: if the SSG plugin and a deployment adapter both use it, Rolldown starts them concurrently, and the adapter can copy `dist/client` while pages are still being written. Plugin order and `enforce: 'post'` don't fix that.
 - **`buildApp` with `order: 'post'`** runs once per `vite build`, after the framework's `order: 'pre'` hook has built every environment. Vite awaits each `buildApp` hook in turn, in plugin order — so "SSG, then adapter" is a guarantee rather than a race.

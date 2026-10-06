@@ -140,6 +140,8 @@ hotUpdate({ type, file }) {
 },
 ```
 
+<HmrHotUpdateDiagram />
+
 Because the hook runs once for each environment, the same five lines keep both the browser and the server-side runner in sync. Returning `[]` prevents a double update: without it, deleting a page would also make Vite propagate an update from the deleted module up through its importers.
 
 <Callout type="info" title="handleHotUpdate is the legacy hook">
@@ -163,17 +165,7 @@ Our framework maintains two parallel structures that need to stay in sync:
 
 When the filesystem changes, both must update:
 
-```mermaid
-flowchart TD
-    A["Developer creates src/pages/users/[name].tsx"] --> B["Chokidar fires 'add'"]
-    B --> C["Watcher (debounced)\nrescans pages directory"]
-    B --> E["hotUpdate type: 'create'\n(once per environment)"]
-    C --> D["generateRouteDeclarations()\nWrites eigen-routes.d.ts"]
-    E --> G["invalidateModule(virtualModule)\n+ full-reload"]
-    D --> F["TS language server picks up\nnew RoutePaths union"]
-    G --> I["Browser reloads, SSR runner\nre-imports the new route table"]
-    F --> H["IDE shows autocomplete for\n'/users/:name'"]
-```
+<HmrTwoUpdatePathsDiagram />
 
 This creates a feedback loop: the developer adds a file, and within seconds, the IDE offers autocomplete for the new route's path and params. This is the same cycle that [TanStack Router](https://tanstack.com/router)'s `@tanstack/router-plugin/vite` implements when it watches the filesystem and regenerates `routeTree.gen.ts`.
 

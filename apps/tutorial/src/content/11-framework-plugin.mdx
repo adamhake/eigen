@@ -220,6 +220,8 @@ The handler receives a `builder` object with `builder.environments` — a record
 
 Hooks run in a defined sequence: handlers with `order: 'pre'` (or no order) first, then the `builder.buildApp` config option, then handlers with `order: 'post'`. A framework builds in `'pre'`; anything that post-processes the output — static pre-rendering ([Part 16](/16-static-site-generation)) or a deployment adapter ([Part 17](/17-deployment-adapters)) — uses `order: 'post'` and finds both builds already on disk.
 
+<BuildAppOrderDiagram />
+
 This is how [TanStack Start](https://tanstack.com/start) orchestrates its builds. When TanStack Start migrated from Vinxi to native Vite at version 1.121.0, Vinxi's `vinxi build` command (which managed multiple Vite instances) was replaced by Vite's environment-aware app build, coordinating multiple environments within a single `vite build`. The config file moved from `app.config.ts` to `vite.config.ts`.
 
 In later parts, when we add edge runtimes (Part 19) and RSC (Part 21), the `buildApp` handler will coordinate three or four environments — but the pattern is the same: sequential builds, ordered by dependency, sharing the same plugin pipeline.
@@ -275,22 +277,7 @@ These declarations tell TypeScript about virtual modules — modules that exist 
 
 ### How the layers connect
 
-```mermaid
-flowchart LR
-  subgraph L1["Layer 1 (Static)\nnpm package"]
-    A1["PageProps&lt;TPath, TData&gt;"]
-    A2["RouteParams&lt;TPath&gt;"]
-    A3["LoaderFn&lt;TPath&gt;"]
-  end
-  subgraph L2["Layer 2 (Generated)\nnode_modules/.eigen"]
-    B1["RoutePaths = '/' |\n'/about' | '/posts/:id'"]
-    B2["RouteParamsMap = {\n'/': Record&lt;never&gt;\n'/posts/:id': { id }\n}"]
-  end
-  subgraph L3["Layer 3 (Virtual)\nPlugin load() hook"]
-    C1["declare module\n'eigen/routes' {\nexport const routes:\nRouteDefinition[]\n}"]
-  end
-  L1 <--> L2 <--> L3
-```
+<TypeLayersDiagram />
 
 <TypeDeepDive title="TypeScript: How declaration files (`.d.ts`) work">
 

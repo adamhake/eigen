@@ -142,6 +142,8 @@ The schema does three things simultaneously: it validates that the data has the 
 
 Notice the schema runs _twice_ on the same data: once on the server (the loader parses the API's input shape into the output shape, so SSR renders a real `Date`), and once on the client (the `parse` export turns the serialized JSON back into the output shape). That only works if the schema's output, after a trip through JSON, is valid _input_ again — here a `Date` serializes to an ISO string, which `z.string()` accepts. Keep loader schemas "JSON round-trippable" and the double parse is free.
 
+<ValidationBoundaryDiagram />
+
 Why two exports instead of one object? Part 7's transform strips the `loader` export statement from the client build and then prunes the imports it no longer references. If `loader` and `parse` came from one shared object (`export const { loader, parse } = ...`), the loader function — with its database imports — would stay referenced on the client. Separate statements give the transform a clean cut.
 
 <TypeDeepDive title="Concept: Parse, don't validate">

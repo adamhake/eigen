@@ -261,6 +261,8 @@ if (!match || match.route.navigation === "document") return; // don't intercept
 
 Intercepted routes keep using Part 23's data preloading on hover — the SPA equivalent of a prerender.
 
+<NavigationModesDiagram />
+
 ### Generating rules from the route tree
 
 The framework plugin knows all routes, so it can emit speculation rules for exactly the document-navigation routes. Static ones are listed by URL; dynamic ones become URL patterns:

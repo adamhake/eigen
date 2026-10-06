@@ -52,14 +52,7 @@ This is the "server-only code leaking into client bundles" problem. Every framew
 
 Our solution follows the first model. A `transform` hook removes the server-only exports, _and the imports only they depend on_, from each page file, but only when the file is being processed for the client environment. The SSR environment sees the file unchanged.
 
-```mermaid
-flowchart LR
-    SRC["src/pages/dashboard.tsx<br/>(loader + db import + Dashboard)"]
-    SRC --> CT["transform (client env)<br/>strip loader, prune its imports"]
-    SRC --> ST["ssr env<br/>plugin not applied"]
-    CT --> CB["client bundle<br/>only Dashboard ships"]
-    ST --> SB["server bundle<br/>loader + db + Dashboard"]
-```
+<StripLoaderEnvironmentsDiagram />
 
 ---
 
@@ -327,6 +320,8 @@ The visitor pattern walks every node in a tree and calls your code on each one. 
 ### Why `enforce: 'pre'`
 
 Vite runs plugins in a fixed order: aliases, then user plugins with `enforce: 'pre'`, then Vite's core plugins, then user plugins without `enforce`, then build plugins, then `enforce: 'post'` plugins. One of the core plugins is Vite's built-in Oxc transform, which strips TypeScript and compiles JSX. Without `enforce: 'pre'`, our plugin would receive JavaScript that has already been through it, no matter where we put it in the `plugins` array. That's workable (the AST would just look different), but `pre` gives us two guarantees. First, we see the source the developer wrote, which is what the error messages and tests are written against. Second, anything that runs after us, including the Oxc transform, React Fast Refresh, and Rolldown's tree-shaking, never sees the loader or its imports at all.
+
+<PluginOrderDiagram />
 
 ### `applyToEnvironment` — environment-scoped plugins
 

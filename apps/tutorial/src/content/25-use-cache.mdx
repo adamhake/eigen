@@ -137,6 +137,8 @@ export default async function PostPage(...__args) { return __cache_run("PostPage
   </Step>
 </Steps>
 
+<CacheRunDiagram />
+
 ### The transform plugin
 
 A regex can't do this safely — it has to find the matching closing brace of each function and cope with `export default`, arrow functions and nested functions. Vite 8 exports Rolldown's parser as `parseAst`, which gives us an ESTree AST; `magic-string` makes the edits and produces a sourcemap. The plugin runs after Vite's own Oxc transform, so TypeScript and JSX are already gone by the time it sees the code:

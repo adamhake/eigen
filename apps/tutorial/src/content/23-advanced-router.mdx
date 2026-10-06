@@ -154,6 +154,8 @@ return `${imports.join("\n")}\n\nexport const routes = [\n${entries.join(",\n")}
 
 Now `/posts/new` always matches before `/posts/:id`: the first segments tie (both static), and at the second segment static (`new`) outranks dynamic (`:id`).
 
+<RouteRankingDiagram />
+
 ---
 
 ## Type-safe search params

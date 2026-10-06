@@ -224,6 +224,8 @@ function DashboardAnalyticsRoute(props) {
 }
 ```
 
+<BoundaryNestingDiagram />
+
 An error boundary only catches errors in its _children_, so a segment's `error.tsx` can never catch an error thrown by the layout of that same segment — `DashboardLayout` failing is handled by `RootErrorBoundary`, and `RootLayout` failing can only be handled by a boundary outside it. That's why the framework adds a last-resort `GlobalErrorBoundary` (Next.js exposes the same slot as `global-error.tsx`); since it replaces the root layout, its fallback must render a complete page shell on its own.
 
 ---
@@ -324,6 +326,8 @@ The generated route component renders each boundary with `key={pathname}`. Witho
 Loader errors happen _before_ the component renders — the data fetch failed. Render errors happen _during_ rendering — a component threw while rendering (null reference, bad data shape, etc.).
 
 The framework distinguishes these. There's an important catch on the server: **React's error boundaries don't run during server rendering.** `getDerivedStateFromError` is a client-side mechanism — when a component throws inside `renderToString`, the whole call throws. So the SSR pipeline handles both phases itself and hands the result to the boundary as `initialError`:
+
+<SsrErrorPathsDiagram />
 
 ```tsx title="entry-server.tsx"
 import { runRoute } from "eigen/run-route";

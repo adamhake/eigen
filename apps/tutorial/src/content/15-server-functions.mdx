@@ -61,24 +61,7 @@ From the developer's perspective, `getUsers` is just an async function. But the 
 
 This is the architecture behind TanStack Start's `createServerFn`, React's `"use server"` Server Functions (as used by Next.js), and SolidStart's `"use server"` functions. Let's build it.
 
-```mermaid
-flowchart LR
-    subgraph Source["Source Code"]
-        A["createServerFn()\n  .handler(async ({ data }) => {\n    return db.query(...)\n  })"]
-    end
-
-    subgraph Server["Server Bundle"]
-        B["Original builder chain\n(db.query runs on the server)"]
-    end
-
-    subgraph Client["Client Bundle"]
-        C["createServerFnStub('a3f2c891')\n→ fetch('/_eigen/fn/a3f2c891',\n  { method: 'POST', body })"]
-    end
-
-    A -->|"transform hook\n(ssr env)"| B
-    A -->|"transform hook\n(client env)"| C
-    C -.->|"HTTP at runtime"| B
-```
+<ServerFnTransformDiagram />
 
 ---
 
@@ -481,6 +464,8 @@ The client bundle has zero server code. The `db` import is gone, and so is `eige
 ## The RPC endpoint
 
 The endpoint is plain web-standard code, so dev and production share it. It's the most security-sensitive piece of the framework: it's an HTTP entry point that executes server code with caller-supplied arguments.
+
+<ServerFnRpcDiagram />
 
 ```typescript title="packages/eigen/server-fn-endpoint.ts"
 import { asClientRedirect, executeMiddleware, RedirectResponse, type MiddlewareFn } from "./middleware";

@@ -147,6 +147,8 @@ export default defineConfig({
 
 Now `import eigen from 'eigen/plugin'` resolves through Node's package resolution — pnpm symlinks `apps/demo/node_modules/eigen` to `packages/eigen` — the same way it will work for end users after publishing.
 
+<WorkspaceResolutionDiagram />
+
 Because `exports` points at `dist/`, the package has to be built before the app can import it. In development, `tsdown --watch` keeps `dist/` current, and Turborepo (below) starts it alongside Vite. Since the workspace package is a symlink outside `node_modules`, Vite treats it as source: it watches `dist/` and isn't pre-bundled.
 
 <Callout type="info" title="Why workspaces over path aliases?">
@@ -577,6 +579,8 @@ This workflow:
 1. Runs the full build/typecheck/test/lint pipeline
 2. If there are pending changesets → creates a "chore: release" PR that bumps versions and updates changelogs
 3. When that PR is merged → publishes the updated packages to npm, with provenance
+
+<ReleasePipelineDiagram />
 
 ---
 

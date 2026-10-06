@@ -297,6 +297,8 @@ But look closely — you'll also see a **page reload**, not a hot update. That's
 
 The reload is fast enough that it looks instant, but the distinction matters. Here's what happened under the hood:
 
+<HmrPropagationDiagram />
+
 1. Vite's file watcher detected the save.
 2. Vite found the changed module in the module graph.
 3. Vite walked up the dependency tree looking for an **HMR boundary** — a module that has registered an [`import.meta.hot.accept()`](https://vite.dev/guide/api-hmr#hot-accept) handler.

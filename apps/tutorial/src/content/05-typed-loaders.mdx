@@ -146,6 +146,8 @@ export function defineLoader<TPath extends keyof RouteParamsMap, TData>(
 
 The first generic parameter `TPath` is constrained to `keyof RouteParamsMap` — the union of all valid route paths from the declarations our plugin generates in [Part 2](/02-route-discovery-plugin#type-declarations). TypeScript validates that the path string is a known route. The second generic parameter `TData` is inferred from the function's return type.
 
+<LoaderTypeFlowDiagram />
+
 `defineLoader` does nothing at runtime — it returns `fn` unchanged. The `_path` argument is consumed only by the type system, hence the underscore prefix (a [TypeScript convention](https://www.typescriptlang.org/docs/handbook/variable-declarations.html#destructuring) for "intentionally unused"). All of the safety lives in the call signature.
 
 <TypeDeepDive title="TypeScript: Generic constraints with `extends keyof`">
@@ -272,22 +274,7 @@ Each row builds on the one above it. Eigen ships both Levels 2 and 3 — `Loader
 
 The standard framework solution is to mirror the loader pipeline as a JSON endpoint. The first page load gets data through HTML (one round-trip, no extra request); subsequent navigations get it through `fetch`. [Next.js](https://nextjs.org)'s Pages Router wires this up at `/_next/data/<buildId>/<path>.json`. React Router v7 (and Remix with Single Fetch) requests the route URL with a `.data` suffix, e.g. `/posts/2.data`; older Remix used a `?_data=` query parameter. We'll use `/_eigen/data?path=...`.
 
-```mermaid
-flowchart LR
-    subgraph initial["Initial load (server-rendered)"]
-        A["GET /posts/1"] --> B["loader()"]
-        B --> C["renderToString()"]
-        B --> D["__EIGEN_DATA__"]
-        C --> E["HTML"]
-        D --> E
-    end
-    subgraph nav["Client navigation (after hydration)"]
-        F["Link click → pushState"] --> G["fetch /_eigen/data?path=/posts/2"]
-        G --> H["loader()"]
-        H --> I["JSON response"]
-        I --> J["setData → re-render"]
-    end
-```
+<LoaderDataFetchDiagram />
 
 ### A loader runner
 

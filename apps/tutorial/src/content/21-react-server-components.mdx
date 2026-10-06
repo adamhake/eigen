@@ -48,15 +48,7 @@ async function PostPage({ params }: { params: { id: string } }) {
 
 RSC requires three environments, each with different module resolution:
 
-```mermaid
-flowchart TD
-    RSC["<b>rsc environment</b> (react-server condition)\n- Runs server components\n- Can access databases, filesystems, secrets\n- Produces RSC payload (serialized React tree)\n- Cannot use useState, useEffect, event handlers"]
-    SSR["<b>ssr environment</b> (node/workerd condition)\n- Consumes RSC payload\n- Renders to HTML string/stream for initial load\n- Runs client components for SSR"]
-    Client["<b>client environment</b> (browser)\n- Consumes RSC payload for hydration\n- Only loads 'use client' component code\n- Handles interactivity (events, state, effects)"]
-
-    RSC -- "RSC payload (serialized stream)" --> SSR
-    SSR -- "HTML + RSC payload" --> Client
-```
+<RscEnvironmentsDiagram />
 
 <Callout type="info" title="The RSC environment">
   The `rsc` environment is the critical addition. It uses the `react-server` export condition, which gives it a version
@@ -185,6 +177,8 @@ export const LikeButton = $$ReactServer.registerClientReference(
 ```
 
 The SSR and client environments import the _actual_ component code. The RSC environment only sees a reference marker. This is the mechanism that keeps server-only code (database imports, API secrets) out of the client bundle — not through a `transform` hook stripping code (our approach in Part 7), but through entirely separate module graphs that resolve the same import differently.
+
+<RscClientReferenceDiagram />
 
 ---
 

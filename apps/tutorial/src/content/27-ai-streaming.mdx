@@ -197,6 +197,10 @@ export function createStreamingServerFnStub(id: string) {
 
 ### The endpoint: async iterators become SSE
 
+The whole path, from the generator on the server to the hook in the browser:
+
+<SseStreamDiagram />
+
 Part 15's `handleServerFnRequest` runs in dev (through the module runner) and in production (mounted on the H3 server). It gets one branch: if the function returned an async iterable, respond with an event stream instead of JSON. Each chunk becomes a `data:` event; the end of the stream is an explicit `done` event, so the client can tell "finished" from "connection dropped":
 
 ```typescript title="packages/eigen/server-fn-endpoint.ts (change)"

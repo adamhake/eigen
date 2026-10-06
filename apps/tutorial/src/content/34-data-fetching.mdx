@@ -29,6 +29,8 @@ Our loaders from Part 5 call `fetch` or query a database directly. This works, b
 
 Two jobs belong to the server-side `fetch` that loaders use: deduplicating identical GETs within one request, and forwarding the user's credentials to _our own_ APIs. Both depend on the incoming request, so the framework creates a fresh fetch per request rather than keeping a module-level cache (a module-level `Map` would be shared by every concurrent request in the process — one user's response could be served to another):
 
+<FetchDedupeDiagram />
+
 ```typescript title="packages/eigen/fetch.ts"
 export type Fetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
@@ -121,20 +123,7 @@ Add `dataMiddleware` to the global list in `src/middleware.ts`. Now two loaders 
 
 ## Parallel loader execution
 
-```mermaid
-gantt
-    title Waterfall vs Parallel Loader Execution
-    dateFormat X
-    axisFormat %Lms
-    section Sequential
-        Root layout loader    :a1, 0, 200
-        Dashboard layout loader :a2, after a1, 200
-        Page loader           :a3, after a2, 200
-    section Parallel
-        Root layout loader    :b1, 0, 200
-        Dashboard layout loader :b2, 0, 200
-        Page loader           :b3, 0, 200
-```
+<LoaderWaterfallDiagram />
 
 Nested layouts create a loader hierarchy. Running the loaders one after another mirrors the component nesting, but layout loaders are usually independent — the root layout's user data doesn't depend on the dashboard layout's metrics data.
 
@@ -262,6 +251,8 @@ Part 7's transform strips `loader` from the client bundle; `postQuery`, `prefetc
 ### The SSR → client handoff
 
 On the server, the app renders inside a `QueryClientProvider` for the request's client — `useQuery` needs one, even when the data is already cached. The cache is then dehydrated and embedded next to the session from Part 33:
+
+<QueryHandoffDiagram />
 
 ```tsx title="entry-server.tsx"
 import { QueryClientProvider, dehydrate } from "@tanstack/react-query";

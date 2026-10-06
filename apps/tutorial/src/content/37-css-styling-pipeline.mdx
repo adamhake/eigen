@@ -57,6 +57,8 @@ The framework adds value in the places where build tooling ends and runtime beha
 
 When Vite builds a production app, it emits a **manifest** that maps each module to its CSS dependencies. During SSR, the framework uses this manifest to figure out which stylesheets a given page needs, then inlines the critical ones in the `<head>` — so the page renders styled on first paint.
 
+<CssManifestFlowDiagram />
+
 ### The SSR manifest
 
 [Part 6](/06-production-builds)'s `.vite/manifest.json` maps _entry and chunk_ files to their outputs. For per-module CSS lookup, Vite can also emit an SSR manifest — but only when you ask for it on the client build:

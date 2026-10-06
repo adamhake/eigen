@@ -22,6 +22,8 @@ Our route plugin has three jobs:
 
 3. **Generate TypeScript declarations** — Write a `.d.ts` file that tells TypeScript about all known route paths and their parameter types, so the `Link` component and loaders get full type safety.
 
+<RouteCodegenDiagram />
+
 This three-part pattern — filesystem scan → runtime JavaScript → type declarations — is the core of every typed framework's routing system. [TanStack Router](https://tanstack.com/router) does it with `routeTree.gen.ts`. [Next.js](https://nextjs.org) does a version of it internally (though with less type exposure). We're going to build it from scratch.
 
 ---
@@ -353,6 +355,8 @@ export const routes = [
 Why `import * as` instead of `import Page0, { loader as loader0 }`? Most pages don't export a loader, and a _named_ import of a missing export is a hard error in ESM. Vite's dev runner happens to tolerate it, but a production build with Rolldown fails with `[MISSING_EXPORT] "loader" is not exported by "src/pages/About.tsx"`. A property read on a namespace object is just `undefined` when the export doesn't exist. (Rolldown still prints an `IMPORT_IS_UNDEFINED` warning for those pages during `vite build` — it's informational, and exactly the behaviour we want.) Later parts read further optional exports the same way.
 
 **`configureServer`** listens for page files being added (`add`) or deleted (`unlink`) — a rename fires both. Editing an existing page is _not_ a structural change, so it's left to normal HMR. On a structural change, it regenerates the type declarations and invalidates the virtual module in each environment's module graph (`server.environments.client.moduleGraph` and `server.environments.ssr.moduleGraph`), since each environment has its own copy of `eigen/routes`. Then `server.environments.client.hot.send({ type: 'full-reload' })` tells the browser to refresh, since the route table has changed. (We don't need to add `src/pages` to the watcher: Vite already watches everything under the project root.)
+
+<RouteWatcherDiagram />
 
 ---
 

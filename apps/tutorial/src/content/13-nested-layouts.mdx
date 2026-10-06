@@ -332,6 +332,8 @@ export async function resolveRouteData(data: RouteData): Promise<RouteData> {
 }
 ```
 
+<LayoutLoadersDiagram />
+
 ### Parallel vs. sequential loader execution
 
 The obvious implementation loops over `route.layouts` and awaits each loader in turn, parent → child. That makes the response time the _sum_ of every loader in the stack. Layout loaders don't depend on each other's results, so `loadRouteData` starts them all at once with `Promise.all` — the response time becomes the _slowest_ loader instead.
@@ -420,6 +422,8 @@ Now trace a navigation from `/dashboard/settings` to `/dashboard/analytics` thro
 | 0     | Provider `'/'` → `layout0.component`          | Provider `'/'` → `layout0.component`          | Same type and key — **kept** |
 | 1     | Provider `'/dashboard'` → `layout3.component` | Provider `'/dashboard'` → `layout3.component` | Same type and key — **kept** |
 | 2     | `SettingsPage`                                | Provider `'/dashboard/analytics'` → …         | Different type — replaced    |
+
+<LayoutPersistenceDiagram />
 
 Only the part of the tree below the shared layouts changes. That works _because_ the layout objects are shared module-level constants: `layout3.component` is the same function for every `/dashboard/*` route.
 

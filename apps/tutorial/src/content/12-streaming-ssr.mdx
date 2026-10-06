@@ -22,19 +22,7 @@ Streaming SSR flips this model. React sends the HTML **progressively**:
 2. **Suspense fallbacks** are rendered as placeholder HTML where slow content will appear.
 3. As each data dependency resolves, React streams the finished HTML plus a small inline `<script>` that swaps it into the correct placeholder. (Hydration is separate — the client React app does that once its JavaScript runs.)
 
-```mermaid
-sequenceDiagram
-    participant Browser
-    participant Server
-
-    Browser->>Server: GET /dashboard
-    Server-->>Browser: Shell HTML (nav, layout, fallbacks)
-    Note over Browser: Renders immediately —<br/>user sees layout + spinners
-    Server-->>Browser: <script> injects Stats panel
-    Note over Browser: Stats appear
-    Server-->>Browser: <script> injects Orders table
-    Note over Browser: Orders appear
-```
+<StreamingTimelineDiagram />
 
 The browser starts rendering within milliseconds. Slow data arrives incrementally. This is the architecture that Next.js App Router and Remix both use under the hood.
 
@@ -314,6 +302,8 @@ export async function renderStream(
 ```
 
 `flush` is the important detail. It runs exactly once, after React closes its stream, and it can still enqueue output — so `htmlAfter` always lands _after_ the last Suspense chunk, and nothing is ever written after the stream ends.
+
+<StreamAssemblyDiagram />
 
 The data script goes in `flush` too, and that's deliberate. By the time React finishes, every deferred promise has resolved, so `resolveDeferred` produces the complete data without waiting. And the client entry is a `<script type="module">`, which the browser only runs after the whole document has been parsed — so `window.__EIGEN_DATA__` is always in place, with the orders already filled in, before `hydrateRoot` runs. `serializeForScript` (from [Part 3](/03-server-side-rendering)) escapes `<`, `>`, `&`, and the U+2028/U+2029 line separators, so a loader string containing `</script>` can't break out of the tag.
 

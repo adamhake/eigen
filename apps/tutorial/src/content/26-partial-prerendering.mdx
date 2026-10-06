@@ -18,21 +18,7 @@ Throughout this series, we've treated SSG ([Part 16](/16-static-site-generation)
 
 Partial Prerendering eliminates the choice. A single page can be _both_: the layout, navigation, and cacheable content are pre-rendered at build time (the "static shell"), while personalized or frequently-changing content is streamed at request time (the "dynamic holes").
 
-```mermaid
-block-beta
-  columns 2
-  block:shell:2
-    columns 2
-    Nav["Navigation"] Sidebar["Sidebar"]
-    block:content:2
-      columns 1
-      Title["Product Title & Description\n(Cached — 'use cache')"]
-      Price["Loading price...\n(Dynamic hole — Suspense)"]
-      Reviews["Loading reviews...\n(Dynamic hole — Suspense)"]
-    end
-    Footer["Footer (Static)"]:2
-  end
-```
+<PprShellDiagram />
 
 The browser receives the shell HTML immediately — it's a file the server already has. The dynamic holes show their Suspense fallbacks. Then, in the _same_ response, the server streams the resolved content into those holes — the same streaming mechanism from [Part 12](/12-streaming-ssr).
 
@@ -291,7 +277,11 @@ Add `eigenPPR()` to the plugin array returned by `eigen()`, after `eigenSSG()`. 
 
 ### Request time: fill the dynamic holes
 
-When a request comes in, the server doesn't re-render the shell. It sends the pre-rendered HTML immediately, then pipes `resume()`'s output after it, in one streamed response. This is Part 16's production server with one more branch, checked before the SSR fallback:
+When a request comes in, the server doesn't re-render the shell. It sends the pre-rendered HTML immediately, then pipes `resume()`'s output after it, in one streamed response:
+
+<PprResumeTimelineDiagram />
+
+This is Part 16's production server with one more branch, checked before the SSR fallback:
 
 ```typescript title="server.prod.ts (PPR branch)"
 import { readFile } from "node:fs/promises";

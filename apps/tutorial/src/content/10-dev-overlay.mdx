@@ -30,6 +30,8 @@ The overlay consists of:
 2. **[WebSocket](https://developer.mozilla.org/en-US/docs/Web/API/WebSocket) channel** — the server pushes diagnostic events to the browser in real-time via a dedicated WebSocket at `/_eigen/dev-ws` (separate from Vite's HMR WebSocket, which listens at the server's `base` path using the `vite-hmr` subprotocol).
 3. **Client overlay** — a script injected via [`transformIndexHtml`](https://vite.dev/guide/api-plugin#transformindexhtml) that connects to the WebSocket and renders a floating badge. Rendered inside [Shadow DOM](https://developer.mozilla.org/en-US/docs/Web/API/Web_components/Using_shadow_DOM) to isolate from the application's CSS. Completely absent in production builds because the entire plugin uses `apply: 'serve'`.
 
+<DevOverlayChannelDiagram />
+
 ---
 
 ## The overlay plugin

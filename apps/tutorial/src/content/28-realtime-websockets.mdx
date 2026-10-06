@@ -29,9 +29,13 @@ Vite already runs a WebSocket server for HMR. By default it shares the dev serve
 
 That leaves room for a _second_ WebSocket endpoint on the same server. Node emits `upgrade` to every listener, so our listener and Vite's each claim only their own requests: ours matches the path `/_eigen/ws`, Vite's matches `base` + `vite-hmr`. Neither listener destroys sockets it doesn't recognize.
 
+<UpgradeRoutingDiagram />
+
 Because the same endpoint has to exist in production — where there's no Vite — the WebSocket logic lives in the framework package, not in the plugin. The plugin only wires it to Vite's HTTP server.
 
 ### The hub: channels and broadcast
+
+<RealtimeHubDiagram />
 
 ```typescript title="packages/eigen/realtime-hub.ts"
 import { WebSocket } from "ws";

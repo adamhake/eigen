@@ -71,6 +71,8 @@ navigation.navigate("/login", { history: "replace" });
 
 The fundamental shift: instead of the framework _performing_ navigations (`pushState`, dispatch event, manually handle the response), the framework _intercepts_ navigations that the browser initiates. Links, form submissions, `navigation.navigate()`, and back/forward buttons all fire the same `navigate` event. The framework handles them uniformly.
 
+<NavigateLifecycleDiagram />
+
 ---
 
 ## Rewriting Eigen's router

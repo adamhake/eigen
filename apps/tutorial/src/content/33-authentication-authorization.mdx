@@ -175,6 +175,8 @@ export const authConfig: AuthConfig<User> = {
 
 Auth is runtime code, so it doesn't need a virtual module: the framework exports a factory that turns an `AuthConfig` into a Part 14 middleware. It runs first in the global chain, which means it runs for page renders, for `/_eigen/data` requests, _and_ for server function calls — one code path in dev and production.
 
+<AuthMiddlewareFlowDiagram />
+
 ```typescript title="packages/eigen/auth-middleware.ts"
 import { defineMiddleware, redirect } from "./middleware";
 import { matchPattern, type AuthConfig } from "./auth";
@@ -333,6 +335,10 @@ export const updateProfile = createServerFn({ method: "POST" })
 ## Logging in and out
 
 Login and logout set and clear the cookie, so they are plain `Request → Response` handlers mounted on the H3 app — the same app serves dev ([Part 3](/03-server-side-rendering)) and production ([Part 6](/06-production-builds)), so there's one implementation:
+
+<SessionCookieLifecycleDiagram />
+
+The handlers:
 
 ```typescript title="src/server/auth-routes.ts"
 import { clearSessionCookie, sessionCookie } from "eigen/auth";
