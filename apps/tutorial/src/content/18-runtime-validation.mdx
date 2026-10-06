@@ -7,8 +7,7 @@ concepts:
   - "the parse-don't-validate pattern"
 ---
 
-
-*This is the eighteenth installment in a series where we build a toy Next.js on top of Vite. In [Part 17](/17-deployment-adapters), we added SSG. Now we'll tackle a gap in our type safety story: the serialized data that crosses the server/client boundary is typed at compile time but unvalidated at runtime.*
+_This is the nineteenth installment in a series where we build a toy Next.js on top of Vite. In [Part 17](/17-deployment-adapters), we added deployment adapters. Now we'll tackle a gap in our type safety story: the serialized data that crosses the server/client boundary is typed at compile time but unvalidated at runtime._
 
 ---
 
@@ -20,14 +19,15 @@ But there's a gap. When loader data travels from server to client, it passes thr
 
 ```
 Server: loader returns { user: { name: "Adam", joinedAt: new Date() } }
-   ↓  JSON.stringify
+   ↓  serializeForScript (JSON.stringify + HTML escaping, Part 3)
 HTML:  window.__EIGEN_DATA__ = {"user":{"name":"Adam","joinedAt":"2026-03-07T..."}}
    ↓  JSON.parse (implicit, via browser)
 Client: data is { user: { name: "Adam", joinedAt: "2026-03-07T..." } }
 ```
 
 <Callout type="warn" title="The serialization boundary problem">
-The `Date` became a string. The TypeScript type still says `Date`. No error at compile time, a subtle bug at runtime. The types promise one thing, the runtime delivers another.
+  The `Date` became a string. The TypeScript type still says `Date`. No error at compile time, a subtle bug at runtime.
+  The types promise one thing, the runtime delivers another.
 </Callout>
 
 Runtime validation solves this by checking data against a schema at the point where it enters the client. If the shape doesn't match, you get a clear error instead of a silent type mismatch.
@@ -36,64 +36,88 @@ Runtime validation solves this by checking data against a schema at the point wh
 
 ## Schema-first loaders with `defineLoader`
 
-Instead of defining TypeScript types and hoping the data matches, we define a schema and *derive* the TypeScript type from it:
+Instead of defining TypeScript types and hoping the data matches, we define a schema and _derive_ the TypeScript type from it.
+
+Eigen shouldn't care _which_ schema library you use. Zod 4, Valibot 1, ArkType 2 and most other modern validators implement [Standard Schema](https://standardschema.dev) — a tiny shared interface: every schema carries a `~standard` property with a `validate(value)` function and phantom `types` for its input and output. Our helpers depend only on that interface (the `@standard-schema/spec` package is types-only; you can also copy its ~60 lines into your project):
 
 ```typescript title="packages/eigen/validated-loader.ts"
-import type { RouteParamsMap } from 'eigen/route-types'
-import type { z } from 'zod'
+import type { StandardSchemaV1 } from "@standard-schema/spec";
+import type { RouteParamsMap } from "eigen/route-types";
+import type { EigenContext } from "eigen/types";
+
+export class SchemaValidationError extends Error {
+  constructor(readonly issues: ReadonlyArray<StandardSchemaV1.Issue>) {
+    super(
+      issues
+        .map((issue) => {
+          const path = (issue.path ?? []).map((p) => String(typeof p === "object" ? p.key : p)).join(".");
+          return path ? `${path}: ${issue.message}` : issue.message;
+        })
+        .join("\n"),
+    );
+    this.name = "SchemaValidationError";
+  }
+}
+
+/** Run a Standard Schema synchronously: returns the typed output or throws. */
+export function parseWith<TSchema extends StandardSchemaV1>(
+  schema: TSchema,
+  data: unknown,
+): StandardSchemaV1.InferOutput<TSchema> {
+  const result = schema["~standard"].validate(data);
+  if (result instanceof Promise) {
+    // Hydration can't await — async refinements belong on the server
+    throw new TypeError("Async schemas are not supported in parse()");
+  }
+  if (result.issues) throw new SchemaValidationError(result.issues);
+  return result.value;
+}
 
 /**
  * Define a loader with runtime validation.
- * The TypeScript type is inferred from the schema — not manually annotated.
+ * The data type is inferred from the schema — not manually annotated.
  */
-export function defineValidatedLoader<
-  TPath extends keyof RouteParamsMap,
-  TSchema extends z.ZodType,
->(
+export function defineValidatedLoader<TPath extends keyof RouteParamsMap, TSchema extends StandardSchemaV1>(
   _path: TPath,
   schema: TSchema,
-  fn: (ctx: { params: RouteParamsMap[TPath] }) => Promise<z.input<TSchema>>,
-): {
-  loader: (ctx: { params: RouteParamsMap[TPath] }) => Promise<z.output<TSchema>>
-  schema: TSchema
-  parse: (data: unknown) => z.output<TSchema>
-} {
-  return {
-    loader: async (ctx) => {
-      const raw = await fn(ctx)
-      // Validate on the server too — catches bugs early
-      return schema.parse(raw)
-    },
-    schema,
-    parse: (data: unknown) => schema.parse(data),
-  }
+  fn: (args: { params: RouteParamsMap[TPath]; ctx: EigenContext }) => Promise<StandardSchemaV1.InferInput<TSchema>>,
+): (args: { params: RouteParamsMap[TPath]; ctx: EigenContext }) => Promise<StandardSchemaV1.InferOutput<TSchema>> {
+  // Validate on the server too — catches bad upstream data before it renders
+  return async (args) => parseWith(schema, await fn(args));
+}
+
+/** The client-safe half: a parse function that only references the schema. */
+export function defineParse<TSchema extends StandardSchemaV1>(
+  schema: TSchema,
+): (data: unknown) => StandardSchemaV1.InferOutput<TSchema> {
+  return (data) => parseWith(schema, data);
 }
 ```
 
 Usage in a page component:
 
 ```tsx title="src/pages/posts/[id].tsx"
-import { z } from 'zod'
-import { defineValidatedLoader } from 'eigen/validated-loader'
+import { z } from "zod";
+import { defineValidatedLoader, defineParse } from "eigen/validated-loader";
 
-const PostSchema = z.object({
+export const PostSchema = z.object({
   id: z.number(),
   title: z.string(),
   body: z.string(),
-  createdAt: z.string().transform(s => new Date(s)), // String → Date at parse time
-})
+  createdAt: z.string().transform((s) => new Date(s)), // String → Date at parse time
+});
 
-export const { loader, parse } = defineValidatedLoader(
-  '/posts/:id',
-  PostSchema,
-  async ({ params }) => {
-    const res = await fetch(`https://api.example.com/posts/${params.id}`)
-    return res.json()
-  },
-)
+// Server-only: Part 7's transform strips this whole statement from the client
+export const loader = defineValidatedLoader("/posts/:id", PostSchema, async ({ params }) => {
+  const res = await fetch(`https://api.example.com/posts/${params.id}`);
+  return res.json();
+});
+
+// Universal: survives into the client bundle, references only the schema
+export const parse = defineParse(PostSchema);
 
 // The type is INFERRED from the schema — not manually written
-type PostData = z.infer<typeof PostSchema>
+type PostData = z.infer<typeof PostSchema>;
 // PostData = { id: number; title: string; body: string; createdAt: Date }
 
 export default function PostPage({ params, data }: { params: { id: string }; data: PostData }) {
@@ -104,21 +128,25 @@ export default function PostPage({ params, data }: { params: { id: string }; dat
       <time>{data.createdAt.toLocaleDateString()}</time>
       <p>{data.body}</p>
     </article>
-  )
+  );
 }
 ```
 
 <TypeDeepDive title="TypeScript: Schema type inference with `z.infer`">
 
-`z.infer<typeof PostSchema>` extracts the TypeScript type that a Zod schema validates. Instead of defining a type *and* a schema separately (and keeping them in sync), you define the schema once and derive the type from it. `typeof PostSchema` gets the schema's type at the TypeScript level — it's a `z.ZodObject<...>` with encoded field information. `z.infer<...>` then maps that schema type to the plain output type (`{ id: number; title: string; ... }`). This "schema as single source of truth" pattern eliminates an entire class of bugs where runtime validation and compile-time types diverge.
+`z.infer<typeof PostSchema>` extracts the TypeScript type that a Zod schema validates. Instead of defining a type _and_ a schema separately (and keeping them in sync), you define the schema once and derive the type from it. `typeof PostSchema` gets the schema's type at the TypeScript level — it's a `z.ZodObject<...>` with encoded field information. `z.infer<...>` then maps that schema type to the plain output type (`{ id: number; title: string; ... }`). This "schema as single source of truth" pattern eliminates an entire class of bugs where runtime validation and compile-time types diverge.
 
 </TypeDeepDive>
 
 The schema does three things simultaneously: it validates that the data has the expected shape, it transforms values (string → Date), and it provides the TypeScript type (via `z.infer`). This is the "parse, don't validate" pattern — instead of checking a type assertion and hoping, you parse unknown data into a known shape.
 
+Notice the schema runs _twice_ on the same data: once on the server (the loader parses the API's input shape into the output shape, so SSR renders a real `Date`), and once on the client (the `parse` export turns the serialized JSON back into the output shape). That only works if the schema's output, after a trip through JSON, is valid _input_ again — here a `Date` serializes to an ISO string, which `z.string()` accepts. Keep loader schemas "JSON round-trippable" and the double parse is free.
+
+Why two exports instead of one object? Part 7's transform strips the `loader` export statement from the client build and then prunes the imports it no longer references. If `loader` and `parse` came from one shared object (`export const { loader, parse } = ...`), the loader function — with its database imports — would stay referenced on the client. Separate statements give the transform a clean cut.
+
 <TypeDeepDive title="Concept: Parse, don't validate">
 
-"Parse, don't validate" means converting untyped data into typed data in one step, rather than checking with a boolean guard and hoping you got it right. `schema.parse(data)` takes `unknown` and returns `T` or throws — the return type *proves* the data is valid. Compare to `if (isValid(data))` where TypeScript still sees `data` as `unknown` unless you write a type predicate. Parsing gives you a typed value; validating gives you a boolean and a prayer.
+"Parse, don't validate" means converting untyped data into typed data in one step, rather than checking with a boolean guard and hoping you got it right. `parse(data)` takes `unknown` and returns `T` or throws — the return type _proves_ the data is valid. Compare to `if (isValid(data))` where TypeScript still sees `data` as `unknown` unless you write a type predicate. Parsing gives you a typed value; validating gives you a boolean and a prayer.
 
 </TypeDeepDive>
 
@@ -126,123 +154,106 @@ The schema does three things simultaneously: it validates that the data has the 
 
 ## Validating during hydration
 
-The `parse` function exported alongside the loader is used on the client to validate `window.__EIGEN_DATA__`:
+The `parse` function exported alongside the loader is used on the client to validate `window.__EIGEN_DATA__` — and, just as importantly, the JSON that comes back from `/_eigen/data` on every client-side navigation (Part 5). Both pass through one helper in the router:
 
-```tsx title="entry-client.tsx"
-function Router() {
-  const [pathname, setPathname] = useState(window.location.pathname)
-  const match = matchRoute(pathname)
+```tsx title="packages/eigen/router.tsx"
+import type { RouteMatch } from "eigen/match-route";
 
-  // Parse and validate the serialized data
-  const data = useMemo(() => {
-    const raw = window.__EIGEN_DATA__
-    if (match?.route.parse) {
-      // Route has a validation schema — parse the raw data
-      try {
-        return match.route.parse(raw)
-      } catch (e) {
-        console.error('Data validation failed during hydration:', e)
-        return raw // Fall back to unvalidated data
-      }
-    }
-    return raw
-  }, [match])
-
-  // ...render with validated data
+function parseRouteData(match: RouteMatch | null, raw: unknown): unknown {
+  if (!match?.route.parse) return raw; // Route has no schema — trust the types
+  try {
+    return match.route.parse(raw);
+  } catch (e) {
+    console.error(`Data validation failed for ${match.route.path}:`, e);
+    throw e; // Surface it (error boundary) instead of rendering mistyped data
+  }
 }
+
+// Initial hydration:
+const [data, setData] = useState(() =>
+  parseRouteData(matchRoute(window.location.pathname, routes), window.__EIGEN_DATA__),
+);
+
+// After fetching /_eigen/data on navigation:
+setData(parseRouteData(matchRoute(newPath, routes), await res.json()));
 ```
 
 ### The route definition with parse functions
 
-The virtual module needs to include `parse` functions for validated routes:
+`RouteDefinition` gains an optional `parse`:
 
-```typescript
-// In the SSR load() for eigen/routes
-`import Page${i}, { loader as loader${i}, parse as parse${i} } from '${r.componentPath}'`
-
-// Route entry
-`{ path: '${r.path}', component: Page${i}, loader: loader${i}, parse: parse${i} }`
-```
-
-And for the client — importantly, the `parse` function is *not* server-only. It needs to be in the client bundle because it runs during hydration. The `transform` hook (Part 7) strips `loader` but keeps `parse`:
-
-```typescript title="eigen-strip-loaders.ts"
-transform(code: string, id: string) {
-  // Strip loader but NOT parse — parse runs on the client
-  // Only strip the loader function and its server-only imports
+```typescript title="packages/eigen/types.ts"
+export interface RouteDefinition {
+  // ...path, component, loader, middleware (Parts 2–14)
+  parse?: (data: unknown) => unknown;
 }
 ```
 
+The virtual module already imports each page as a namespace, so it just reads one more optional export. A page without `parse` simply yields `undefined` — no missing-export error:
+
+```typescript
+// In load() for eigen/routes — generated code is plain JS
+`import * as RouteMod${i} from '${r.componentPath}'`
+// Route entry
+`{ path: '${r.path}', component: RouteMod${i}.default, loader: RouteMod${i}.loader, parse: RouteMod${i}.parse }`;
+```
+
+And for the client — importantly, the `parse` function is _not_ server-only. It needs to be in the client bundle because it runs during hydration and navigation. Part 7's `eigenStripLoaders` plugin (`plugins/eigen-strip-loaders.ts`, an AST-based `enforce: 'pre'` transform) already does the right thing: in every export form, it strips the server-only exports (`loader`, `middleware`, `generateStaticParams`, `generateMetadata`) and prunes the imports they used, but keeps `default` and `parse`. Nothing to change — as long as `parse` lives in its own export statement, as above.
+
 <Callout type="info" title="Parse survives stripping">
-The loader contains server-only code (database queries, API keys). The parse function contains only the zod schema — pure validation logic with no server dependencies. It must survive into the client bundle.
+  The loader contains server-only code (database queries, API keys). The parse function contains only the zod schema —
+  pure validation logic with no server dependencies. It must survive into the client bundle.
 </Callout>
 
 ---
 
 ## Validation library examples
 
-Zod is ~14KB minified. For a framework that prioritizes bundle size, valibot (~1KB per schema) is a compelling alternative. Here is the same `PostSchema` in both libraries:
+Zod 4's classic method-chaining API costs several kilobytes gzipped even for a small schema, because methods can't be tree-shaken. For a framework that prioritizes bundle size, Valibot (or `zod/mini`) uses standalone functions that tree-shake down to roughly a kilobyte for a schema like this one. Here is the same `PostSchema` in both libraries:
 
 <Tabs items={["Zod", "Valibot"]}>
 <Tab value="Zod">
 
 ```typescript
-import { z } from 'zod'
+import { z } from "zod";
 
 const PostSchema = z.object({
   id: z.number(),
   title: z.string(),
   body: z.string(),
-  createdAt: z.string().transform(s => new Date(s)),
-})
+  createdAt: z.string().transform((s) => new Date(s)),
+});
 
-type PostData = z.infer<typeof PostSchema>
+type PostData = z.infer<typeof PostSchema>;
 ```
 
 </Tab>
 <Tab value="Valibot">
 
 ```typescript
-import * as v from 'valibot'
+import * as v from "valibot";
 
 const PostSchema = v.object({
   id: v.number(),
   title: v.string(),
   body: v.string(),
-  createdAt: v.pipe(v.string(), v.transform(s => new Date(s))),
-})
+  createdAt: v.pipe(
+    v.string(),
+    v.transform((s) => new Date(s)),
+  ),
+});
 
-type PostData = v.InferOutput<typeof PostSchema>
+type PostData = v.InferOutput<typeof PostSchema>;
 ```
 
 </Tab>
 </Tabs>
 
-The framework's `defineValidatedLoader` can be schema-library-agnostic by accepting any object with a `parse` method:
-
-```typescript
-interface SchemaLike<T> {
-  parse(data: unknown): T
-}
-
-export function defineValidatedLoader<
-  TPath extends keyof RouteParamsMap,
-  TSchema extends SchemaLike<any>,
->(
-  path: TPath,
-  schema: TSchema,
-  fn: (ctx: { params: RouteParamsMap[TPath] }) => Promise<unknown>,
-): {
-  loader: (ctx: { params: RouteParamsMap[TPath] }) => Promise<ReturnType<TSchema['parse']>>
-  parse: TSchema['parse']
-}
-```
-
-This works with zod, valibot, arktype, or any library that exposes `.parse()`. The framework doesn't couple to a specific validation library — it couples to a protocol.
+Either one drops straight into `defineValidatedLoader(path, PostSchema, fn)` and `defineParse(PostSchema)` with no adapter. That's why the helpers take a `StandardSchemaV1` rather than "something with a `.parse()` method": the libraries _don't_ agree on method names — Zod has `schema.parse(data)`, Valibot is functional (`v.parse(schema, data)`, with no method on the schema at all), ArkType schemas are callable — but all of them expose the same `~standard.validate`. The framework doesn't couple to a specific validation library — it couples to a protocol.
 
 <TypeDeepDive title="TypeScript: Structural typing and protocol interfaces">
 
-TypeScript uses structural typing — if an object has the right shape, it satisfies the interface, regardless of its class or origin. `SchemaLike<T>` with a `parse(data: unknown): T` method matches both Zod schemas and Valibot schemas because both happen to have a compatible `parse` method. You don't need Zod and Valibot to `implement` an interface — TypeScript checks the shape automatically. This is the "protocol" pattern: define a minimal interface, and any library that matches it works.
+TypeScript uses structural typing — if an object has the right shape, it satisfies the interface, regardless of its class or origin. `StandardSchemaV1` describes a single property, `'~standard'`, holding `version`, `vendor`, `validate` and an optional phantom `types: { input; output }`. Zod and Valibot schemas both carry that property, so both satisfy the interface without importing or `implement`ing it — TypeScript checks the shape automatically. `StandardSchemaV1.InferOutput<S>` simply reads `S['~standard']['types']['output']`, which is how `defineParse` knows `createdAt` is a `Date` for either library. This is the "protocol" pattern: define a minimal interface, and any library that matches it works.
 
 </TypeDeepDive>
 
@@ -257,25 +268,25 @@ This is much harder. Tools like `ts-to-zod` and `typia` can generate runtime val
 ```typescript
 // Hypothetical: the plugin analyzes the loader's return type
 // and generates a validation schema automatically
-export const loader = defineLoader('/posts/:id', async ({ params }) => {
+export const loader = defineLoader("/posts/:id", async ({ params }) => {
   // Return type: Promise<{ title: string; body: string }>
   // → Plugin generates: z.object({ title: z.string(), body: z.string() })
-})
+});
 ```
 
 This would require the plugin's `transform` hook to use the TypeScript compiler API to extract return types and generate zod/valibot calls. It's technically possible but fragile — TypeScript's type system is Turing-complete, so arbitrary return types can't always be mapped to schemas.
 
-The pragmatic choice is the schema-first direction: developers write schemas, TypeScript infers types. This is what Remix does with `unstable_defineLoader` + zod, and it's the approach we recommend.
+The pragmatic choice is the schema-first direction: developers write schemas, TypeScript infers types. It's the same direction TanStack Router takes with `validateSearch` and tRPC takes with `.input()`/`.output()`, and it's the approach we recommend.
 
 ---
 
 ## What to observe
 
-1. **Make a loader return a `Date` object.** Without validation, the client receives a string and `date.toLocaleDateString()` throws. With the zod schema's `.transform()`, the string is parsed back into a `Date` during hydration.
+1. **Remove the `parse` export.** SSR still renders a real `Date` (the server-side loader parsed it), but after hydration — or after a client-side navigation — `data.createdAt` is a string and `toLocaleDateString()` throws. Restore `parse` and the schema's `.transform()` turns the string back into a `Date` on the client.
 
-2. **Return data that doesn't match the schema.** The `parse` call throws a `ZodError` with a detailed path showing exactly which field failed validation. Compare this to a silent type mismatch.
+2. **Return data that doesn't match the schema.** Make the API return `id: "42"`. The server-side parse throws a `SchemaValidationError` whose message names the failing path (`id: Invalid input: expected number, received string`). Compare this to a silent type mismatch.
 
-3. **Check the client bundle size.** With zod imported only for specific route schemas (via dynamic import or the route's parse function), tree-shaking keeps the cost proportional to usage.
+3. **Check the client bundle.** Search `dist/client/assets` for `api.example.com` — it's gone, because Part 7 stripped the `loader` statement. The schema and the validation library are there, imported only by routes that export `parse`.
 
 4. **The TypeScript type comes from the schema** — hover over `PostData` and confirm it matches the schema, not a manual annotation. Change the schema and the type updates automatically.
 
@@ -283,7 +294,7 @@ The pragmatic choice is the schema-first direction: developers write schemas, Ty
 
 ## Key insight
 
-Runtime validation closes the last gap in the type safety story. Compile-time types catch developer errors (wrong field names, missing properties). Runtime validation catches *data* errors (API changes, serialization artifacts, stale caches). The schema is the single source of truth — it generates both the TypeScript type (for the compiler) and the validation logic (for the runtime).
+Runtime validation closes the last gap in the type safety story. Compile-time types catch developer errors (wrong field names, missing properties). Runtime validation catches _data_ errors (API changes, serialization artifacts, stale caches). The schema is the single source of truth — it generates both the TypeScript type (for the compiler) and the validation logic (for the runtime).
 
 From a Vite perspective, the interesting nuance is that validation code must survive into the client bundle while loader code must not. The `transform` hook's job gets more surgical: it needs to distinguish between "server-only exports" (loader) and "universal exports" (parse, schema). This is the same tree-shaking challenge that real frameworks face — and why conventions like `"use server"` and `.server.ts` files exist. They give the transform hook clear signals about what to strip.
 
@@ -291,71 +302,80 @@ From a Vite perspective, the interesting nuance is that validation code must sur
 
 <TestSection title="Testing: schema validation">
 
-Validation schemas are the contract between server and client — they deserve thorough testing. The `PostSchema` is defined in the page component, so import it directly:
+Validation schemas are the contract between server and client — they deserve thorough testing. The `PostSchema` is exported from the page component, so import it directly:
 
 ```typescript title="src/__tests__/schemas.test.ts"
-import { describe, it, expect } from 'vitest'
-import { PostSchema } from '../pages/posts/[id]'
+import { describe, it, expect } from "vitest";
+import { PostSchema, parse } from "../pages/posts/[id]";
+import { SchemaValidationError } from "eigen/validated-loader";
 
-describe('PostSchema', () => {
-  it('parses valid data', () => {
+describe("PostSchema", () => {
+  it("parses valid data", () => {
     const result = PostSchema.parse({
       id: 1,
-      title: 'Hello',
-      body: 'World',
-      createdAt: '2026-03-13T00:00:00Z',
-    })
+      title: "Hello",
+      body: "World",
+      createdAt: "2026-03-13T00:00:00Z",
+    });
 
-    expect(result.id).toBe(1)
-    expect(result.createdAt).toBeInstanceOf(Date)
-  })
+    expect(result.id).toBe(1);
+    expect(result.createdAt).toBeInstanceOf(Date);
+  });
 
-  it('transforms date strings into Date objects', () => {
+  it("transforms date strings into Date objects", () => {
     const result = PostSchema.parse({
       id: 1,
-      title: 'Test',
-      body: 'Body',
-      createdAt: '2026-01-15T12:00:00Z',
-    })
+      title: "Test",
+      body: "Body",
+      createdAt: "2026-01-15T12:00:00Z",
+    });
 
-    expect(result.createdAt.getFullYear()).toBe(2026)
-    expect(result.createdAt.getMonth()).toBe(0) // January
-  })
+    expect(result.createdAt.getFullYear()).toBe(2026);
+    expect(result.createdAt.getMonth()).toBe(0); // January
+  });
 
-  it('rejects missing required fields', () => {
-    expect(() => PostSchema.parse({ id: 1 })).toThrow()
-  })
+  it("rejects missing required fields", () => {
+    expect(() => PostSchema.parse({ id: 1 })).toThrow();
+  });
 
-  it('rejects wrong types', () => {
+  it("rejects wrong types", () => {
     expect(() =>
       PostSchema.parse({
-        id: 'not-a-number',
-        title: 'Test',
-        body: 'Body',
-        createdAt: '2026-01-01',
+        id: "not-a-number",
+        title: "Test",
+        body: "Body",
+        createdAt: "2026-01-01",
       }),
-    ).toThrow()
-  })
+    ).toThrow();
+  });
 
-  it('survives a JSON round-trip', () => {
+  it("survives a JSON round-trip", () => {
     // Simulate the serialization boundary
     const serverData = {
       id: 42,
-      title: 'Post',
-      body: 'Content',
-      createdAt: new Date('2026-06-01').toISOString(),
-    }
-    const serialized = JSON.stringify(serverData)
-    const deserialized = JSON.parse(serialized)
+      title: "Post",
+      body: "Content",
+      createdAt: new Date("2026-06-01").toISOString(),
+    };
+    const serialized = JSON.stringify(serverData);
+    const deserialized = JSON.parse(serialized);
 
     // Without the schema: createdAt is a string
-    expect(typeof deserialized.createdAt).toBe('string')
+    expect(typeof deserialized.createdAt).toBe("string");
 
     // With the schema: createdAt is a Date
-    const parsed = PostSchema.parse(deserialized)
-    expect(parsed.createdAt).toBeInstanceOf(Date)
-  })
-})
+    const parsed = PostSchema.parse(deserialized);
+    expect(parsed.createdAt).toBeInstanceOf(Date);
+  });
+
+  it("the exported parse goes through Standard Schema", () => {
+    expect(parse({ id: 1, title: "T", body: "B", createdAt: "2026-01-01" })).toMatchObject({
+      id: 1,
+      createdAt: expect.any(Date),
+    });
+    expect(() => parse({ id: 1 })).toThrow(SchemaValidationError);
+  });
+});
 ```
 
 The "JSON round-trip" test is the most important one — it reproduces the exact serialization boundary that causes the `Date` → `string` bug described in this chapter. The test proves that the schema's `.transform()` restores the correct type after deserialization.

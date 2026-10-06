@@ -21,7 +21,7 @@ export const conceptDefinitions: Record<string, ConceptDefinition> = {
   },
   "dependency pre-bundling": {
     description:
-      "Vite uses esbuild to convert node_modules dependencies from CommonJS to ESM and collapse many internal files into single modules.",
+      "Vite uses Rolldown to convert node_modules dependencies from CommonJS to ESM and collapse many internal files into single modules.",
     url: "https://vite.dev/guide/dep-pre-bundling.html",
   },
   "hot module replacement": {
@@ -52,8 +52,7 @@ export const conceptDefinitions: Record<string, ConceptDefinition> = {
 
   // Part 3
   "server-side rendering": {
-    description:
-      "Rendering React components to HTML on the server so the browser receives ready-to-display markup.",
+    description: "Rendering React components to HTML on the server so the browser receives ready-to-display markup.",
     url: "https://vite.dev/guide/ssr.html",
   },
   "dual module graphs": {
@@ -72,7 +71,7 @@ export const conceptDefinitions: Record<string, ConceptDefinition> = {
   },
 
   // Part 4
-  "hydration": {
+  hydration: {
     description:
       "Attaching event listeners and React state to server-rendered HTML so it becomes interactive without re-rendering from scratch.",
     url: "https://react.dev/reference/react-dom/client/hydrateRoot",
@@ -81,15 +80,16 @@ export const conceptDefinitions: Record<string, ConceptDefinition> = {
     description:
       "A shared agreement about the shape and location of serialized data passed from the server render to the client hydration step.",
   },
-  "shared route matching": {
+  "isomorphic application shell": {
     description:
-      "Using the same route-matching logic on both server and client so both sides agree on which component renders for a given URL.",
+      "The same React tree (layout, navigation, router) rendered on the server and hydrated on the client, so both sides agree on which component renders for a given URL.",
   },
 
   // Part 5
-  "data loading conventions": {
+  "the satisfies operator": {
     description:
-      "File-based patterns (like exporting a loader function) that let the framework fetch data for a route before rendering.",
+      "A TypeScript operator that checks a value against a type without widening it, so a loader can be validated as a LoaderFn while keeping its precise return type.",
+    url: "https://www.typescriptlang.org/docs/handbook/release-notes/typescript-4-9.html#the-satisfies-operator",
   },
   "constrained type inference": {
     description:
@@ -115,9 +115,9 @@ export const conceptDefinitions: Record<string, ConceptDefinition> = {
     description:
       "Including a hash of the file's contents in its output filename so browsers can cache aggressively and bust caches automatically on change.",
   },
-  "the production server": {
+  "porting dev middleware to production": {
     description:
-      "A minimal Node.js server that serves the built client assets and handles SSR using the server build output.",
+      "Re-creating what the Vite dev server did implicitly (HTML transforms, module loading, static files) in a standalone server that serves the built client assets and the server bundle.",
   },
 
   // Part 7
@@ -426,13 +426,9 @@ export const conceptDefinitions: Record<string, ConceptDefinition> = {
     description:
       "Prefetching route data and code on hover, viewport intersection, or intent signals to make navigations feel instant.",
   },
-  "optimistic navigation": {
+  "catch-all and optional segments": {
     description:
-      "Immediately showing the next page's UI while data loads in the background, using useTransition to manage the pending state.",
-  },
-  "scroll restoration": {
-    description:
-      "Saving and restoring scroll positions when navigating back/forward, matching user expectations for browser history navigation.",
+      "Route patterns such as [...slug] and [[id]] that match any number of trailing segments or an optional one, and must rank below more specific routes.",
   },
 
   // Part 24
@@ -442,8 +438,7 @@ export const conceptDefinitions: Record<string, ConceptDefinition> = {
     url: "https://developer.mozilla.org/en-US/docs/Web/API/View_Transition_API",
   },
   "cross-document animations": {
-    description:
-      "View transitions that work across full page navigations (MPA), not just within a single-page app.",
+    description: "View transitions that work across full page navigations (MPA), not just within a single-page app.",
   },
   "speculative prerendering": {
     description:
@@ -458,7 +453,7 @@ export const conceptDefinitions: Record<string, ConceptDefinition> = {
   // Part 25
   "compiler-driven caching": {
     description:
-      "Using a \"use cache\" directive to tell the compiler to wrap functions in caching logic, making cache behavior a code annotation.",
+      'Using a "use cache" directive to tell the compiler to wrap functions in caching logic, making cache behavior a code annotation.',
   },
   "cache key derivation": {
     description:
@@ -490,9 +485,10 @@ export const conceptDefinitions: Record<string, ConceptDefinition> = {
     description:
       "Deciding which parts of a page can be computed once at build time vs. which must be computed fresh for every request.",
   },
-  "streaming into pre-rendered html": {
+  "prerender, postponed state, and resume": {
     description:
-      "Injecting dynamically-rendered content into a pre-built HTML shell using streaming, combining SSG speed with SSR flexibility.",
+      "React's prerender API produces a static prelude plus postponed state at build time; resume renders only the dynamic holes at request time and streams them after the shell.",
+    url: "https://react.dev/reference/react-dom/server/resume",
   },
 
   // Part 27
@@ -500,10 +496,10 @@ export const conceptDefinitions: Record<string, ConceptDefinition> = {
     description:
       "Server functions that return a ReadableStream, sending data incrementally to the client as it becomes available.",
   },
-  "the ai sdk protocol": {
+  "server-sent events as a transport": {
     description:
-      "Vercel's AI SDK streaming format for LLM responses, providing a standard wire protocol for text, tool calls, and structured data.",
-    url: "https://ai-sdk.dev/docs/ai-sdk-ui/stream-protocol",
+      "Streaming a server function's output as text/event-stream frames over a normal HTTP response, which works through proxies and needs no WebSocket.",
+    url: "https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events",
   },
   "progressive ui updates": {
     description:
@@ -568,13 +564,11 @@ export const conceptDefinitions: Record<string, ConceptDefinition> = {
       "Generating OG meta tags from loader data so social media previews reflect each page's actual content.",
   },
   "json-ld structured data": {
-    description:
-      "Embedding machine-readable structured data in the page for search engines, using the JSON-LD format.",
+    description: "Embedding machine-readable structured data in the page for search engines, using the JSON-LD format.",
     url: "https://developers.google.com/search/docs/appearance/structured-data/intro-structured-data",
   },
   "sitemap generation": {
-    description:
-      "Automatically producing a sitemap.xml from the route tree so search engines can discover all pages.",
+    description: "Automatically producing a sitemap.xml from the route tree so search engines can discover all pages.",
   },
 
   // Part 31
@@ -697,12 +691,105 @@ export const conceptDefinitions: Record<string, ConceptDefinition> = {
       "Capturing the exact output of a code transform and comparing it against a stored baseline, catching silent regressions in plugin output.",
     url: "https://vitest.dev/guide/snapshot.html",
   },
-  "plugin testing with Vite's test utilities": {
+  "plugin testing with vite's test utilities": {
     description:
       "Testing Vite plugin hooks (resolveId, load, transform) by either extracting logic into pure functions or using a real Vite instance in middleware mode.",
   },
-  "integration testing the SSR pipeline": {
+  "integration testing the ssr pipeline": {
     description:
       "Testing the full server render pipeline — route matching, middleware execution, data loading, and component rendering — without a browser or HTTP server.",
+  },
+
+  // Part 37
+  "critical css extraction": {
+    description:
+      "Collecting the stylesheets used by the modules rendered for a request and inlining or linking them in the server HTML, so the first paint is styled without a flash of unstyled content.",
+  },
+  "css modules type generation": {
+    description: "Generating .d.ts files for *.module.css imports so class names are type-checked and autocompleted.",
+    url: "https://vite.dev/guide/features.html#css-modules",
+  },
+  "tailwind css v4 integration": {
+    description:
+      "Using Tailwind CSS v4's Vite plugin, CSS-first configuration (@theme) and automatic source detection inside a framework's build.",
+    url: "https://tailwindcss.com/docs/installation/using-vite",
+  },
+  "css-in-js and streaming ssr": {
+    description:
+      "The trade-offs runtime CSS-in-JS libraries face when HTML is streamed in chunks or rendered as Server Components, and the style-registry patterns used to cope.",
+  },
+  "virtual style modules": {
+    description:
+      "A framework-provided virtual module that aggregates global styles and exposes CSS metadata to the server renderer.",
+  },
+
+  // Part 38
+  "server function form actions": {
+    description:
+      "Passing a server function to a form's action so it works with JavaScript (React form actions) and without it (a plain POST to the function's endpoint).",
+    url: "https://react.dev/reference/react-dom/components/form",
+  },
+  "optimistic ui patterns": {
+    description:
+      "Showing the expected result of a mutation immediately with useOptimistic, then reconciling with the server's response.",
+    url: "https://react.dev/reference/react/useOptimistic",
+  },
+  "shared validation schemas": {
+    description:
+      "One schema used both in the browser for instant feedback and on the server as the authoritative check.",
+  },
+  "cache revalidation after mutation": {
+    description: "Invalidating cached data by tag after a successful mutation so subsequent renders read fresh data.",
+  },
+
+  // Part 39
+  "scaffolding cli": {
+    description: "A create-* command that copies a project template, merges package.json and installs dependencies.",
+  },
+  "ast-based code generation": {
+    description:
+      "Generating and modifying source files by editing a syntax tree (e.g. with magicast) instead of concatenating strings.",
+    url: "https://github.com/unjs/magicast",
+  },
+  "custom eslint rules": {
+    description:
+      "Framework-specific lint rules distributed as an ESLint flat-config plugin that catch convention mistakes at edit time.",
+    url: "https://eslint.org/docs/latest/extend/custom-rules",
+  },
+  "typescript language service plugin": {
+    description:
+      "A tsserver plugin that augments editor features such as completions and diagnostics with framework knowledge.",
+    url: "https://github.com/microsoft/TypeScript/wiki/Writing-a-Language-Service-Plugin",
+  },
+  "framework diagnostics": {
+    description:
+      "Checks the dev server runs against the project (misconfigured routes, missing exports) and reports in the dev overlay.",
+  },
+
+  // Part 40
+  "pnpm workspaces": {
+    description:
+      "A monorepo setup where local packages are linked with the workspace: protocol and resolved through their package.json exports.",
+    url: "https://pnpm.io/workspaces",
+  },
+  "tsdown library builds": {
+    description:
+      "Bundling a TypeScript library with tsdown (built on Rolldown) into ESM output with declaration files and subpath entry points.",
+    url: "https://tsdown.dev",
+  },
+  "turborepo task orchestration": {
+    description:
+      "Declaring task dependencies and outputs in turbo.json so builds, tests and type checks run in the right order with caching.",
+    url: "https://turborepo.com/docs",
+  },
+  "changeset-based versioning": {
+    description:
+      "Recording intended version bumps as changeset files that a release workflow turns into version updates and changelogs.",
+    url: "https://github.com/changesets/changesets",
+  },
+  "npm trusted publishing and provenance": {
+    description:
+      "Publishing from CI with npm trusted publishing (OIDC), which removes long-lived tokens and attaches a signed provenance attestation.",
+    url: "https://docs.npmjs.com/trusted-publishers",
   },
 };

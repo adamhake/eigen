@@ -9,14 +9,13 @@ concepts:
   - "image CDN integration"
 ---
 
-
-*In this installment, we build an image optimization pipeline — a Vite plugin that processes images at build time and a React component that serves responsive, format-optimized images with blur placeholders. We also integrate with external DAMs like Cloudinary for on-the-fly transformations.*
----
+## _In this installment, we build an image optimization pipeline — a Vite plugin that processes images at build time and a React component that serves responsive, format-optimized images with blur placeholders. We also integrate with external DAMs like Cloudinary for on-the-fly transformations._
 
 ## The problem: images on the modern web
 
 <Callout type="warn" title="The #1 web performance mistake">
-Serving unoptimized images — a 4MB JPEG hero that's 4000px wide served to a 375px phone — wastes bandwidth, delays LCP, and tanks Core Web Vitals.
+  Serving unoptimized images — a 4MB JPEG hero that's 4000px wide served to a 375px phone — wastes bandwidth, delays
+  LCP, and tanks Core Web Vitals.
 </Callout>
 
 `next/image` solved this by providing a component that automatically generates responsive variants, converts to modern formats, and lazy-loads with blur placeholders. We'll build the same for Eigen.
@@ -27,82 +26,103 @@ Serving unoptimized images — a 4MB JPEG hero that's 4000px wide served to a 37
 
 ### Approach 1: Build-time optimization (local images)
 
-For images in the project's `src/` or `public/` directories, the Vite plugin processes them at build time using `sharp`:
+For images imported from the project's `src/` directory, the Vite plugin processes them with `sharp`. (Files in `public/` are copied verbatim and never go through the module graph, so they can't be optimized this way.) The plugin writes each variant to a cache directory and then imports it with Vite's standard `?url` suffix, so Vite's own asset pipeline handles hashing, `base`, dev serving, and copying into `dist/client/assets` — and the client and SSR builds agree on every URL:
 
 ```typescript title="plugins/eigen-images.ts"
-import type { Plugin } from 'vite'
-import sharp from 'sharp'
+import type { Plugin } from "vite";
+import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
+import sharp from "sharp";
 
-const IMAGE_REGEX = /\.(jpg|jpeg|png|webp|avif|gif)$/
-const WIDTHS = [640, 750, 828, 1080, 1200, 1920, 2048]
-
-interface ProcessedImage {
-  src: string
-  srcSet: string
-  width: number
-  height: number
-  blurDataURL: string  // Base64 tiny blur placeholder
-  format: string
-}
+const QUERY = "?eigen-image";
+const PREFIX = "\0eigen-image:";
+const WIDTHS = [640, 750, 828, 1080, 1200, 1920, 2048];
 
 export default function eigenImages(): Plugin {
-  const processedCache = new Map<string, ProcessedImage>()
+  let cacheDir = "";
 
   return {
-    name: 'eigen-images',
+    name: "eigen-images",
+    enforce: "pre",
 
-    // Intercept image imports and return metadata + optimized variants
+    configResolved(config) {
+      cacheDir = path.join(config.root, "node_modules/.eigen/images");
+    },
+
+    // Resolve '../images/hero.jpg?eigen-image' against the importer, exactly
+    // like a normal import, then tag it as a virtual image module
     async resolveId(id, importer) {
-      if (id.endsWith('?eigen-image')) {
-        return `\0eigen-image:${id.replace('?eigen-image', '')}`
-      }
+      if (!id.endsWith(QUERY)) return;
+      const resolved = await this.resolve(id.slice(0, -QUERY.length), importer, { skipSelf: true });
+      if (!resolved) return null;
+      return PREFIX + resolved.id;
     },
 
     async load(id) {
-      if (!id.startsWith('\0eigen-image:')) return
+      if (!id.startsWith(PREFIX)) return;
+      const imagePath = id.slice(PREFIX.length);
+      this.addWatchFile(imagePath);
 
-      const imagePath = id.replace('\0eigen-image:', '')
+      const input = await readFile(imagePath);
+      const metadata = await sharp(input).metadata();
+      // EXIF orientations 5–8 rotate the image 90°, so the displayed
+      // width/height are swapped relative to the stored pixels
+      const rotated = (metadata.orientation ?? 1) >= 5;
+      const width = (rotated ? metadata.height : metadata.width) ?? 0;
+      const height = (rotated ? metadata.width : metadata.height) ?? 0;
 
-      if (processedCache.has(imagePath)) {
-        const cached = processedCache.get(imagePath)!
-        return `export default ${JSON.stringify(cached)}`
+      // Each pipeline starts from a fresh sharp instance. sharp methods mutate
+      // the instance they're called on (and clone() copies those options), so
+      // reusing one instance would leak the blur into every variant.
+      // .rotate() with no arguments applies the EXIF orientation.
+      const blurBuffer = await sharp(input).rotate().resize(10).blur(3).jpeg({ quality: 50 }).toBuffer();
+      const blurDataURL = `data:image/jpeg;base64,${blurBuffer.toString("base64")}`;
+
+      // Never upscale; an image narrower than 640px gets one variant at its own width
+      const widths = WIDTHS.filter((w) => w <= width);
+      if (widths.length === 0) widths.push(width);
+
+      // Content hash: editing the image produces new variant files
+      const hash = createHash("sha256").update(input).digest("hex").slice(0, 8);
+      const base = path.basename(imagePath, path.extname(imagePath));
+      await mkdir(cacheDir, { recursive: true });
+
+      const imports: string[] = [];
+      for (const [i, w] of widths.entries()) {
+        const file = path.join(cacheDir, `${base}-${hash}-${w}w.webp`);
+        if (!existsSync(file)) {
+          await writeFile(file, await sharp(input).rotate().resize(w).webp({ quality: 80 }).toBuffer());
+        }
+        // ?url makes Vite treat the file as an asset and return its public URL
+        imports.push(`import v${i} from ${JSON.stringify(`${file}?url`)}`);
       }
 
-      const image = sharp(imagePath)
-      const metadata = await image.metadata()
-      const { width: origWidth, height: origHeight } = metadata
-
-      // Generate blur placeholder (10px wide, base64)
-      const blurBuffer = await image
-        .resize(10)
-        .blur(3)
-        .toBuffer()
-      const blurDataURL = `data:image/jpeg;base64,${blurBuffer.toString('base64')}`
-
-      // Generate responsive variants at build time
-      const variants: string[] = []
-      for (const w of WIDTHS) {
-        if (w > (origWidth ?? 0)) continue
-
-        // WebP variant
-        const webpPath = imagePath.replace(IMAGE_REGEX, `-${w}w.webp`)
-        await image.clone().resize(w).webp({ quality: 80 }).toFile(webpPath)
-        variants.push(`${webpPath} ${w}w`)
-      }
-
-      const result: ProcessedImage = {
-        src: imagePath,
-        srcSet: variants.join(', '),
-        width: origWidth ?? 0,
-        height: origHeight ?? 0,
-        blurDataURL,
-        format: 'webp',
-      }
-
-      processedCache.set(imagePath, result)
-      return `export default ${JSON.stringify(result)}`
+      // Generated module code is plain JS (no TS, no JSX)
+      const last = widths.length - 1;
+      return `${imports.join("\n")}
+export default {
+  src: v${last},
+  srcSet: [${widths.map((w, i) => `v${i} + ' ${w}w'`).join(", ")}].join(', '),
+  width: ${width},
+  height: ${height},
+  blurDataURL: ${JSON.stringify(blurDataURL)},
+}`;
     },
-  }
+  };
+}
+```
+
+`load` runs once per module per build, and the dev server caches the result until the source image changes (`addWatchFile` invalidates it). The cache directory lives under `node_modules`, which Vite's file watcher ignores, so writing variants never triggers a reload — and because file names include a content hash, unchanged images are not re-encoded on the next build.
+
+So TypeScript knows what an `?eigen-image` import produces, the framework ships an ambient declaration:
+
+```typescript title="packages/eigen/client.d.ts"
+declare module "*?eigen-image" {
+  import type { ProcessedImage } from "eigen/image";
+  const image: ProcessedImage;
+  export default image;
 }
 ```
 
@@ -110,8 +130,8 @@ Usage in a component:
 
 ```tsx
 // Import with the ?eigen-image query to trigger processing
-import heroImage from '../images/hero.jpg?eigen-image'
-import { Image } from 'eigen/image'
+import heroImage from "../images/hero.jpg?eigen-image";
+import { Image } from "eigen/image";
 
 export default function HomePage() {
   return (
@@ -119,9 +139,9 @@ export default function HomePage() {
       src={heroImage}
       alt="Hero banner"
       sizes="100vw"
-      priority  // Skip lazy loading for above-the-fold images
+      priority // Above the fold: eager, high fetch priority, preloaded
     />
-  )
+  );
 }
 ```
 
@@ -131,51 +151,62 @@ For images hosted on a DAM (Cloudinary, Imgix, Sanity, Contentful), the optimiza
 
 ```typescript title="packages/eigen/image-providers.ts"
 export interface ImageProvider {
-  name: string
-  buildURL(src: string, options: ImageTransformOptions): string
+  name: string;
+  buildURL(src: string, options: ImageTransformOptions): string;
 }
 
 export interface ImageTransformOptions {
-  width?: number
-  height?: number
-  quality?: number
-  format?: 'webp' | 'avif' | 'auto'
-  fit?: 'cover' | 'contain' | 'fill'
-  blur?: number
+  width?: number;
+  height?: number;
+  quality?: number;
+  format?: "webp" | "avif" | "auto";
+  /** CSS object-fit semantics */
+  fit?: "cover" | "contain" | "fill";
+  blur?: number;
 }
 
 export const cloudinaryProvider: ImageProvider = {
-  name: 'cloudinary',
+  name: "cloudinary",
   buildURL(src: string, opts: ImageTransformOptions): string {
     // Cloudinary URL transformation API
     // https://res.cloudinary.com/demo/image/upload/w_800,f_auto,q_80/sample.jpg
-    const transforms: string[] = []
-    if (opts.width) transforms.push(`w_${opts.width}`)
-    if (opts.height) transforms.push(`h_${opts.height}`)
-    if (opts.quality) transforms.push(`q_${opts.quality}`)
-    if (opts.format === 'auto') transforms.push('f_auto')
-    else if (opts.format) transforms.push(`f_${opts.format}`)
-    if (opts.fit) transforms.push(`c_${opts.fit === 'cover' ? 'fill' : opts.fit}`)
+    const transforms: string[] = [];
+    if (opts.width) transforms.push(`w_${opts.width}`);
+    if (opts.height) transforms.push(`h_${opts.height}`);
+    if (opts.quality) transforms.push(`q_${opts.quality}`);
+    if (opts.format === "auto") transforms.push("f_auto");
+    else if (opts.format) transforms.push(`f_${opts.format}`);
+    // Map CSS object-fit to Cloudinary crop modes:
+    // cover → c_fill (crop to fill), contain → c_fit (fit inside), fill → c_scale (stretch)
+    const cropModes = { cover: "fill", contain: "fit", fill: "scale" } as const;
+    if (opts.fit) transforms.push(`c_${cropModes[opts.fit]}`);
+    if (opts.blur) transforms.push(`e_blur:${opts.blur}`);
 
-    const transformStr = transforms.join(',')
+    if (transforms.length === 0) return src;
     // Insert transforms into Cloudinary URL
-    return src.replace('/upload/', `/upload/${transformStr}/`)
+    return src.replace("/upload/", `/upload/${transforms.join(",")}/`);
   },
-}
+};
 
 export const imgixProvider: ImageProvider = {
-  name: 'imgix',
+  name: "imgix",
   buildURL(src: string, opts: ImageTransformOptions): string {
-    const params = new URLSearchParams()
-    if (opts.width) params.set('w', String(opts.width))
-    if (opts.height) params.set('h', String(opts.height))
-    if (opts.quality) params.set('q', String(opts.quality))
-    if (opts.format === 'auto') params.set('auto', 'format')
-    else if (opts.format) params.set('fm', opts.format)
-    if (opts.fit) params.set('fit', opts.fit === 'cover' ? 'crop' : opts.fit)
-    return `${src}?${params.toString()}`
+    // Use URL so a src that already has a query string isn't broken
+    const url = new URL(src);
+    const params = url.searchParams;
+    if (opts.width) params.set("w", String(opts.width));
+    if (opts.height) params.set("h", String(opts.height));
+    if (opts.quality) params.set("q", String(opts.quality));
+    if (opts.format === "auto") params.set("auto", "format");
+    else if (opts.format) params.set("fm", opts.format);
+    // Map CSS object-fit to imgix fit modes:
+    // cover → crop, contain → clip (fit inside), fill → scale (stretch)
+    const fitModes = { cover: "crop", contain: "clip", fill: "scale" } as const;
+    if (opts.fit) params.set("fit", fitModes[opts.fit]);
+    if (opts.blur) params.set("blur", String(opts.blur));
+    return url.toString();
   },
-}
+};
 ```
 
 ---
@@ -183,28 +214,38 @@ export const imgixProvider: ImageProvider = {
 ## The `<Image>` component
 
 ```tsx title="packages/eigen/image.tsx"
-import type { ProcessedImage } from './types'
-import type { ImageProvider, ImageTransformOptions } from './image-providers'
+import { preload } from "react-dom";
+import type { ImageProvider } from "./image-providers";
+
+/** What an `?eigen-image` import resolves to */
+export interface ProcessedImage {
+  src: string;
+  srcSet: string;
+  width: number;
+  height: number;
+  /** Base64 tiny blur placeholder */
+  blurDataURL: string;
+}
 
 interface ImageProps {
   /** Local processed image or external URL string */
-  src: ProcessedImage | string
-  alt: string
-  width?: number
-  height?: number
-  sizes?: string
-  /** Skip lazy loading (for above-the-fold images) */
-  priority?: boolean
+  src: ProcessedImage | string;
+  alt: string;
+  width?: number;
+  height?: number;
+  sizes?: string;
+  /** Above-the-fold image: eager loading, high fetch priority, preloaded */
+  priority?: boolean;
   /** Image provider for external URLs */
-  provider?: ImageProvider
+  provider?: ImageProvider;
   /** CSS class */
-  className?: string
+  className?: string;
   /** Quality override (1-100) */
-  quality?: number
+  quality?: number;
 }
 
-const DEFAULT_SIZES = '(max-width: 768px) 100vw, (max-width: 1200px) 50vw, 33vw'
-const WIDTHS = [640, 750, 828, 1080, 1200, 1920]
+const DEFAULT_SIZES = "(max-width: 768px) 100vw, (max-width: 1200px) 50vw, 33vw";
+const WIDTHS = [640, 750, 828, 1080, 1200, 1920];
 
 export function Image({
   src,
@@ -217,14 +258,20 @@ export function Image({
   className,
   quality = 80,
 }: ImageProps) {
+  const loading = priority ? "eager" : "lazy";
+  const fetchPriority = priority ? "high" : undefined;
+
   // Local processed image
-  if (typeof src === 'object') {
+  if (typeof src === "object") {
+    if (priority) {
+      preload(src.src, { as: "image", imageSrcSet: src.srcSet, imageSizes: sizes, fetchPriority: "high" });
+    }
     return (
       <div
         className={className}
         style={{
-          position: 'relative',
-          overflow: 'hidden',
+          position: "relative",
+          overflow: "hidden",
           aspectRatio: `${src.width} / ${src.height}`,
         }}
       >
@@ -235,13 +282,13 @@ export function Image({
             alt=""
             aria-hidden="true"
             style={{
-              position: 'absolute',
+              position: "absolute",
               inset: 0,
-              width: '100%',
-              height: '100%',
-              objectFit: 'cover',
-              filter: 'blur(20px)',
-              transform: 'scale(1.1)',
+              width: "100%",
+              height: "100%",
+              objectFit: "cover",
+              filter: "blur(20px)",
+              transform: "scale(1.1)",
             }}
           />
         )}
@@ -252,37 +299,44 @@ export function Image({
           alt={alt}
           width={src.width}
           height={src.height}
-          loading={priority ? 'eager' : 'lazy'}
-          decoding={priority ? 'sync' : 'async'}
+          loading={loading}
+          fetchPriority={fetchPriority}
+          decoding="async"
           style={{
-            position: 'relative',
-            width: '100%',
-            height: 'auto',
+            position: "relative",
+            width: "100%",
+            height: "auto",
           }}
         />
       </div>
-    )
+    );
   }
 
   // External image with provider (Cloudinary, Imgix, etc.)
   if (provider) {
-    const srcSet = WIDTHS
-      .map(w => `${provider.buildURL(src, { width: w, quality, format: 'auto' })} ${w}w`)
-      .join(', ')
+    const srcSet = WIDTHS.map((w) => `${provider.buildURL(src, { width: w, quality, format: "auto" })} ${w}w`).join(
+      ", ",
+    );
+    const fallbackSrc = provider.buildURL(src, { width: width ?? 1200, quality, format: "auto" });
+
+    if (priority) {
+      preload(fallbackSrc, { as: "image", imageSrcSet: srcSet, imageSizes: sizes, fetchPriority: "high" });
+    }
 
     return (
       <img
-        src={provider.buildURL(src, { width: width ?? 1200, quality, format: 'auto' })}
+        src={fallbackSrc}
         srcSet={srcSet}
         sizes={sizes}
         alt={alt}
         width={width}
         height={height}
-        loading={priority ? 'eager' : 'lazy'}
-        decoding={priority ? 'async' : 'async'}
+        loading={loading}
+        fetchPriority={fetchPriority}
+        decoding="async"
         className={className}
       />
-    )
+    );
   }
 
   // Plain external image (no optimization)
@@ -292,10 +346,11 @@ export function Image({
       alt={alt}
       width={width}
       height={height}
-      loading={priority ? 'eager' : 'lazy'}
+      loading={loading}
+      fetchPriority={fetchPriority}
       className={className}
     />
-  )
+  );
 }
 ```
 
@@ -303,24 +358,9 @@ export function Image({
 
 ## Preload hints for priority images
 
-Above-the-fold images should be preloaded for faster LCP. The framework injects preload hints into `<head>`:
+Above-the-fold images should start downloading as early as possible for a good LCP. Rather than guessing which image is the hero from the route's metadata (an OG image is a 1200×630 social card, usually not what's on screen), the `<Image>` component declares it: when `priority` is set, it calls React 19's [`preload()`](https://react.dev/reference/react-dom/preload) from `react-dom` with the image's `srcset` and `sizes`.
 
-```typescript
-// In the SSR pipeline, when a page has priority images
-function generateImagePreloads(metadata: RouteMetadata): string {
-  const preloads: string[] = []
-
-  // Preload OG images (they're often the hero image)
-  if (metadata.openGraph?.images?.[0]) {
-    const img = metadata.openGraph.images[0]
-    preloads.push(
-      `<link rel="preload" as="image" href="${img.url}" imagesrcset="${generateSrcSet(img.url)}" imagesizes="100vw" />`,
-    )
-  }
-
-  return preloads.join('\n')
-}
-```
+During SSR, React collects these resource hints while rendering and emits them as `<link rel="preload" as="image" imagesrcset="…" imagesizes="…" fetchpriority="high">` early in the HTML stream, ahead of the content that uses them; on the client, the same call inserts the link into `<head>`. React de-duplicates repeated calls for the same resource. Combined with `fetchPriority="high"` and `loading="eager"` on the `<img>` itself, the browser discovers and prioritizes the hero image before it parses the markup that contains it.
 
 ---
 
@@ -329,30 +369,32 @@ function generateImagePreloads(metadata: RouteMetadata): string {
 The image plugin is configured in the framework:
 
 ```typescript title="vite.config.ts"
-import eigen from 'eigen/plugin'
-import { cloudinaryProvider } from 'eigen/image-providers'
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import eigen from "./packages/eigen/plugin"; // a package import from Part 40 on
+import { cloudinaryProvider } from "eigen/image-providers";
 
 export default defineConfig({
   plugins: [
     eigen({
       images: {
         provider: cloudinaryProvider,
-        domains: ['res.cloudinary.com', 'images.ctfassets.net'],
+        domains: ["res.cloudinary.com", "images.ctfassets.net"],
         quality: 80,
-        formats: ['webp', 'avif'],
+        formats: ["webp", "avif"],
         deviceSizes: [640, 750, 828, 1080, 1200, 1920, 2048],
       },
     }),
     react(),
   ],
-})
+});
 ```
 
 ---
 
 ## Key insight
 
-Image optimization sits at the intersection of three Vite concerns: the `resolveId`/`load` hooks for processing image imports at build time, `transformIndexHtml` for injecting preload hints, and the component layer for rendering responsive `<img>` tags. For external images (Cloudinary, Imgix), no build-time processing is needed — the `<Image>` component generates CDN URLs with transformation parameters. The framework provides the component and the provider abstraction; the actual optimization happens either at build time (sharp) or at request time (CDN).
+Image optimization sits at the intersection of three concerns: the `resolveId`/`load` hooks for processing image imports (handing the generated variants to Vite's asset pipeline via `?url`), the component layer for rendering responsive `<img>` tags, and React 19's resource-hint APIs for preloading the images that matter for LCP. For external images (Cloudinary, Imgix), no build-time processing is needed — the `<Image>` component generates CDN URLs with transformation parameters. The framework provides the component and the provider abstraction; the actual optimization happens either at build time (sharp) or at request time (CDN).
 
 ---
 

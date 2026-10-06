@@ -8,8 +8,7 @@ concepts:
   - "generated type declarations"
 ---
 
-
-*This is the third installment in a series where we build a toy Next.js on top of Vite. In [Part 1](/01-bare-vite-spa), we set up the project and observed the dev server in action. Now we'll write our first Vite plugin — the route discovery system that makes everything else possible.*
+_This is the third installment in a series where we build a toy Next.js on top of Vite. In [Part 1](/01-bare-vite-spa), we set up the project and observed the dev server in action. Now we'll write our first Vite plugin — the route discovery system that makes everything else possible._
 
 ---
 
@@ -19,7 +18,7 @@ Our route plugin has three jobs:
 
 1. **Discover routes** — Scan `src/pages/` for `.tsx` files and convert filenames to route paths (`About.tsx` → `/about`, `posts/[id].tsx` → `/posts/:id`).
 
-2. **Generate a virtual module** — Produce a JavaScript module that exports the route table. The module should generate *different code* for client vs. server environments (lazy imports for the client, static imports for the server).
+2. **Generate a virtual module** — Produce a JavaScript module that exports the route table. The module should generate _different code_ for client vs. server environments (lazy imports for the client, static imports for the server).
 
 3. **Generate TypeScript declarations** — Write a `.d.ts` file that tells TypeScript about all known route paths and their parameter types, so the `Link` component and loaders get full type safety.
 
@@ -33,30 +32,37 @@ Before writing the plugin, we need to define the types that Eigen exposes to app
 
 ```typescript title="packages/eigen/types.ts"
 /**
- * Extract route param names from a path string.
- * Given '/posts/:id/:slug', produces { id: string; slug: string }.
+ * Walk a path string and collect one { name: string } object per
+ * `:name` segment. Static paths produce {}.
  *
  * This is a template literal type — TypeScript infers the structure
  * from the string literal at compile time.
  */
-export type RouteParams<T extends string> =
-	T extends `${string}:${infer Param}/${infer Rest}`
-		? { [K in Param]: string } & RouteParams<Rest>
-		: T extends `${string}:${infer Param}`
-			? { [K in Param]: string }
-			: Record<string, never>;
+type ExtractParams<T extends string> = T extends `${string}:${infer Param}/${infer Rest}`
+  ? { [K in Param]: string } & ExtractParams<`/${Rest}`>
+  : T extends `${string}:${infer Param}`
+    ? { [K in Param]: string }
+    : {};
+
+/**
+ * Extract route param names from a path string.
+ * Given '/posts/:id/:slug', produces { id: string; slug: string }.
+ * Given a static path like '/about', produces Record<string, never>.
+ */
+export type RouteParams<T extends string> = keyof ExtractParams<T> extends never
+  ? Record<string, never>
+  : ExtractParams<T>;
 
 /** Props passed to a page component */
 export interface PageProps<TPath extends string = string, TData = unknown> {
-	params: RouteParams<TPath>;
-	data: TData;
+  params: RouteParams<TPath>;
+  data: TData;
 }
 
 /** A loader function that runs on the server */
-export type LoaderFn<
-	TPath extends string = string,
-	TData = unknown,
-> = (context: { params: RouteParams<TPath> }) => Promise<TData> | TData;
+export type LoaderFn<TPath extends string = string, TData = unknown> = (context: {
+  params: RouteParams<TPath>;
+}) => Promise<TData> | TData;
 
 /**
  * Internal route definition used by the framework runtime.
@@ -66,37 +72,37 @@ export type LoaderFn<
  * and LoaderFn — those are for application code, not framework internals.
  */
 export interface RouteDefinition {
-	path: string;
-	component: React.ComponentType<Record<string, unknown>>;
-	loader?: (context: {
-		params: Record<string, string>;
-	}) => Promise<unknown> | unknown;
+  path: string;
+  component: React.ComponentType<Record<string, unknown>>;
+  loader?: (context: { params: Record<string, string> }) => Promise<unknown> | unknown;
 }
 ```
 
 ### Understanding `RouteParams`
 
-The `RouteParams` type deserves close attention. It's a **recursive conditional type** that uses template literal inference to extract parameter names from a route path string:
+The `RouteParams` type deserves close attention. The real work happens in `ExtractParams`, a **recursive conditional type** that uses template literal inference to extract parameter names from a route path string:
 
 ```typescript
-// Step through RouteParams<'/posts/:id/:slug'>:
+// Step through ExtractParams<'/posts/:id/:slug'>:
 
 // First: T extends `${string}:${infer Param}/${infer Rest}`
 //   Param = 'id', Rest = ':slug'
-type Step1 = RouteParams<'/posts/:id/:slug'>
-//   → { id: string } & RouteParams<':slug'>
+type Step1 = ExtractParams<"/posts/:id/:slug">;
+//   → { id: string } & ExtractParams<'/:slug'>
 
 // Recurse: T extends `${string}:${infer Param}`
 //   Param = 'slug'
-type Step2 = RouteParams<':slug'>
+type Step2 = ExtractParams<"/:slug">;
 //   → { slug: string }
 
 // Final result:
-type Result = RouteParams<'/posts/:id/:slug'>
+type Result = RouteParams<"/posts/:id/:slug">;
 //   → { id: string; slug: string }
 ```
 
-For a static route like `/about`, none of the template literal patterns match, so the result is `Record<string, never>` — an empty params object.
+When there are no more `:param` segments, the recursion bottoms out at `{}`. That base case matters: for `'/users/:userId/posts'`, the result is `{ userId: string } & {}`, which is just `{ userId: string }`. (Had the base case been `Record<string, never>`, the intersection would have forced `userId` to `string & never` — that is, `never`.)
+
+`RouteParams` wraps the result in one last check. If `ExtractParams` found no keys at all — a static route like `/about` — it returns `Record<string, never>`, an object that accepts no params.
 
 <TypeDeepDive title="TypeScript: Template literal types and `infer`">
 
@@ -118,63 +124,71 @@ import { resolve } from "node:path";
 import type { Plugin, ResolvedConfig } from "vite";
 
 interface DiscoveredRoute {
-	path: string;
-	componentPath: string;
-	file: string;
-	paramNames: string[];
+  path: string;
+  componentPath: string;
+  file: string;
+  paramNames: string[];
 }
 
 export function fileToRoute(filename: string): {
-	path: string;
-	paramNames: string[];
+  path: string;
+  paramNames: string[];
 } {
-	const paramNames: string[] = [];
+  const paramNames: string[] = [];
 
-	const name = filename
-		.replace(/\.tsx$/, "")
-		.replace(/\[(\w+)\]/g, (_, param: string) => {
-			paramNames.push(param);
-			return `:${param}`;
-		})
-		.replace(/\/index$/, "");
+  const segments = filename
+    .replace(/\.tsx$/, "")
+    .split("/")
+    .map((segment) => {
+      // [id] → :id — param names keep their exact casing
+      const param = /^\[(\w+)\]$/.exec(segment);
+      if (param) {
+        paramNames.push(param[1]);
+        return `:${param[1]}`;
+      }
+      // Static segments are lowercased: About.tsx → /about
+      return segment.toLowerCase();
+    });
 
-	const path = name === "Home" ? "/" : `/${name.toLowerCase()}`;
-	return { path, paramNames };
+  // blog/index.tsx → /blog
+  if (segments[segments.length - 1] === "index") segments.pop();
+
+  const name = segments.join("/");
+  const path = name === "home" || name === "" ? "/" : `/${name}`;
+  return { path, paramNames };
 }
 
 export function discoverRoutes(pagesDir: string): DiscoveredRoute[] {
-	const files = readdirSync(pagesDir, { recursive: true }).filter(
-		(f): f is string => typeof f === "string" && f.endsWith(".tsx"),
-	);
+  const files = readdirSync(pagesDir, { recursive: true })
+    .filter((f): f is string => typeof f === "string" && f.endsWith(".tsx"))
+    // readdirSync returns backslash-separated paths on Windows
+    .map((f) => f.replaceAll("\\", "/"));
 
-	return files.map((file) => {
-		const { path, paramNames } = fileToRoute(file);
-		return {
-			path,
-			componentPath: `/src/pages/${file}`,
-			file,
-			paramNames,
-		};
-	});
+  return files.map((file) => {
+    const { path, paramNames } = fileToRoute(file);
+    return {
+      path,
+      componentPath: `/src/pages/${file}`,
+      file,
+      paramNames,
+    };
+  });
 }
 
-function generateRouteDeclarations(
-	routes: DiscoveredRoute[],
-	outDir: string,
-): void {
-	const pathUnion = routes.map((r) => `'${r.path}'`).join(" | ") || "never";
+function generateRouteDeclarations(routes: DiscoveredRoute[], outDir: string): void {
+  const pathUnion = routes.map((r) => `'${r.path}'`).join(" | ") || "never";
 
-	const paramEntries = routes
-		.map((r) => {
-			if (r.paramNames.length === 0) {
-				return `    '${r.path}': Record<string, never>`;
-			}
-			const paramType = r.paramNames.map((p) => `${p}: string`).join("; ");
-			return `    '${r.path}': { ${paramType} }`;
-		})
-		.join("\n");
+  const paramEntries = routes
+    .map((r) => {
+      if (r.paramNames.length === 0) {
+        return `    '${r.path}': Record<string, never>`;
+      }
+      const paramType = r.paramNames.map((p) => `${p}: string`).join("; ");
+      return `    '${r.path}': { ${paramType} }`;
+    })
+    .join("\n");
 
-	const dts = `// Auto-generated by eigen — do not edit
+  const dts = `// Auto-generated by eigen — do not edit
 declare module 'eigen/routes' {
   import type { RouteDefinition } from 'eigen/types'
   export const routes: RouteDefinition[]
@@ -191,130 +205,119 @@ ${paramEntries}
 }
 `;
 
-	mkdirSync(outDir, { recursive: true });
-	writeFileSync(resolve(outDir, "eigen-routes.d.ts"), dts);
+  mkdirSync(outDir, { recursive: true });
+  writeFileSync(resolve(outDir, "eigen-routes.d.ts"), dts);
 }
 
 export default function eigenRoutes(): Plugin {
-	const virtualModuleId = "eigen/routes";
-	const resolvedVirtualModuleId = `\0${virtualModuleId}`;
-	let pagesDir: string;
-	let root: string;
+  const virtualModuleId = "eigen/routes";
+  const resolvedVirtualModuleId = `\0${virtualModuleId}`;
+  let pagesDir: string;
+  let root: string;
 
-	return {
-		name: "eigen-routes",
+  return {
+    name: "eigen-routes",
 
-		configResolved(config: ResolvedConfig) {
-			root = config.root;
-			pagesDir = resolve(config.root, "src/pages");
+    configResolved(config: ResolvedConfig) {
+      root = config.root;
+      pagesDir = resolve(config.root, "src/pages");
 
-			// Generate declarations on startup so the IDE has them immediately
-			const routes = discoverRoutes(pagesDir);
-			generateRouteDeclarations(routes, resolve(root, "node_modules/.eigen"));
-		},
+      // Generate declarations on startup so the IDE has them immediately
+      const routes = discoverRoutes(pagesDir);
+      generateRouteDeclarations(routes, resolve(root, "node_modules/.eigen"));
+    },
 
-		resolveId(id: string) {
-			if (id === virtualModuleId) {
-				return resolvedVirtualModuleId;
-			}
-		},
+    resolveId(id: string) {
+      if (id === virtualModuleId) {
+        return resolvedVirtualModuleId;
+      }
+    },
 
-		load(id: string) {
-			if (id === resolvedVirtualModuleId) {
-				const routes = discoverRoutes(pagesDir);
-				const isSSR = this.environment?.name === "ssr";
+    load(id: string) {
+      if (id === resolvedVirtualModuleId) {
+        const routes = discoverRoutes(pagesDir);
+        const isSSR = this.environment.name === "ssr";
 
-				if (isSSR) {
-					// Server: static imports, include loaders
-					const imports = routes
-						.map(
-							(r, i) =>
-								`import Page${i}, { loader as loader${i} } from '${r.componentPath}'`,
-						)
-						.join("\n");
+        if (isSSR) {
+          // Server: static namespace imports, include loaders
+          const imports = routes.map((r, i) => `import * as RouteMod${i} from '${r.componentPath}'`).join("\n");
 
-					const routeArray = routes
-						.map(
-							(r, i) =>
-								`  { path: '${r.path}', component: Page${i}, loader: typeof loader${i} !== 'undefined' ? loader${i} : undefined }`,
-						)
-						.join(",\n");
+          const routeArray = routes
+            .map((r, i) => `  { path: '${r.path}', component: RouteMod${i}.default, loader: RouteMod${i}.loader }`)
+            .join(",\n");
 
-					return {
-						code: `
+          return {
+            code: `
 ${imports}
 export const routes = [\n${routeArray}\n]
             `.trim(),
-						moduleType: "js",
-					};
-				} else {
-					// Client: lazy imports for code splitting, no loaders
-					const imports = routes
-						.map(
-							(r, i) =>
-								`const Page${i} = React.lazy(() => import('${r.componentPath}'))`,
-						)
-						.join("\n");
+            moduleType: "js",
+          };
+        } else {
+          // Client: lazy imports for code splitting, no loaders
+          const imports = routes
+            .map((r, i) => `const Page${i} = React.lazy(() => import('${r.componentPath}'))`)
+            .join("\n");
 
-					const routeArray = routes
-						.map((r, i) => `  { path: '${r.path}', component: Page${i} }`)
-						.join(",\n");
+          const routeArray = routes.map((r, i) => `  { path: '${r.path}', component: Page${i} }`).join(",\n");
 
-					return {
-						code: `
+          return {
+            code: `
 import React from 'react'
 ${imports}
 export const routes = [\n${routeArray}\n]
             `.trim(),
-						moduleType: "js",
-					};
-				}
-			}
-		},
+            moduleType: "js",
+          };
+        }
+      }
+    },
 
-		configureServer(server) {
-			server.watcher.add(pagesDir);
-			server.watcher.on("all", (_, filePath) => {
-				if (filePath.startsWith(pagesDir) && filePath.endsWith(".tsx")) {
-					// Regenerate declarations so the IDE picks up new routes
-					const routes = discoverRoutes(pagesDir);
-					generateRouteDeclarations(
-						routes,
-						resolve(root, "node_modules/.eigen"),
-					);
+    configureServer(server) {
+      // Only structural changes matter: a page was added or removed.
+      // Edits to an existing page are ordinary HMR updates.
+      const onPagesChanged = (filePath: string) => {
+        if (!filePath.startsWith(pagesDir) || !filePath.endsWith(".tsx")) return;
 
-					// Invalidate the virtual module so it regenerates
-					const mod = server.moduleGraph.getModuleById(resolvedVirtualModuleId);
-					if (mod) {
-						server.moduleGraph.invalidateModule(mod);
-						server.ws.send({ type: "full-reload" });
-					}
-				}
-			});
-		},
-	};
+        // Regenerate declarations so the IDE picks up new routes
+        const routes = discoverRoutes(pagesDir);
+        generateRouteDeclarations(routes, resolve(root, "node_modules/.eigen"));
+
+        // Invalidate the virtual module in both environments' graphs
+        for (const env of [server.environments.client, server.environments.ssr]) {
+          const mod = env.moduleGraph.getModuleById(resolvedVirtualModuleId);
+          if (mod) env.moduleGraph.invalidateModule(mod);
+        }
+
+        // The route table changed structurally — reload the browser
+        server.environments.client.hot.send({ type: "full-reload" });
+      };
+
+      server.watcher.on("add", onPagesChanged);
+      server.watcher.on("unlink", onPagesChanged);
+    },
+  };
 }
-
 ```
 
 ### Helper functions
 
-**`fileToRoute`** converts filesystem paths to route paths following the [Next.js pages router](https://nextjs.org/docs/pages/building-your-application/routing) convention: `Home.tsx` → `/`, `About.tsx` → `/about`, `posts/[id].tsx` → `/posts/:id`. The `[param]` → `:param` conversion extracts the parameter names, which we'll need for type generation.
+**`fileToRoute`** converts filesystem paths to route paths, borrowing the bracket syntax of the [Next.js pages router](https://nextjs.org/docs/pages/building-your-application/routing) with a couple of Eigen-specific twists: `Home.tsx` (or `index.tsx`) → `/`, `About.tsx` → `/about`, `posts/[id].tsx` → `/posts/:id`, `blog/index.tsx` → `/blog`. It works segment by segment. Static segments are lowercased so PascalCase component files produce conventional URLs. Param segments keep their exact spelling — `[userId]` becomes `:userId`, not `:userid` — because the param name has to agree everywhere it appears: in the route path the matcher reads, in the generated `RouteParamsMap`, and in the `params` object components receive.
 
-**`discoverRoutes`** scans the pages directory recursively and maps each `.tsx` file through `fileToRoute`.
+**`discoverRoutes`** scans the pages directory recursively and maps each `.tsx` file through `fileToRoute`. It normalizes Windows backslashes to `/` first, so `posts\[id].tsx` produces the same route (and the same `/src/pages/...` import URL) on every OS.
 
 ### Type declarations
 
 **`generateRouteDeclarations`** writes a `.d.ts` file that gives TypeScript full knowledge of the route topology. For a project with `Home.tsx`, `About.tsx`, and `posts/[id].tsx`, it generates:
 
 ```typescript
-declare module 'eigen/route-types' {
-  export type RoutePaths = '/' | '/about' | '/posts/:id'
+declare module "eigen/route-types" {
+  export type RoutePaths = "/" | "/about" | "/posts/:id";
 
   export interface RouteParamsMap {
-    '/': Record<string, never>
-    '/about': Record<string, never>
-    '/posts/:id': { id: string }
+    "/": Record<string, never>;
+    "/about": Record<string, never>;
+    "/posts/:id": { id: string };
   }
 }
 ```
@@ -323,7 +326,7 @@ Now TypeScript knows every valid route path and what parameters each one expects
 
 <TypeDeepDive title="TypeScript: `declare module` and ambient declarations">
 
-`declare module 'some-module'` tells TypeScript about a module's types without providing any implementation code. For virtual modules — which don't exist as files on disk — this is the *only* way TypeScript can know what an import contains. The declaration file acts as a contract: the plugin's `load` hook must produce code whose exports match the declared shape, but TypeScript trusts the declaration at compile time without verifying it. This technique is also called "ambient module declaration," and it's the same mechanism used by [`@types/*`](https://github.com/DefinitelyTyped/DefinitelyTyped) packages to type third-party JavaScript libraries.
+`declare module 'some-module'` tells TypeScript about a module's types without providing any implementation code. For virtual modules — which don't exist as files on disk — this is the _only_ way TypeScript can know what an import contains. The declaration file acts as a contract: the plugin's `load` hook must produce code whose exports match the declared shape, but TypeScript trusts the declaration at compile time without verifying it. This technique is also called "ambient module declaration," and it's the same mechanism used by [`@types/*`](https://github.com/DefinitelyTyped/DefinitelyTyped) packages to type third-party JavaScript libraries.
 
 </TypeDeepDive>
 
@@ -335,9 +338,21 @@ Let's walk through each hook:
 
 **`resolveId`** intercepts the import `'eigen/routes'` and returns our internal ID (prefixed with `\0`). This tells Vite "I'll handle this module — don't look for it on disk."
 
-**`load`** generates the virtual module's source code. It checks [`this.environment?.name`](https://vite.dev/guide/api-environment) to determine whether it's generating for the client or server environment, and produces different code for each. The client version uses [`React.lazy()`](https://react.dev/reference/react/lazy) for code splitting; the server version uses static imports and includes the `loader` exports.
+**`load`** generates the virtual module's source code. It checks [`this.environment.name`](https://vite.dev/guide/api-environment) to determine whether it's generating for the client or server environment, and produces different code for each. The client version uses [`React.lazy()`](https://react.dev/reference/react/lazy) for code splitting. The server version uses static _namespace_ imports and reads the optional `loader` export off the namespace:
 
-**`configureServer`** sets up a file watcher on the pages directory. When a file is added, deleted, or renamed, it regenerates the type declarations and invalidates the virtual module in Vite's module graph. The `server.ws.send({ type: 'full-reload' })` tells the browser to refresh, since the route table has changed structurally.
+```js
+// Generated for the SSR environment
+import * as RouteMod0 from "/src/pages/About.tsx";
+import * as RouteMod1 from "/src/pages/posts/[id].tsx";
+export const routes = [
+  { path: "/about", component: RouteMod0.default, loader: RouteMod0.loader },
+  { path: "/posts/:id", component: RouteMod1.default, loader: RouteMod1.loader },
+];
+```
+
+Why `import * as` instead of `import Page0, { loader as loader0 }`? Most pages don't export a loader, and a _named_ import of a missing export is a hard error in ESM. Vite's dev runner happens to tolerate it, but a production build with Rolldown fails with `[MISSING_EXPORT] "loader" is not exported by "src/pages/About.tsx"`. A property read on a namespace object is just `undefined` when the export doesn't exist. (Rolldown still prints an `IMPORT_IS_UNDEFINED` warning for those pages during `vite build` — it's informational, and exactly the behaviour we want.) Later parts read further optional exports the same way.
+
+**`configureServer`** listens for page files being added (`add`) or deleted (`unlink`) — a rename fires both. Editing an existing page is _not_ a structural change, so it's left to normal HMR. On a structural change, it regenerates the type declarations and invalidates the virtual module in each environment's module graph (`server.environments.client.moduleGraph` and `server.environments.ssr.moduleGraph`), since each environment has its own copy of `eigen/routes`. Then `server.environments.client.hot.send({ type: 'full-reload' })` tells the browser to refresh, since the route table has changed. (We don't need to add `src/pages` to the watcher: Vite already watches everything under the project root.)
 
 ---
 
@@ -362,109 +377,108 @@ Note that you need to run the dev server at least once (`npx vite`) for the decl
 Update `vite.config.ts`:
 
 ```typescript title="vite.config.ts"
-import { resolve } from 'node:path'
-import react from '@vitejs/plugin-react'
-import { defineConfig } from 'vite'
-import eigenRoutes from './plugins/eigen-routes' // [!code ++]
+import { resolve } from "node:path";
+import react from "@vitejs/plugin-react";
+import { defineConfig } from "vite";
+import eigenRoutes from "./plugins/eigen-routes"; // [!code ++]
 
 export default defineConfig({
   plugins: [react()], // [!code --]
   plugins: [react(), eigenRoutes()], // [!code ++]
-  resolve: { // [!code ++]
-    alias: { // [!code ++]
-      'eigen/types': resolve(__dirname, 'packages/eigen/types.ts'), // [!code ++]
-    }, // [!code ++]
-  }, // [!code ++]
-})
+  resolve: {
+    alias: {
+      "eigen/types": resolve(__dirname, "packages/eigen/types.ts"),
+    },
+  },
+});
 ```
 
 Update `src/main.tsx` to consume the generated routes with type-safe navigation. We're defining `Router` and `Link` inline here to keep things simple — in a real framework, these would live in the framework package (e.g., `packages/eigen/router.tsx`). We'll extract them in [Part 11](/11-framework-plugin) once the framework plugin takes shape.
 
 ```tsx title="src/main.tsx"
-import React, { Suspense, useState, useEffect } from 'react'
-import { createRoot } from 'react-dom/client'
-import { routes } from 'eigen/routes'
-import type { RouteDefinition } from 'eigen/types'
-import type { RoutePaths, RouteParamsMap } from 'eigen/route-types'
+import React, { Suspense, useState, useEffect } from "react";
+import { createRoot } from "react-dom/client";
+import { routes } from "eigen/routes";
+import type { RouteDefinition } from "eigen/types";
+import type { RoutePaths, RouteParamsMap } from "eigen/route-types";
 
 interface RouteMatch {
-  route: RouteDefinition
-  params: Record<string, string>
+  route: RouteDefinition;
+  params: Record<string, string>;
 }
 
 function matchRoute(pathname: string): RouteMatch | null {
   for (const route of routes) {
-    if (route.path === pathname) return { route, params: {} }
+    if (route.path === pathname) return { route, params: {} };
 
-    const routeParts = route.path.split('/')
-    const pathParts = pathname.split('/')
-    if (routeParts.length !== pathParts.length) continue
+    const routeParts = route.path.split("/");
+    const pathParts = pathname.split("/");
+    if (routeParts.length !== pathParts.length) continue;
 
-    const params: Record<string, string> = {}
+    const params: Record<string, string> = {};
     const match = routeParts.every((part, i) => {
-      if (part.startsWith(':')) {
-        params[part.slice(1)] = pathParts[i]
-        return true
+      if (part.startsWith(":")) {
+        params[part.slice(1)] = pathParts[i];
+        return true;
       }
-      return part === pathParts[i]
-    })
+      return part === pathParts[i];
+    });
 
-    if (match) return { route, params }
+    if (match) return { route, params };
   }
-  return null
+  return null;
 }
 
 function Router() {
-  const [pathname, setPathname] = useState(window.location.pathname)
+  const [pathname, setPathname] = useState(window.location.pathname);
 
   useEffect(() => {
-    const handler = () => setPathname(window.location.pathname)
-    window.addEventListener('popstate', handler)
-    return () => window.removeEventListener('popstate', handler)
-  }, [])
+    const handler = () => setPathname(window.location.pathname);
+    window.addEventListener("popstate", handler);
+    return () => window.removeEventListener("popstate", handler);
+  }, []);
 
-  const match = matchRoute(pathname)
-  if (!match) return <h1>404</h1>
+  const match = matchRoute(pathname);
+  if (!match) return <h1>404</h1>;
 
-  const Component = match.route.component
+  const Component = match.route.component;
   return (
     <Suspense fallback={<div>Loading...</div>}>
       <Component params={match.params} data={undefined} />
     </Suspense>
-  )
+  );
 }
 
 /**
  * Type-safe Link component.
  * The `to` prop only accepts known route paths.
- * For dynamic routes, you must provide the params.
+ * Dynamic routes require `params`; static routes forbid it.
  */
-interface LinkProps<T extends RoutePaths> {
-  to: T
-  params?: RouteParamsMap[T]
-  children: React.ReactNode
-}
+type LinkProps<T extends RoutePaths> = {
+  to: T;
+  children: React.ReactNode;
+} & (RouteParamsMap[T] extends Record<string, never> ? { params?: undefined } : { params: RouteParamsMap[T] });
 
 function Link<T extends RoutePaths>({ to, params, children }: LinkProps<T>) {
-  let href: string = to
+  let href: string = to;
   if (params) {
     href = to.replace(/:(\w+)/g, (_, key: string) => {
-      return (params as Record<string, string>)[key] ?? `:${key}`
-    })
+      return (params as Record<string, string>)[key] ?? `:${key}`;
+    });
   }
 
   return (
     <a
       href={href}
       onClick={(e) => {
-        e.preventDefault()
-        window.history.pushState({}, '', href)
-        window.dispatchEvent(new PopStateEvent('popstate'))
+        e.preventDefault();
+        window.history.pushState({}, "", href);
+        window.dispatchEvent(new PopStateEvent("popstate"));
       }}
     >
       {children}
     </a>
-  )
+  );
 }
 
 function App() {
@@ -477,20 +491,22 @@ function App() {
       </nav>
       <Router />
     </div>
-  )
+  );
 }
 
-export { Link }
-const root = document.getElementById('root')
-if (!root) throw new Error('Root element not found')
-createRoot(root).render(<App />)
+export { Link };
+const root = document.getElementById("root");
+if (!root) throw new Error("Root element not found");
+createRoot(root).render(<App />);
 ```
 
-The `Link` component is generic over `T extends RoutePaths`. When you write `<Link to="/">`, TypeScript infers `T = "/"` and checks that it's a member of the `RoutePaths` union. If you write `<Link to="/posts/:id">`, TypeScript requires a `params` prop of type `{ id: string }`. If you write `<Link to="/nonexistent">`, you get a compile error — `/nonexistent` isn't in the union.
+The `Link` component is generic over `T extends RoutePaths`. When you write `<Link to="/">`, TypeScript infers `T = "/"` and checks that it's a member of the `RoutePaths` union. If you write `<Link to="/posts/:id">`, TypeScript requires a `params` prop of type `{ id: string }` — leaving it out is a compile error. If you write `<Link to="/nonexistent">`, you get a compile error — `/nonexistent` isn't in the union.
 
-<TypeDeepDive title="TypeScript: Generic React components">
+<TypeDeepDive title="TypeScript: Generic React components and conditional props">
 
-`function Link<T extends RoutePaths>` makes `Link` a generic component — the type parameter `T` is inferred from the `to` prop when you use it in JSX. The `extends RoutePaths` constraint limits `T` to only valid route paths from the generated union, so `<Link to="/nonexistent">` is a compile-time error. Once `T` is inferred (say, as `'/posts/:id'`), the `params` prop's type is derived from it via `RouteParamsMap[T]`, which resolves to `{ id: string }`. This means the compiler knows exactly which params each route needs — and will error if you forget one or add an extra.
+`function Link<T extends RoutePaths>` makes `Link` a generic component — the type parameter `T` is inferred from the `to` prop when you use it in JSX. The `extends RoutePaths` constraint limits `T` to only valid route paths from the generated union, so `<Link to="/nonexistent">` is a compile-time error.
+
+Once `T` is inferred, a conditional type picks the shape of the rest of the props. `RouteParamsMap[T] extends Record<string, never>` is true only for static routes, which get an optional `params?: undefined` (so passing params to `/about` is an error). Every other route gets a _required_ `params: RouteParamsMap[T]` — for `'/posts/:id'`, that's `{ id: string }`. A plain `params?: RouteParamsMap[T]` would look similar but would let you silently forget the params on a dynamic route. With the conditional, the compiler knows exactly which params each route needs — and will error if you forget one, misspell one, or add an extra.
 
 </TypeDeepDive>
 
@@ -501,15 +517,13 @@ The `Link` component is generic over `T extends RoutePaths`. When you write `<Li
 This page won't fully work yet — we haven't introduced SSR or wired up loaders (that's [Parts 3](/03-server-side-rendering)–[5](/05-typed-loaders)). But it shows what a type-safe page component looks like and how the types we've built connect:
 
 ```tsx title="src/pages/posts/[id].tsx"
-import type { PageProps } from 'eigen/types'
+import type { PageProps } from "eigen/types";
 
-type Props = PageProps<'/posts/:id', { title: string; body: string }>
+type Props = PageProps<"/posts/:id", { title: string; body: string }>;
 
 export async function loader({ params }: { params: { id: string } }) {
-  const post = await fetch(
-    `https://jsonplaceholder.typicode.com/posts/${params.id}`,
-  )
-  return post.json() as Promise<{ title: string; body: string }>
+  const post = await fetch(`https://jsonplaceholder.typicode.com/posts/${params.id}`);
+  return post.json() as Promise<{ title: string; body: string }>;
 }
 
 export default function PostPage({ params, data }: Props) {
@@ -522,7 +536,7 @@ export default function PostPage({ params, data }: Props) {
       <p>Post #{params.id}</p>
       <p>{data.body}</p>
     </article>
-  )
+  );
 }
 ```
 
@@ -539,21 +553,21 @@ The `PageProps<'/posts/:id', { title: string; body: string }>` type ties this co
    ```
 
    ```typescript title="vite.config.ts"
-   import { resolve } from 'node:path'
-   import react from '@vitejs/plugin-react'
-   import inspect from 'vite-plugin-inspect' // [!code ++]
-   import { defineConfig } from 'vite'
-   import eigenRoutes from './plugins/eigen-routes'
+   import { resolve } from "node:path";
+   import react from "@vitejs/plugin-react";
+   import inspect from "vite-plugin-inspect"; // [!code ++]
+   import { defineConfig } from "vite";
+   import eigenRoutes from "./plugins/eigen-routes";
 
    export default defineConfig({
      plugins: [react(), eigenRoutes()], // [!code --]
      plugins: [react(), eigenRoutes(), inspect()], // [!code ++]
      resolve: {
        alias: {
-         'eigen/types': resolve(__dirname, 'packages/eigen/types.ts'),
+         "eigen/types": resolve(__dirname, "packages/eigen/types.ts"),
        },
      },
-   })
+   });
    ```
 
    Visit `/__inspect/` and find the virtual module `eigen/routes` — you can see the generated source code and the transform pipeline it passes through. This is an invaluable debugging tool for plugin development.
@@ -579,48 +593,55 @@ The plugin is the single source of truth. It writes two parallel representations
 The route discovery plugin is built from pure functions — ideal targets for unit tests. Since `fileToRoute` and `discoverRoutes` are already exported from the plugin, tests can import them directly:
 
 ```typescript title="plugins/__tests__/eigen-routes.test.ts"
-import { describe, it, expect } from 'vitest'
-import { fileToRoute } from '../eigen-routes'
+import { describe, it, expect } from "vitest";
+import { fileToRoute } from "../eigen-routes";
 
-describe('fileToRoute', () => {
-  it('converts Home.tsx to /', () => {
-    expect(fileToRoute('Home.tsx')).toEqual({
-      path: '/',
+describe("fileToRoute", () => {
+  it("converts Home.tsx to /", () => {
+    expect(fileToRoute("Home.tsx")).toEqual({
+      path: "/",
       paramNames: [],
-    })
-  })
+    });
+  });
 
-  it('converts About.tsx to /about', () => {
-    expect(fileToRoute('About.tsx')).toEqual({
-      path: '/about',
+  it("converts About.tsx to /about", () => {
+    expect(fileToRoute("About.tsx")).toEqual({
+      path: "/about",
       paramNames: [],
-    })
-  })
+    });
+  });
 
-  it('extracts dynamic params from [id].tsx', () => {
-    expect(fileToRoute('posts/[id].tsx')).toEqual({
-      path: '/posts/:id',
-      paramNames: ['id'],
-    })
-  })
+  it("extracts dynamic params from [id].tsx", () => {
+    expect(fileToRoute("posts/[id].tsx")).toEqual({
+      path: "/posts/:id",
+      paramNames: ["id"],
+    });
+  });
 
-  it('handles multiple dynamic segments', () => {
-    expect(fileToRoute('users/[userId]/posts/[postId].tsx')).toEqual({
-      path: '/users/:userid/posts/:postid',
-      paramNames: ['userId', 'postId'],
-    })
-  })
+  it("handles multiple dynamic segments and preserves param casing", () => {
+    expect(fileToRoute("users/[userId]/posts/[postId].tsx")).toEqual({
+      path: "/users/:userId/posts/:postId",
+      paramNames: ["userId", "postId"],
+    });
+  });
 
-  it('strips /index from nested index routes', () => {
-    expect(fileToRoute('blog/index.tsx')).toEqual({
-      path: '/blog',
+  it("lowercases static segments only", () => {
+    expect(fileToRoute("Blog/[slugId].tsx")).toEqual({
+      path: "/blog/:slugId",
+      paramNames: ["slugId"],
+    });
+  });
+
+  it("strips /index from nested index routes", () => {
+    expect(fileToRoute("blog/index.tsx")).toEqual({
+      path: "/blog",
       paramNames: [],
-    })
-  })
-})
+    });
+  });
+});
 ```
 
-These tests document the routing conventions: the `Home.tsx` → `/` special case, the `[param]` → `:param` conversion, and the `index` stripping. If a future change breaks a convention, the test names explain *what* broke and *why* it matters.
+These tests document the routing conventions: the `Home.tsx` → `/` special case, the `[param]` → `:param` conversion (with param names left exactly as written), static-segment lowercasing, and the `index` stripping. If a future change breaks a convention, the test names explain _what_ broke and _why_ it matters.
 
 Run with `npx vitest run plugins/` — since these are pure functions with no Vite dependencies, the tests are fast and isolated.
 
@@ -638,4 +659,4 @@ Run with `npx vitest run plugins/` — since these are pure functions with no Vi
 
 ## What's next
 
-In [Part 3](/03-server-side-rendering), we'll add server-side rendering. This means introducing Vite's [`ssrLoadModule`](https://vite.dev/guide/api-javascript#vitedevserver-ssrloadmodule) API, creating a custom dev server with [H3](https://h3.dev), and understanding how the two module graphs (client and SSR) work in practice. The virtual module will start generating different code per environment.
+In [Part 3](/03-server-side-rendering), we'll add server-side rendering. This means introducing Vite's [ModuleRunner](https://vite.dev/guide/api-environment-frameworks) (`environments.ssr.runner.import()`), creating a custom dev server with [H3](https://h3.dev), and understanding how the two module graphs (client and SSR) work in practice. The SSR branch of the virtual module — the one with the loaders — finally gets exercised.

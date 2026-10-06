@@ -8,8 +8,7 @@ concepts:
   - "zero-latency navigations"
 ---
 
-
-*This is the twenty-fourth installment in a series where we build a toy Next.js on top of Vite. In [Part 23](/23-advanced-router), we replaced our router with the Navigation API. Now we'll layer on two more browser APIs — View Transitions for animated navigations and Speculation Rules for browser-native prerendering — to give Eigen the instant, animated feel of a native app.*
+_This is the twenty-fifth installment in a series where we build a toy Next.js on top of Vite. In [Part 23](/23-advanced-router), we added ranked matching, typed search params and preloading to the Navigation API router from [Part 22](/22-navigation-api). Now we'll layer on two more browser APIs — View Transitions for animated navigations and Speculation Rules for browser-native prerendering — to give Eigen the instant, animated feel of a native app._
 
 ---
 
@@ -22,52 +21,65 @@ The View Transitions API lets the browser capture a "before" snapshot of the pag
 In our Navigation API intercept handler, wrap the DOM update in `startViewTransition`:
 
 ```typescript
+import { flushSync } from "react-dom";
+
+// Part 23's data fetch, pulled into a helper: preloaded result first, network second
+function fetchRouteData(url: URL, signal: AbortSignal): Promise<unknown> {
+  const href = url.pathname + url.search;
+  return (
+    takePreloadedData(href) ??
+    fetch(`/_eigen/data?path=${encodeURIComponent(href)}`, { signal }).then((res) => res.json())
+  );
+}
+
 event.intercept({
   async handler() {
-    const res = await fetch(`/_eigen/data?path=${encodeURIComponent(url.pathname)}`, {
-      signal: event.signal,
-    })
-    const newData = await res.json()
+    const newData = await fetchRouteData(url, event.signal);
+
+    const commit = () => {
+      // flushSync makes React apply the update synchronously,
+      // so the "after" snapshot sees the new page
+      flushSync(() => {
+        setLocation({ pathname: url.pathname, search: url.search });
+        setData(newData);
+      });
+    };
+
+    // Feature-detect: browsers without view transitions just update
+    if (!document.startViewTransition) {
+      commit();
+      return;
+    }
 
     // Wrap the state update in a view transition
-    const transition = document.startViewTransition(() => {
-      // This callback runs synchronously — React flushes the update
-      flushSync(() => {
-        setPathname(url.pathname)
-        setData(newData)
-      })
-    })
+    const transition = document.startViewTransition(commit);
 
     // Optionally wait for the animation to complete
-    await transition.finished
+    await transition.finished;
   },
-})
+});
 ```
 
-The browser automatically creates `::view-transition-old(root)` and `::view-transition-new(root)` pseudo-elements and crossfades between them. You control the animation entirely in CSS:
+The browser automatically creates `::view-transition-old(root)` and `::view-transition-new(root)` pseudo-elements and crossfades between them — that default needs no CSS at all. To change it, you target those pseudo-elements in CSS. For example, a slide instead of a crossfade:
 
 ```css
-/* Default crossfade — applied automatically */
-::view-transition-old(root) {
-  animation: fade-out 200ms ease;
-}
-::view-transition-new(root) {
-  animation: fade-in 200ms ease;
-}
-
-/* Slide animation for navigations */
+/* Slide animation for navigations (replaces the default crossfade) */
 @keyframes slide-out {
-  to { transform: translateX(-100%); }
+  to {
+    transform: translateX(-100%);
+  }
 }
 @keyframes slide-in {
-  from { transform: translateX(100%); }
+  from {
+    transform: translateX(100%);
+  }
 }
 
 ::view-transition-old(root) {
-  animation: slide-out 300ms ease;
+  animation: slide-out 300ms ease both;
 }
 ::view-transition-new(root) {
-  animation: slide-in 300ms ease;
+  animation: slide-in 300ms ease both;
 }
 ```
 
@@ -83,7 +95,7 @@ function PostCard({ post }: { post: Post }) {
       <h2>{post.title}</h2>
       <img src={post.thumbnail} alt="" />
     </article>
-  )
+  );
 }
 
 // On the detail page
@@ -93,7 +105,7 @@ function PostDetail({ data }: { data: Post }) {
       <h1>{data.title}</h1>
       <img src={data.image} alt="" />
     </article>
-  )
+  );
 }
 ```
 
@@ -107,29 +119,67 @@ The Navigation API provides navigation direction, which we can use to set transi
 event.intercept({
   async handler() {
     // Determine direction based on history position
-    const isBack = event.navigationType === 'traverse'
-      && (event.destination.index ?? 0) < (navigation.currentEntry?.index ?? 0)
+    const isBack =
+      event.navigationType === "traverse" && event.destination.index < (navigation.currentEntry?.index ?? 0);
+
+    const newData = await fetchRouteData(url, event.signal);
 
     // Set the transition type — CSS uses this to choose the animation
     const transition = document.startViewTransition({
-      update: () => flushSync(() => { setPathname(url.pathname); setData(newData) }),
-      types: [isBack ? 'slide-backward' : 'slide-forward'],
-    })
+      update: () =>
+        flushSync(() => {
+          setLocation({ pathname: url.pathname, search: url.search });
+          setData(newData);
+        }),
+      types: [isBack ? "slide-backward" : "slide-forward"],
+    });
+    await transition.finished;
   },
-})
+});
 ```
 
+Types are matched in CSS with the `:active-view-transition-type()` pseudo-class on the document element (the `@view-transition` at-rule doesn't take selectors — it only has `navigation` and `types` descriptors):
+
 ```css
-/* Forward navigation: slide left */
-@view-transition(slide-forward) {
-  ::view-transition-old(root) { animation: slide-out-left 300ms; }
-  ::view-transition-new(root) { animation: slide-in-right 300ms; }
+@keyframes slide-out-left {
+  to {
+    transform: translateX(-100%);
+  }
+}
+@keyframes slide-in-right {
+  from {
+    transform: translateX(100%);
+  }
+}
+@keyframes slide-out-right {
+  to {
+    transform: translateX(100%);
+  }
+}
+@keyframes slide-in-left {
+  from {
+    transform: translateX(-100%);
+  }
 }
 
-/* Back navigation: slide right */
-@view-transition(slide-backward) {
-  ::view-transition-old(root) { animation: slide-in-left 300ms reverse; }
-  ::view-transition-new(root) { animation: slide-out-right 300ms reverse; }
+/* Forward navigation: old page exits left, new page enters from the right */
+html:active-view-transition-type(slide-forward) {
+  &::view-transition-old(root) {
+    animation: slide-out-left 300ms ease both;
+  }
+  &::view-transition-new(root) {
+    animation: slide-in-right 300ms ease both;
+  }
+}
+
+/* Back navigation: old page exits right, new page enters from the left */
+html:active-view-transition-type(slide-backward) {
+  &::view-transition-old(root) {
+    animation: slide-out-right 300ms ease both;
+  }
+  &::view-transition-new(root) {
+    animation: slide-in-left 300ms ease both;
+  }
 }
 ```
 
@@ -145,7 +195,7 @@ For pages that don't use client-side routing (or before JavaScript loads), cross
 }
 ```
 
-That single line gives every same-origin navigation a crossfade animation. This is the progressive enhancement story: the page works without JavaScript, cross-document transitions provide the base animation, and when the Navigation API intercept kicks in, same-document transitions provide the richer experience.
+That single rule opts the page into animated same-origin navigations — both the outgoing and the incoming page must include it, and the default animation is a crossfade. This is the progressive enhancement story: the page works without JavaScript, cross-document transitions provide the base animation, and when the Navigation API intercept kicks in, same-document transitions provide the richer experience.
 
 ### Generating the CSS via `transformIndexHtml`
 
@@ -158,7 +208,7 @@ transformIndexHtml(html: string) {
     '</head>',
     `<style>
       @view-transition { navigation: auto; }
-      ::view-transition-old(root) { animation-duration: 200ms; }
+      ::view-transition-old(root),
       ::view-transition-new(root) { animation-duration: 200ms; }
     </style></head>`,
   )
@@ -169,72 +219,100 @@ transformIndexHtml(html: string) {
 
 ## Speculation Rules: browser-native prerendering
 
-The Speculation Rules API tells the browser to prefetch or prerender pages *before* the user navigates to them. Combined with view transitions, this creates zero-latency animated navigations — the page is already rendered in a hidden tab when the user clicks.
+The Speculation Rules API tells the browser to prefetch or prerender pages _before_ the user navigates to them. A prerendered page is loaded and rendered in an invisible background page; when the user navigates to that URL, the browser swaps it in instead of loading it again.
+
+There's a catch for a framework like ours. A prerender is only used for a **cross-document** navigation — the browser activates it in place of loading a new document. When our Navigation API handler calls `event.intercept()`, the navigation becomes same-document: no new document is loaded, so the prerendered page is never activated and the work is thrown away. Speculation Rules and client-side interception don't stack; each route has to pick one.
 
 ### Static rules
 
+For a classic multi-page site (no client router), one rule is enough:
+
 ```html
 <script type="speculationrules">
-{
-  "prerender": [
-    {
-      "where": { "href_matches": "/*" },
-      "eagerness": "moderate"
-    }
-  ]
-}
+  {
+    "prerender": [
+      {
+        "where": { "href_matches": "/*" },
+        "eagerness": "moderate"
+      }
+    ]
+  }
 </script>
 ```
 
-Eagerness levels: `immediate` (prerender on page load), `eager` (prerender on hover intent), `moderate` (prerender on hover/pointer down), `conservative` (prerender on click).
+Eagerness levels (Chrome's desktop heuristics): `immediate` (as soon as the rule is seen), `eager` (after ~10ms of hovering a link), `moderate` (after 200ms of hovering, or on pointerdown if sooner), `conservative` (on pointer or touch down). On mobile, where there's no hover, `eager` and `moderate` use viewport heuristics instead.
+
+### Choosing per route: intercept or prerender
+
+Eigen lets a route opt out of client-side interception with one export:
+
+```tsx title="src/pages/pricing.tsx"
+// Navigations *to* this page are full document loads: prerendered by
+// Speculation Rules, animated by the cross-document @view-transition rule
+export const navigation = "document";
+```
+
+The generated routes module carries it (`navigation: RouteMod${i}.navigation ?? 'intercept'`), and the intercept handler leaves those navigations to the browser:
+
+```typescript
+const match = matchRoute(url.pathname);
+if (!match || match.route.navigation === "document") return; // don't intercept
+```
+
+Intercepted routes keep using Part 23's data preloading on hover — the SPA equivalent of a prerender.
 
 ### Generating rules from the route tree
 
-The framework plugin knows all routes. It can generate targeted speculation rules:
+The framework plugin knows all routes, so it can emit speculation rules for exactly the document-navigation routes. Static ones are listed by URL; dynamic ones become URL patterns:
 
 ```typescript
 // In the eigen plugin — generate speculation rules
-transformIndexHtml(html: string, ctx) {
-  const routes = discoverRoutes(pagesDir)
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+import { serializeForScript } from 'eigen/serialize'
+import { discoverRoutes } from './eigen-routes'
 
-  // Only prerender static routes (no dynamic segments) and popular pages
-  const staticRoutes = routes
-    .filter(r => !r.path.includes(':'))
-    .map(r => r.path)
+transformIndexHtml(html: string) {
+  const documentRoutes = discoverRoutes(pagesDir).filter(r =>
+    /export\s+const\s+navigation\s*=\s*['"]document['"]/.test(readFileSync(resolve(pagesDir, r.file), 'utf-8')),
+  )
+  if (documentRoutes.length === 0) return html
 
-  const rules = {
-    prerender: [
-      {
-        urls: staticRoutes,
-        eagerness: 'moderate' as const,
-      },
-    ],
-    prefetch: [
-      {
-        // Dynamic routes: prefetch (but don't prerender) on hover
-        where: { href_matches: '/*' },
-        eagerness: 'moderate' as const,
-      },
-    ],
+  const staticUrls = documentRoutes.filter(r => !r.path.includes(':')).map(r => r.path)
+  const dynamicPatterns = documentRoutes
+    .filter(r => r.path.includes(':'))
+    .map(r => ({ href_matches: r.path.replace(/:\w+[*?]?/g, '*') })) // '/blog/:slug' → '/blog/*'
+
+  const prerender: object[] = []
+  if (staticUrls.length > 0) {
+    // Static document routes: prerender on hover
+    prerender.push({ urls: staticUrls, eagerness: 'moderate' })
   }
+  if (dynamicPatterns.length > 0) {
+    // Dynamic document routes: prerender on pointerdown
+    prerender.push({ where: { or: dynamicPatterns }, eagerness: 'conservative' })
+  }
+  const rules = { prerender }
 
   return html.replace(
     '</head>',
-    `<script type="speculationrules">${JSON.stringify(rules)}</script></head>`,
+    `<script type="speculationrules">${serializeForScript(rules)}</script></head>`,
   )
 }
 ```
 
+`serializeForScript` (Part 3) escapes `<`, `>` and `&` as `\u003c`-style escapes, which are still valid JSON — the browser's speculation-rules parser reads them back as the original characters.
+
 ### Dynamic rules based on the current page
 
-More sophisticated: the plugin generates per-page rules based on the route tree. The `/dashboard` page prerenders its child routes because those are the most likely next navigations:
+More sophisticated: the plugin generates per-page rules based on the route tree. A `/docs` page prerenders its child routes because those are the most likely next navigations:
 
 ```typescript
-// Generated for /dashboard
+// Generated for /docs
 {
   "prerender": [
     {
-      "urls": ["/dashboard/settings", "/dashboard/analytics"],
+      "urls": ["/docs/getting-started", "/docs/api"],
       "eagerness": "eager"
     }
   ]
@@ -247,18 +325,18 @@ This can be generated by the virtual module — each page's speculation rules ar
 
 ## The combined effect
 
-When View Transitions, Speculation Rules, and the Navigation API work together:
+For a document-navigation route, View Transitions and Speculation Rules work together:
 
-1. **User hovers over a link.** Speculation Rules trigger prerendering of the target page.
-2. **User clicks.** The Navigation API's `navigate` event fires.
-3. **The intercept handler detects** the page is already prerendered in a hidden tab.
-4. **View Transition captures** the old page snapshot.
+1. **User hovers over a link.** Speculation Rules start prerendering the target page in the background.
+2. **User clicks.** The router sees `navigation: 'document'` and doesn't intercept, so the browser performs a normal cross-document navigation.
+3. **The browser finds the prerendered page** for that URL.
+4. **The cross-document view transition captures** the old page snapshot (both pages opted in with `@view-transition`).
 5. **The prerendered page activates** (near-instant — it's already rendered).
-6. **View Transition animates** from old to new with a CSS-driven crossfade/slide.
+6. **The view transition animates** from old to new with the CSS-driven crossfade/slide.
 
 Total perceived latency: the animation duration (~200ms). Data fetching, rendering, and JavaScript execution happened during the hover — invisible to the user.
 
-This is the experience that native apps provide. The browser is now capable of it without any framework JavaScript for the prerendering step.
+For intercepted routes, the same shape comes from Eigen's own pieces: Part 23's hover preload fetches the data, and `document.startViewTransition` animates the same-document update. This is the experience that native apps provide. For document routes, the browser now delivers it without any framework JavaScript for the prerendering step.
 
 ---
 
@@ -276,14 +354,7 @@ Always respect `prefers-reduced-motion`:
 }
 ```
 
-And the speculation rules should be conditional on network quality:
-
-```typescript
-// Don't prerender on slow connections
-const shouldPrerender =
-  !navigator.connection?.saveData &&
-  (navigator.connection?.effectiveType ?? '4g') !== '2g'
-```
+Speculation is already conditional on the user's situation, so the framework doesn't need to gate it: Chrome skips speculation rules when Save-Data is on, when energy saver is on and the battery is low, under memory pressure, and when the user has turned off "Preload pages". Prefer `conservative` or `moderate` eagerness over `immediate` so you aren't prerendering pages nobody visits — every prerender costs server work and bandwidth.
 
 ---
 
@@ -295,7 +366,7 @@ const shouldPrerender =
 
 3. **Open Chrome DevTools → Application → Speculative loads.** You'll see which pages are being prerendered and their status.
 
-4. **Throttle the network to "Slow 3G"** and navigate. Without speculation rules, you see the loading state. With speculation rules on moderate eagerness, the page loads instantly if you hovered for >200ms before clicking.
+4. **Throttle the network to "Slow 3G"** and navigate to a `navigation: 'document'` route. Without speculation rules, you wait for the full page load. With speculation rules on moderate eagerness, the page appears instantly if you hovered for >200ms before clicking. Then do the same for an intercepted route: DevTools shows no prerender for it — Part 23's data preload does that job instead.
 
 5. **Disable JavaScript entirely.** Cross-document view transitions (the CSS `@view-transition` rule) still work — the animation happens between full page loads.
 
@@ -303,7 +374,7 @@ const shouldPrerender =
 
 ## Key insight
 
-These three browser APIs (Navigation, View Transitions, Speculation Rules) represent a fundamental shift in what the *platform* provides vs. what *frameworks* must implement. Client-side routing, page transition animations, and predictive preloading have been framework concerns for a decade. They're becoming browser primitives.
+These three browser APIs (Navigation, View Transitions, Speculation Rules) represent a fundamental shift in what the _platform_ provides vs. what _frameworks_ must implement. Client-side routing, page transition animations, and predictive preloading have been framework concerns for a decade. They're becoming browser primitives.
 
 For a Vite framework plugin, the role evolves from "implement routing" to "generate metadata that feeds browser APIs." The plugin generates speculation rules from the route tree (via `transformIndexHtml`), provides type-safe navigation (via the virtual module's `RoutePaths` type), and lets the browser handle the rest. Less JavaScript in the bundle. Better performance. Progressive enhancement by default.
 
@@ -313,4 +384,4 @@ Astro pioneered this approach with its built-in View Transition support. The pat
 
 ## What's next
 
-In Part 25, we'll implement the **`"use cache"` directive** — the third entry in React's directive family (after `"use client"` and `"use server"`), which turns caching into a compiler concern. The `transform` hook detects the directive and generates caching wrappers, creating a model where developers control cache granularity at the component and function level.
+In Part 25, we'll implement the **`"use cache"` directive** — a Next.js directive that sits beside React's `"use client"` and `"use server"`, which turns caching into a compiler concern. The `transform` hook detects the directive and generates caching wrappers, creating a model where developers control cache granularity at the component and function level.

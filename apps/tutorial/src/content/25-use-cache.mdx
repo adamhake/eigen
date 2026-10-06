@@ -9,67 +9,76 @@ concepts:
   - "cache scoping (remote, private)"
 ---
 
-
-*This is the twenty-fifth installment in a series where we build a toy Next.js on top of Vite. In [Part 24](/24-view-transitions-speculation), we added View Transitions and Speculation Rules. Now we'll implement the third member of React's directive family: `"use cache"` — which turns caching from a runtime concern into a compile-time transformation.*
+_This is the twenty-sixth installment in a series where we build a toy Next.js on top of Vite. In [Part 24](/24-view-transitions-speculation), we added View Transitions and Speculation Rules. Now we'll implement `"use cache"` — the Next.js directive that sits beside React's `"use client"` and `"use server"`, and turns caching from a runtime concern into a compile-time transformation._
 
 ---
 
-## The third directive
+## A third directive
 
-React's directive model now has three entries:
+React defines two directives, and Next.js adds a third:
 
-| Directive | Environment | Meaning |
-|---|---|---|
-| `"use client"` | RSC → Client boundary | This component runs in the browser; include it in the client bundle |
-| `"use server"` | Client → Server boundary | This function runs on the server; generate an RPC stub for the client |
-| `"use cache"` | Cache boundary | This function/component's result should be cached; wrap it with cache logic |
+| Directive      | Defined by                 | Environment              | Meaning                                                                     |
+| -------------- | -------------------------- | ------------------------ | --------------------------------------------------------------------------- |
+| `"use client"` | React                      | RSC → Client boundary    | This component runs in the browser; include it in the client bundle         |
+| `"use server"` | React                      | Client → Server boundary | This function runs on the server; generate an RPC stub for the client       |
+| `"use cache"`  | Next.js (Cache Components) | Cache boundary           | This function/component's result should be cached; wrap it with cache logic |
 
-`"use cache"` is orthogonal to the other two. A server component can be cached. A server function can be cached. Even a `"use client"` component tree can be cached at the server component level that renders it. The directive tells the framework's build system to wrap the function with caching logic — memoizing based on arguments, respecting time-to-live, and supporting on-demand revalidation.
+`"use cache"` isn't part of React — React doesn't know about it, and nothing in `react-server-dom` handles it. It's a _framework_ directive: the framework's compiler finds it and rewrites the function. That makes it a good fit for this series, because "find a string literal, rewrite the function around it" is exactly what a Vite `transform` hook does.
+
+`"use cache"` is orthogonal to the other two. A server component can be cached. A server-side data function can be cached. Even a `"use client"` component tree can be cached at the server component level that renders it. The directive tells the framework's build system to wrap the function with caching logic — memoizing based on arguments, respecting time-to-live, and supporting on-demand revalidation.
 
 ---
 
 ## How it works: developer's view
 
-The developer uses two helper functions alongside the directive: `cacheLife` configures the TTL (how long the cached result is valid), and `cacheTag` associates the cached entry with a named tag for targeted invalidation. Both are imported from the framework and called inside the cached function body:
+The developer uses two helper functions alongside the directive: `cacheLife` configures the lifetime (how long the cached result is fresh, and how long a stale copy may still be served), and `cacheTag` associates the cached entry with a named tag for targeted invalidation. Both are imported from the framework and called inside the cached function body:
 
 ```tsx title="src/pages/posts/[id].tsx"
-import { cacheLife, cacheTag } from 'eigen/cache'
+import { cacheLife, cacheTag } from "eigen/cache";
+import { db } from "../../lib/db";
 
 export default async function PostPage({ params }: { params: { id: string } }) {
-  'use cache'
-  cacheLife('hours')        // Cache for 1 hour
-  cacheTag(`post-${params.id}`)  // Tag for targeted revalidation
+  "use cache";
+  cacheLife("hours"); // Fresh for 1 hour; stale copy served for up to 1 day
+  cacheTag(`post-${params.id}`); // Tag for targeted revalidation
 
-  const post = await db.query('SELECT * FROM posts WHERE id = $1', [params.id])
+  const {
+    rows: [post],
+  } = await db.query("SELECT * FROM posts WHERE id = $1", [params.id]);
   return (
     <article>
       <h1>{post.title}</h1>
       <p>{post.body}</p>
     </article>
-  )
+  );
 }
 ```
 
-Without `"use cache"`, this component re-fetches from the database on every request. With it, the result is cached — subsequent requests for the same `params.id` serve from cache until the TTL expires or the tag is revalidated.
+This is an async server component, so it renders in the `rsc` environment from [Part 21](/21-react-server-components). Without `"use cache"`, it re-queries the database on every request. With it, the result is cached — subsequent requests for the same `params.id` are served from the cache until the entry goes stale or the tag is revalidated.
 
 ### Granular caching — function level
 
 ```typescript
 async function getPopularPosts() {
-  'use cache'
-  cacheLife('days')
-  cacheTag('popular-posts')
-  return db.query('SELECT * FROM posts ORDER BY views DESC LIMIT 10')
+  "use cache";
+  cacheLife("days");
+  cacheTag("popular-posts");
+  const { rows } = await db.query("SELECT * FROM posts ORDER BY views DESC LIMIT 10");
+  return rows;
 }
 
 async function getCurrentUser(sessionId: string) {
-  'use cache: private'
-  cacheLife({ stale: 60, revalidate: 300 })
-  return db.query('SELECT * FROM users WHERE session_id = $1', [sessionId])
+  "use cache: private";
+  // Memoized for the current request only: three components can call this,
+  // and one query runs. Never written to a shared cache store.
+  const {
+    rows: [user],
+  } = await db.query("SELECT * FROM users WHERE session_id = $1", [sessionId]);
+  return user;
 }
 ```
 
-Notice `"use cache: private"` — this variant caches per-request and can access runtime APIs like cookies. The result is cached only in memory for the current request, never persisted to shared storage.
+Notice `"use cache: private"`. In Next.js, private caches exist for personalized data: a private function may read `cookies()` and `headers()`, matching calls within one request reuse the result, nothing is stored in a server cache across requests, and the client router may keep the rendered output in browser memory for the `cacheLife` `stale` time. Eigen implements the server half of that: a private function is memoized per request and never touches the shared store.
 
 ---
 
@@ -79,212 +88,446 @@ When the `transform` hook encounters `"use cache"`, it wraps the function body w
 
 ```typescript
 async function getPopularPosts() {
-  'use cache'
-  cacheLife('days')
-  cacheTag('popular-posts')
-  return db.query('SELECT * FROM posts ORDER BY views DESC LIMIT 10')
+  "use cache";
+  cacheLife("days");
+  cacheTag("popular-posts");
+  const { rows } = await db.query("SELECT * FROM posts ORDER BY views DESC LIMIT 10");
+  return rows;
 }
 ```
 
-Becomes (simplified):
+Becomes:
 
 ```typescript
-import { __cache_wrap } from 'eigen/runtime/cache'
+import { __cache_run } from "eigen/runtime/cache";
 
-const getPopularPosts = __cache_wrap(
-  'getPopularPosts_a3f2c8',   // Stable ID from file + function name
-  {
-    life: 'days',
-    tags: ['popular-posts'],
-  },
-  async function getPopularPosts_impl() {
-    return db.query('SELECT * FROM posts ORDER BY views DESC LIMIT 10')
-  },
-)
+async function getPopularPosts() {
+  return __cache_run("getPopularPosts_a3f2c8d1", "default", [], async () => {
+    cacheLife("days");
+    cacheTag("popular-posts");
+    const { rows } = await db.query("SELECT * FROM posts ORDER BY views DESC LIMIT 10");
+    return rows;
+  });
+}
 ```
 
-The `__cache_wrap` function:
+Three things are deliberately preserved. The function stays a _declaration_, so hoisting and `export`/`export default` keep working. The `cacheLife` and `cacheTag` calls stay in the body — they're ordinary runtime calls that record the lifetime and tags for the entry being filled (we'll see how below). And the original parameters move to the inner arrow function, while the outer function collects its arguments as `...__args` for the cache key:
+
+```typescript
+// export default async function PostPage({ params }) { 'use cache'; ... }
+// becomes:
+export default async function PostPage(...__args) { return __cache_run("PostPage_9b1e04aa", "default", __args, async ({ params }) => {
+  cacheLife('hours')
+  ...
+}) }
+```
+
+`__cache_run` then does the work:
 
 <Steps>
-<Step>
-**Derive cache key** from the function ID + serialized arguments
-</Step>
-<Step>
-**Check the cache store** (in-memory, Redis, KV store, etc.)
-</Step>
-<Step>
-**On hit:** return the cached value
-</Step>
-<Step>
-**On miss:** call the original function, store the result, return it
-</Step>
-<Step>
-**Respect `cacheLife` TTL** and `cacheTag` for revalidation
-</Step>
+  <Step>**Derive the cache key** from the function ID + serialized arguments</Step>
+  <Step>**Check the cache store** (in-memory, Redis, KV store, etc.)</Step>
+  <Step>**Fresh hit:** return the cached value</Step>
+  <Step>
+    **Stale hit** (past `revalidate`, before `expire`): return the cached value and refresh it in the background
+  </Step>
+  <Step>
+    **Miss or expired:** run the original function inside a cache scope that collects `cacheLife`/`cacheTag`, store the
+    result with that lifetime and those tags, return it
+  </Step>
 </Steps>
 
 ### The transform plugin
 
+A regex can't do this safely — it has to find the matching closing brace of each function and cope with `export default`, arrow functions and nested functions. Vite 8 exports Rolldown's parser as `parseAst`, which gives us an ESTree AST; `magic-string` makes the edits and produces a sourcemap. The plugin runs after Vite's own Oxc transform, so TypeScript and JSX are already gone by the time it sees the code:
+
 ```typescript title="plugins/eigen-cache.ts"
-import type { Plugin } from 'vite'
+import type { Plugin } from "vite";
+import { parseAst } from "vite";
+import MagicString from "magic-string";
+import { createHash } from "node:crypto";
+import { relative } from "node:path";
+
+const DIRECTIVE = /^use cache(?::\s*(\w+))?$/;
+
+function walk(node: any, visit: (node: any) => void): void {
+  if (!node || typeof node.type !== "string") return;
+  visit(node);
+  for (const key of Object.keys(node)) {
+    const child = node[key];
+    if (Array.isArray(child)) child.forEach((c) => walk(c, visit));
+    else if (child && typeof child === "object") walk(child, visit);
+  }
+}
 
 export default function eigenCache(): Plugin {
+  let root = process.cwd();
+
   return {
-    name: 'eigen-cache-transform',
+    name: "eigen-cache-transform",
+
+    configResolved(config) {
+      root = config.root;
+    },
 
     // Only transform in server environments (RSC and SSR)
     applyToEnvironment(env) {
-      return env.name === 'rsc' || env.name === 'ssr'
+      return env.name === "rsc" || env.name === "ssr";
     },
 
-    transform(code: string, id: string) {
-      if (!code.includes("'use cache'") && !code.includes('"use cache"')) {
-        return
-      }
+    transform: {
+      // Hook filter: Vite skips the handler for modules without the directive
+      filter: { code: /['"]use cache/ },
+      handler(code, id) {
+        const ast = parseAst(code);
+        const s = new MagicString(code);
+        let wrapped = 0;
 
-      // Find functions with "use cache" directive
-      // A real implementation uses an AST parser
-      const transformed = code.replace(
-        /(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(([^)]*)\)\s*\{[\s]*['"]use cache(?::?\s*(\w+))?['"]/g,
-        (match, name, args, variant) => {
-          const fnId = generateStableId(id, name)
-          const cacheVariant = variant || 'default'
+        walk(ast, (node) => {
+          const isFunction =
+            node.type === "FunctionDeclaration" ||
+            node.type === "FunctionExpression" ||
+            node.type === "ArrowFunctionExpression";
+          if (!isFunction || node.body?.type !== "BlockStatement") return;
 
-          // Extract cacheLife and cacheTag calls from the function body
-          // (simplified — real implementation parses the full body)
+          // A directive is an ExpressionStatement with a `directive` field,
+          // and only counts as the first statement of the body
+          const first = node.body.body[0];
+          const match =
+            first?.type === "ExpressionStatement" && typeof first.directive === "string"
+              ? DIRECTIVE.exec(first.directive)
+              : null;
+          if (!match) return;
 
-          return `const ${name} = __cache_wrap(
-            '${fnId}',
-            { variant: '${cacheVariant}' },
-            async function ${name}_impl(${args}) {`
-        },
-      )
+          if (!node.async) {
+            this.error(`"${first.directive}" requires an async function (${id})`);
+          }
 
-      // Add the import
-      if (transformed !== code) {
+          const variant = match[1] ?? "default"; // 'default' | 'private' | 'remote' | ...
+          const name = node.id?.name ?? "anonymous";
+          const hash = createHash("sha256")
+            .update(`${relative(root, id)}:${name}:${node.start}`)
+            .digest("hex")
+            .slice(0, 8);
+          const fnId = `${name}_${hash}`;
+
+          // (a, { b }) → (...__args); the original params move to the inner arrow
+          const params = node.params;
+          const paramText = params.length ? code.slice(params[0].start, params[params.length - 1].end) : "";
+          const argsExpr = params.length ? "__args" : "[]";
+          if (params.length) {
+            s.overwrite(params[0].start, params[params.length - 1].end, "...__args");
+          }
+
+          // Drop the directive, then wrap the remaining body
+          s.remove(first.start, first.end);
+          s.appendLeft(
+            node.body.start + 1,
+            ` return __cache_run(${JSON.stringify(fnId)}, ${JSON.stringify(variant)}, ${argsExpr}, async (${paramText}) => {`,
+          );
+          s.appendLeft(node.body.end - 1, "}) ");
+          wrapped++;
+        });
+
+        if (wrapped === 0) return;
+
+        s.prepend(`import { __cache_run } from 'eigen/runtime/cache';\n`);
         return {
-          code: `import { __cache_wrap } from 'eigen/runtime/cache';\n${transformed}`,
-          map: null,
-        }
-      }
+          code: s.toString(),
+          map: s.generateMap({ hires: "boundary", source: id }),
+        };
+      },
     },
-  }
+  };
 }
 ```
+
+Only function-level directives are handled. Next.js also accepts `'use cache'` at the top of a file (caching every export); supporting that is a loop over the module's exported functions with the same wrapping.
+
+The ID is derived from the file path _relative to the project root_, the function name and its position, so it's stable across machines and builds — a requirement once entries live in a shared store like Redis.
 
 ---
 
 ## Cache key derivation
 
-The cache key must capture everything that affects the output: the function's identity, its arguments, and any closed-over values. For a component like:
+The cache key must capture everything that affects the output: the function's identity and its arguments. For a component like:
 
 ```tsx
 async function PostPage({ params }: { params: { id: string } }) {
-  'use cache'
-  const post = await db.query(...)
-  return <article>...</article>
+  "use cache";
+  const post = await getPost(params.id);
+  return <article>...</article>;
 }
 ```
 
-The cache key is derived from: `functionId + serialize(params)`. Two requests with `{ id: '42' }` hit the same cache entry. A request with `{ id: '43' }` gets a different entry.
+The cache key is derived from `functionId + serialize(args)`, and the args here are the props object. Two requests with `{ params: { id: '42' } }` hit the same cache entry. A request with `{ id: '43' }` gets a different entry.
+
+Closed-over values are _not_ part of the key. Next.js's compiler hoists the function and passes closure variables as extra arguments so they become part of the key; our transform doesn't, so a cached function should read everything that varies from its parameters.
 
 ```typescript title="packages/eigen/runtime/cache.ts"
-function deriveCacheKey(fnId: string, args: unknown[]): string {
-  const argsHash = stableStringify(args)
-  return `${fnId}:${argsHash}`
+export function deriveCacheKey(fnId: string, args: unknown[]): string {
+  return `${fnId}:${stableStringify(args)}`;
 }
 
 // Stable JSON serialization (deterministic key ordering)
 function stableStringify(value: unknown): string {
-  if (typeof value !== 'object' || value === null) {
-    return JSON.stringify(value)
+  if (value === undefined) return "undefined";
+  if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return JSON.stringify(value);
   }
   if (Array.isArray(value)) {
-    return `[${value.map(stableStringify).join(',')}]`
+    return `[${value.map(stableStringify).join(",")}]`;
   }
-  const keys = Object.keys(value).sort()
-  const entries = keys.map(k =>
-    `${JSON.stringify(k)}:${stableStringify((value as any)[k])}`,
-  )
-  return `{${entries.join(',')}}`
+  const proto = typeof value === "object" ? Object.getPrototypeOf(value) : undefined;
+  if (proto !== Object.prototype && proto !== null) {
+    // Date, Map, class instances, functions, React elements' children...
+    // would all collapse to the same key or lose information. Refuse loudly.
+    throw new TypeError(`"use cache" arguments must be JSON-like; got ${Object.prototype.toString.call(value)}`);
+  }
+  const keys = Object.keys(value as object).sort();
+  const entries = keys.map((k) => `${JSON.stringify(k)}:${stableStringify((value as Record<string, unknown>)[k])}`);
+  return `{${entries.join(",")}}`;
 }
 ```
 
 ### Serialization constraint
 
-Like server functions (Part 15), cache keys require that arguments are JSON-serializable. You can't cache a function that receives a `Date`, a `Map`, or a React element as an argument — the cache key derivation would produce inconsistent results. This is the same serialization boundary that `"use server"` enforces.
+Like Eigen's server functions (Part 15), which send their arguments as JSON, cache keys require JSON-like arguments. You can't cache a function that receives a `Date`, a `Map`, a function, or a React element as an argument — `stableStringify` throws rather than silently producing a key that two different inputs could share. (Next.js serializes cache keys with React's RSC serializer, which handles more types; the principle — the key must capture the arguments exactly — is the same.)
+
+---
+
+## The runtime: scopes, lifetimes and tags
+
+`cacheLife` and `cacheTag` need to know _which_ cache entry they're configuring. The answer is `AsyncLocalStorage`: `__cache_run` runs the original function inside a scope object, and the helpers write to whatever scope is active — even after `await`s, because the async context follows the function's continuation.
+
+```typescript title="packages/eigen/runtime/cache.ts"
+import { AsyncLocalStorage } from "node:async_hooks";
+
+export interface CacheLife {
+  revalidate: number; // seconds until the entry is stale (served, then refreshed)
+  expire: number; // seconds until the entry is unusable (next request waits)
+}
+
+// Mirrors the revalidate/expire values of Next.js's preset profiles
+export const PROFILES = {
+  default: { revalidate: 900, expire: Infinity },
+  seconds: { revalidate: 1, expire: 60 },
+  minutes: { revalidate: 60, expire: 3_600 },
+  hours: { revalidate: 3_600, expire: 86_400 },
+  days: { revalidate: 86_400, expire: 604_800 },
+  weeks: { revalidate: 604_800, expire: 2_592_000 },
+  max: { revalidate: 2_592_000, expire: 31_536_000 },
+} satisfies Record<string, CacheLife>;
+
+interface CacheScope {
+  life: CacheLife;
+  tags: Set<string>;
+}
+
+const cacheScope = new AsyncLocalStorage<CacheScope>();
+const requestMemo = new AsyncLocalStorage<Map<string, Promise<unknown>>>();
+const inFlight = new Map<string, Promise<unknown>>();
+
+function activeScope(fn: string): CacheScope {
+  const scope = cacheScope.getStore();
+  if (!scope) throw new Error(`${fn}() must be called inside a "use cache" function`);
+  return scope;
+}
+
+export function cacheLife(profile: keyof typeof PROFILES | Partial<CacheLife>): void {
+  activeScope("cacheLife").life = typeof profile === "string" ? PROFILES[profile] : { ...PROFILES.default, ...profile };
+}
+
+export function cacheTag(...tags: string[]): void {
+  const scope = activeScope("cacheTag");
+  for (const tag of tags) scope.tags.add(tag);
+}
+
+/** Eigen's request handler wraps each request in this, giving private caches a per-request memo */
+export function withRequestCache<T>(fn: () => T): T {
+  return requestMemo.run(new Map(), fn);
+}
+
+export function __cache_run<T>(
+  fnId: string,
+  variant: string,
+  args: unknown[],
+  impl: (...args: any[]) => Promise<T>,
+): Promise<T> {
+  const key = deriveCacheKey(fnId, args);
+
+  if (variant === "private") {
+    const memo = requestMemo.getStore();
+    if (!memo) return impl(...args); // outside a request: nothing to share
+    if (!memo.has(key)) {
+      const scope = { life: PROFILES.default, tags: new Set<string>() };
+      memo.set(
+        key,
+        cacheScope.run(scope, () => impl(...args)),
+      );
+    }
+    return memo.get(key) as Promise<T>;
+  }
+
+  return runShared(storeFor(variant), key, args, impl);
+}
+
+async function runShared<T>(
+  store: CacheStore,
+  key: string,
+  args: unknown[],
+  impl: (...args: any[]) => Promise<T>,
+): Promise<T> {
+  const entry = await store.get(key);
+  const age = entry ? (Date.now() - entry.createdAt) / 1000 : Infinity;
+
+  if (entry && age < entry.revalidate) return entry.value as T; // fresh
+
+  if (entry && age < entry.expire) {
+    // Stale-while-revalidate: answer now, refresh in the background
+    fill(store, key, args, impl).catch((err) => console.error("[eigen] background revalidation failed:", err));
+    return entry.value as T;
+  }
+
+  return fill(store, key, args, impl); // miss or expired
+}
+
+function fill<T>(store: CacheStore, key: string, args: unknown[], impl: (...args: any[]) => Promise<T>): Promise<T> {
+  // Concurrent misses for the same key share one execution
+  const existing = inFlight.get(key);
+  if (existing) return existing as Promise<T>;
+
+  const scope: CacheScope = { life: PROFILES.default, tags: new Set() };
+  const pending = cacheScope
+    .run(scope, () => impl(...args))
+    .then(async (value) => {
+      await store.set(key, {
+        value,
+        createdAt: Date.now(),
+        ...scope.life,
+        tags: [...scope.tags],
+      });
+      return value;
+    })
+    .finally(() => inFlight.delete(key));
+
+  inFlight.set(key, pending);
+  return pending;
+}
+```
+
+Nested cached functions get their own scope: when `PostPage` calls a cached `getPost`, the inner `cacheLife` call configures the inner entry only.
 
 ---
 
 ## Cache storage backends
 
-The `__cache_wrap` function delegates to a pluggable cache store:
+`__cache_run` delegates to a pluggable cache store. Entries carry their lifetime and tags, so any store can answer "is this fresh?" and "which entries have this tag?":
 
 ```typescript title="packages/eigen/runtime/cache.ts"
+export interface CacheEntry {
+  value: unknown;
+  createdAt: number; // ms timestamp
+  revalidate: number; // seconds
+  expire: number; // seconds
+  tags: string[];
+}
+
 export interface CacheStore {
-  get(key: string): Promise<{ value: string; timestamp: number } | null>
-  set(key: string, value: string, ttl: number): Promise<void>
-  revalidateTag(tag: string): Promise<void>
+  get(key: string): Promise<CacheEntry | undefined>;
+  set(key: string, entry: CacheEntry): Promise<void>;
+  revalidateTag(tag: string): Promise<void>;
 }
 
 // Default: in-memory (single process, lost on restart)
-class MemoryCacheStore implements CacheStore {
-  private store = new Map<string, { value: string; timestamp: number; ttl: number; tags: string[] }>()
+export class MemoryCacheStore implements CacheStore {
+  private store = new Map<string, CacheEntry>();
 
   async get(key: string) {
-    const entry = this.store.get(key)
-    if (!entry) return null
-    if (Date.now() - entry.timestamp > entry.ttl * 1000) {
-      this.store.delete(key)
-      return null
+    const entry = this.store.get(key);
+    if (entry && Date.now() - entry.createdAt > entry.expire * 1000) {
+      this.store.delete(key);
+      return undefined;
     }
-    return { value: entry.value, timestamp: entry.timestamp }
+    return entry;
   }
 
-  async set(key: string, value: string, ttl: number, tags: string[] = []) {
-    this.store.set(key, { value, timestamp: Date.now(), ttl, tags })
+  async set(key: string, entry: CacheEntry) {
+    this.store.set(key, entry);
   }
 
   async revalidateTag(tag: string) {
     for (const [key, entry] of this.store) {
-      if (entry.tags.includes(tag)) {
-        this.store.delete(key)
-      }
+      if (entry.tags.includes(tag)) this.store.delete(key);
     }
   }
 }
+
+let handlers: Record<string, CacheStore> = { default: new MemoryCacheStore() };
+
+export function configureCache(stores: Record<string, CacheStore>): void {
+  handlers = { default: new MemoryCacheStore(), ...stores };
+}
+
+function storeFor(variant: string): CacheStore {
+  return handlers[variant] ?? handlers.default;
+}
+
+export function getCacheHandlers(): Record<string, CacheStore> {
+  return handlers;
+}
 ```
 
-Next.js supports `"use cache: remote"` for distributed caching (Redis, Cloudflare KV, Vercel KV). The framework configures the store via `cacheHandlers` in the config:
+The memory store keeps values as live objects. A remote store has to serialize them: JSON works for data functions; a cached _server component_ returns React elements, which need React's RSC serializer (the same payload format as Part 21) to survive a round trip through Redis.
 
-```typescript title="eigen.config.ts"
-export default {
-  cacheHandlers: {
-    default: new MemoryCacheStore(),
-    remote: new RedisCacheStore(process.env.REDIS_URL),
-  },
-}
+Next.js supports `"use cache: remote"` for distributed caching (Redis, Cloudflare KV, Vercel's runtime cache), configured through `cacheHandlers` in `next.config.ts`, which maps variant names to handler _modules_. Eigen does the same at runtime instead of in the Vite config — store instances hold connections, so they belong in server code, not in a config file that only exists at build time:
+
+```typescript title="src/cache.server.ts"
+import { configureCache, MemoryCacheStore } from "eigen/runtime/cache";
+import { RedisCacheStore } from "./lib/redis-cache-store";
+
+// Imported once by the server entry, before the first request
+configureCache({
+  default: new MemoryCacheStore(),
+  remote: new RedisCacheStore(process.env.REDIS_URL!),
+});
 ```
 
 ---
 
 ## On-demand revalidation
 
-The `cacheTag` function associates cache entries with tags. When data changes, the application calls `revalidateTag` to invalidate all entries with that tag:
+The `cacheTag` function associates cache entries with tags. When data changes, the application calls `revalidateTag` to invalidate all entries with that tag, in every configured store:
 
-```typescript
-// In a server function triggered by a webhook or form submission
-import { revalidateTag } from 'eigen/cache'
+```typescript title="packages/eigen/cache.ts"
+import { getCacheHandlers } from "./runtime/cache";
 
-export const updatePost = createServerFn(async (post: { id: string; title: string }) => {
-  await db.query('UPDATE posts SET title = $1 WHERE id = $2', [post.title, post.id])
+export { cacheLife, cacheTag } from "./runtime/cache";
 
-  // Invalidate all cache entries tagged with this post
-  await revalidateTag(`post-${post.id}`)
-  // Also invalidate the popular posts list
-  await revalidateTag('popular-posts')
-})
+export async function revalidateTag(tag: string): Promise<void> {
+  await Promise.all(Object.values(getCacheHandlers()).map((store) => store.revalidateTag(tag)));
+}
 ```
+
+```typescript title="src/server/posts.ts"
+// In a server function triggered by a webhook or form submission
+import { createServerFn } from "eigen/server";
+import { revalidateTag } from "eigen/cache";
+import { z } from "zod";
+
+export const updatePost = createServerFn({ method: "POST" })
+  .validator(z.object({ id: z.string(), title: z.string() }))
+  .handler(async ({ data: post }) => {
+    await db.query("UPDATE posts SET title = $1 WHERE id = $2", [post.title, post.id]);
+
+    // Invalidate all cache entries tagged with this post
+    await revalidateTag(`post-${post.id}`);
+    // Also invalidate the popular posts list
+    await revalidateTag("popular-posts");
+  });
+```
+
+Eigen's `revalidateTag` deletes entries outright, so the next request waits for fresh data. Next.js 16 is more nuanced: `revalidateTag(tag, 'max')` marks entries stale and serves them while a background refresh runs (the single-argument form is deprecated), and `updateTag(tag)` gives a Server Action read-your-own-writes by expiring immediately. Both are small extensions of the store interface above.
 
 This is the mechanism that makes `"use cache"` practical for dynamic content: you cache aggressively (hours, days), and invalidate precisely when the underlying data changes.
 
@@ -292,24 +535,26 @@ This is the mechanism that makes `"use cache"` practical for dynamic content: yo
 
 ## What to observe
 
-1. **Add a `console.log` inside a cached function.** On the first request, it logs. On subsequent requests within the TTL, it doesn't — the cache serves the stored result.
+1. **Add a `console.log` inside a cached function.** On the first request, it logs. On subsequent requests within the `revalidate` window, it doesn't — the cache serves the stored result.
 
-2. **Call `revalidateTag` and request again.** The function re-executes and the new result is cached.
+2. **Use `cacheLife({ revalidate: 5, expire: 60 })` and wait 10 seconds.** The next request returns instantly with the old value _and_ the log appears — that's the background refresh. The request after that sees the new value.
 
-3. **Check the transform output in `vite-plugin-inspect`.** The `"use cache"` directive is gone, replaced by a `__cache_wrap` call with the extracted configuration.
+3. **Call `revalidateTag` and request again.** The function re-executes and the new result is cached.
 
-4. **Compare `"use cache"` with `"use cache: private"`.** Private entries are per-request — they're useful for deduplicating within a single render pass but don't persist across requests.
+4. **Check the transform output in `vite-plugin-inspect`.** The `"use cache"` directive is gone, the function is still a declaration, and its body is wrapped in a `__cache_run(...)` call.
+
+5. **Compare `"use cache"` with `"use cache: private"`.** Call a private function from two components in the same page: the log appears once per request, never zero times — private entries deduplicate within a request but don't persist across requests.
 
 ---
 
 ## Key insight
 
-`"use cache"` extends the directive-as-compiler-hint pattern established by `"use client"` and `"use server"`. The developer writes a string literal in their function body; the framework's `transform` hook detects it and generates caching infrastructure. The developer never imports a cache library, configures a TTL, or manages cache keys — the compiler infers all of it from the function's arguments and the `cacheLife`/`cacheTag` calls.
+`"use cache"` extends the directive-as-compiler-hint pattern established by React's `"use client"` and `"use server"`. The developer writes a string literal in their function body; the framework's `transform` hook detects it and generates caching infrastructure. The developer never builds cache keys or calls a cache store — the compiler derives the key from the function's identity and arguments, and the runtime picks up the lifetime and tags from the `cacheLife`/`cacheTag` calls.
 
-This is caching without ceremony. The mental model is simple: "this function is expensive, cache its results, invalidate when I say so." The complexity — key derivation, TTL management, storage backends, serialization — lives in the framework's generated code, not in the developer's.
+This is caching without ceremony. The mental model is simple: "this function is expensive, cache its results, invalidate when I say so." The complexity — key derivation, lifetimes, stale-while-revalidate, storage backends, serialization — lives in the framework's generated code and runtime, not in the developer's.
 
 ---
 
 ## What's next
 
-In Part 26, we'll implement **Partial Prerendering** — the convergence of SSG and SSR where a single route has a static shell (cached at build time) and dynamic holes (filled at request time via Suspense). This is the architecture that `"use cache"` enables: cached components become the static shell, uncached components become the dynamic content.
+In Part 26, we'll implement **Partial Prerendering** — the convergence of SSG and SSR where a single route has a static shell (rendered at build time) and dynamic holes (filled at request time via Suspense). This is the architecture that `"use cache"` enables: cached components become the static shell, uncached components become the dynamic content.

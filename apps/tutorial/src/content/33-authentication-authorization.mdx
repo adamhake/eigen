@@ -9,25 +9,24 @@ concepts:
   - "auth provider abstraction"
 ---
 
-
-*In this installment, we build the authentication and authorization primitives that Eigen provides to application developers. The framework doesn't implement a specific auth strategy — it provides the hooks, middleware patterns, session management, and typed context that make any strategy (session cookies, JWTs, OAuth, SAML, passkeys) plug in cleanly.*
----
+## _In this installment, we build the authentication and authorization primitives that Eigen provides to application developers. The framework doesn't implement a specific auth strategy — it provides the hooks, middleware patterns, session management, and typed context that make any strategy (session cookies, JWTs, OAuth, SAML, passkeys) plug in cleanly._
 
 ## What the framework provides vs. what the application provides
 
-The framework is responsible for *plumbing* — getting auth state from the request into every layer of the application in a typed, secure way. The application (or an auth library) is responsible for *strategy* — how users log in, how sessions are stored, how tokens are verified.
+The framework is responsible for _plumbing_ — getting auth state from the request into every layer of the application in a typed, secure way. The application (or an auth library) is responsible for _strategy_ — how users log in, how sessions are stored, how tokens are verified.
 
-| Responsibility | Framework (Eigen) | Application / Auth library |
-|---|---|---|
-| Parse session from request | `getSession()` primitive | Configure session storage (cookie, DB, JWT) |
-| Type the user object | `Session<TUser>` generic | Define the `User` type |
-| Protect routes | `auth` route config, middleware | Define which routes need protection |
-| Redirect unauthenticated users | `redirect()` in middleware | Choose login page URL |
-| Make user available in loaders | `ctx.user` via middleware context | — |
-| Make user available in components | `useSession()` hook | — |
-| Serialize session to client | `__EIGEN_DATA__` session field | — |
-| CSRF protection | Token generation and validation | — |
-| Role/permission checks | `authorize()` helper | Define role hierarchy |
+| Responsibility                    | Framework (Eigen)                                            | Application / Auth library                  |
+| --------------------------------- | ------------------------------------------------------------ | ------------------------------------------- |
+| Parse session from request        | `getSession()` hook in `AuthConfig`                          | Configure session storage (cookie, DB, JWT) |
+| Type the user object              | `Session<TUser>` generic, `EigenContext` augmentation        | Define the `User` type                      |
+| Protect routes                    | `protectedRoutes`, `requireAccess()` middleware              | Define which routes need protection         |
+| Redirect unauthenticated users    | `redirect()` with a validated `returnTo`                     | Choose login page URL                       |
+| Session cookies                   | `sessionCookie()` / `clearSessionCookie()` with secure flags | Create and revoke sessions in a store       |
+| Make user available in loaders    | `ctx.user` via middleware context                            | —                                           |
+| Make user available in components | `useSession()` hook                                          | —                                           |
+| Serialize session to client       | `window.__EIGEN_SESSION__` (safe subset)                     | —                                           |
+| CSRF protection                   | Origin check + HMAC token generation and validation          | —                                           |
+| Role/permission checks            | `requireAccess()` helper                                     | Define role hierarchy                       |
 
 ---
 
@@ -39,320 +38,488 @@ The framework defines a generic session that applications fill in with their use
 /** The session object available throughout the request lifecycle */
 export interface Session<TUser = unknown> {
   /** The authenticated user, or null if not authenticated */
-  user: TUser | null
-  /** Session ID for server-side session stores */
-  sessionId: string | null
+  user: TUser | null;
+  /**
+   * Identifier of the browser session — what CSRF tokens are bound to.
+   * null when the credential isn't sent automatically by the browser
+   * (e.g. an Authorization: Bearer header).
+   */
+  sessionId: string | null;
   /** Whether this is an authenticated session */
-  isAuthenticated: boolean
-  /** Session expiry timestamp */
-  expiresAt: number | null
+  isAuthenticated: boolean;
+  /** Session expiry timestamp (ms since epoch) */
+  expiresAt: number | null;
 }
+
+export const anonymousSession: Session<never> = {
+  user: null,
+  sessionId: null,
+  isAuthenticated: false,
+  expiresAt: null,
+};
 
 /** Configuration for the auth middleware */
 export interface AuthConfig<TUser> {
-  /** 
+  /**
    * Resolve a session from the incoming request.
    * This is where the auth strategy plugs in — parse a cookie,
    * verify a JWT, check a session store, etc.
    */
-  getSession: (request: Request) => Promise<Session<TUser>>
+  getSession: (request: Request) => Promise<Session<TUser>>;
+
+  /** Server-only secret for signing CSRF tokens (at least 32 random bytes) */
+  secret: string;
 
   /** URL to redirect to when authentication is required but missing */
-  loginUrl?: string
+  loginUrl?: string;
 
-  /** 
+  /**
    * Routes that require authentication.
-   * Can be exact paths, glob patterns, or a function.
+   * Exact paths, 'prefix/*' patterns, or a function.
    */
-  protectedRoutes?: string[] | ((pathname: string) => boolean)
+  protectedRoutes?: string[] | ((pathname: string) => boolean);
 
   /**
    * Routes that should NOT require authentication even if they
    * match a protected pattern. Login, signup, public API, etc.
    */
-  publicRoutes?: string[]
+  publicRoutes?: string[];
 }
 ```
+
+### Session cookies
+
+When sessions live in cookies, the cookie's attributes are the first line of defense, so the framework sets them in one place instead of leaving every application to remember them:
+
+```typescript title="packages/eigen/auth.ts"
+/**
+ * The __Host- prefix makes the browser enforce Secure, Path=/ and no Domain
+ * attribute, so a subdomain can't set or overwrite this cookie.
+ */
+export const SESSION_COOKIE = "__Host-session";
+
+export function sessionCookie(sessionId: string, expiresAt: number): string {
+  const maxAge = Math.max(0, Math.floor((expiresAt - Date.now()) / 1000));
+  return [
+    `${SESSION_COOKIE}=${encodeURIComponent(sessionId)}`,
+    "Path=/", // required by the __Host- prefix
+    "HttpOnly", // invisible to document.cookie — an XSS bug can't read it
+    "Secure", // HTTPS only (Chrome and Firefox accept it on http://localhost)
+    "SameSite=Lax", // not sent on cross-site POSTs or subresource requests
+    `Max-Age=${maxAge}`,
+  ].join("; ");
+}
+
+/** Same name and attributes, empty value, expires immediately */
+export function clearSessionCookie(): string {
+  return `${SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`;
+}
+```
+
+The cookie only holds an opaque, random session ID (at least 128 bits from `crypto.getRandomValues`); the user record and expiry live in a server-side store, so a session can be revoked by deleting it.
 
 ### Application-side: defining the user type
 
 ```typescript title="src/auth.config.ts"
-import type { AuthConfig } from 'eigen/auth'
-import { verifySessionCookie } from './lib/session'
+import { anonymousSession, SESSION_COOKIE, type AuthConfig } from "eigen/auth";
+import { getCookie } from "eigen/cookies";
+import { findSession } from "./lib/sessions"; // server-side session store
 
 export interface User {
-  id: string
-  email: string
-  name: string
-  role: 'admin' | 'editor' | 'viewer'
-  organizationId: string
+  id: string;
+  email: string;
+  name: string;
+  role: "admin" | "editor" | "viewer";
+  permissions: string[];
+  organizationId: string;
+}
+
+function requireEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) throw new Error(`Missing environment variable ${name}`);
+  return value;
 }
 
 export const authConfig: AuthConfig<User> = {
+  secret: requireEnv("EIGEN_AUTH_SECRET"),
+
   async getSession(request) {
-    const cookie = request.headers.get('cookie')
-    const sessionToken = parseCookie(cookie, 'session')
+    const sessionId = getCookie(request, SESSION_COOKIE);
+    if (!sessionId) return anonymousSession;
 
-    if (!sessionToken) {
-      return { user: null, sessionId: null, isAuthenticated: false, expiresAt: null }
-    }
+    // Unknown, revoked, or expired IDs all come back as "not logged in"
+    const stored = await findSession(sessionId);
+    if (!stored || stored.expiresAt <= Date.now()) return anonymousSession;
 
-    try {
-      const session = await verifySessionCookie(sessionToken)
-      return {
-        user: session.user,
-        sessionId: session.id,
-        isAuthenticated: true,
-        expiresAt: session.expiresAt,
-      }
-    } catch {
-      return { user: null, sessionId: null, isAuthenticated: false, expiresAt: null }
-    }
+    return {
+      user: stored.user,
+      sessionId,
+      isAuthenticated: true,
+      expiresAt: stored.expiresAt,
+    };
   },
 
-  loginUrl: '/login',
+  loginUrl: "/login",
 
-  protectedRoutes: ['/dashboard/*', '/settings/*', '/api/admin/*'],
+  protectedRoutes: ["/dashboard/*", "/settings/*", "/api/admin/*"],
 
-  publicRoutes: ['/login', '/signup', '/api/public/*'],
-}
-
-function parseCookie(header: string | null, name: string): string | undefined {
-  if (!header) return undefined
-  const match = header.match(new RegExp(`${name}=([^;]+)`))
-  return match?.[1]
-}
+  publicRoutes: ["/login", "/signup", "/api/public/*"],
+};
 ```
+
+`getCookie` is the anchored cookie reader from [Part 14](/14-framework-middleware), so a cookie named `x__Host-session` can't be mistaken for ours.
 
 ---
 
-## The auth middleware plugin
+## The auth middleware
 
-The framework provides an auth middleware that runs early in the chain and makes the session available to everything downstream:
+Auth is runtime code, so it doesn't need a virtual module: the framework exports a factory that turns an `AuthConfig` into a Part 14 middleware. It runs first in the global chain, which means it runs for page renders, for `/_eigen/data` requests, _and_ for server function calls — one code path in dev and production.
 
 ```typescript title="packages/eigen/auth-middleware.ts"
-import type { Plugin, ResolvedConfig } from 'vite'
-import type { AuthConfig, Session } from './auth'
+import { defineMiddleware, redirect } from "./middleware";
+import { matchPattern, type AuthConfig } from "./auth";
+import { checkCSRF, generateCSRFToken } from "./csrf";
 
-export function eigenAuth<TUser>(config: AuthConfig<TUser>): Plugin {
-  return {
-    name: 'eigen-auth',
+export function createAuthMiddleware<TUser>(config: AuthConfig<TUser>) {
+  return defineMiddleware(async (ctx) => {
+    const session = await config.getSession(ctx.request);
 
-    // Generate the auth middleware as a virtual module
-    resolveId(id) {
-      if (id === 'eigen/auth/middleware') return '\0eigen:auth-middleware'
-      if (id === 'eigen/auth/session') return '\0eigen:auth-session'
-    },
+    // 1. CSRF: every state-changing request (server functions, form posts)
+    //    must come from our own origin and carry a valid token
+    const denied = await checkCSRF(ctx.request, session.sessionId, config.secret);
+    if (denied) return denied;
 
-    load(id) {
-      if (id === '\0eigen:auth-middleware') {
-        // Generate middleware that uses the application's auth config
-        return `
-          import { authConfig } from '/src/auth.config'
-          import { redirect } from 'eigen/middleware'
+    // 2. Authentication for protected routes
+    if (isProtected(ctx.pathname, config) && !session.isAuthenticated) {
+      const { search } = new URL(ctx.request.url);
+      const returnTo = encodeURIComponent(ctx.pathname + search);
+      redirect(`${config.loginUrl ?? "/login"}?returnTo=${returnTo}`);
+    }
 
-          export const authMiddleware = async (ctx, next) => {
-            const session = await authConfig.getSession(ctx.request)
+    // 3. Add session to context — available in all downstream middleware,
+    //    loaders, and server functions as ctx.session, ctx.user, ctx.csrfToken
+    const csrfToken = session.sessionId ? await generateCSRFToken(session.sessionId, config.secret) : null;
 
-            // Check if this route requires authentication
-            const isProtected = checkProtected(ctx.pathname, authConfig)
-            const isPublic = checkPublic(ctx.pathname, authConfig)
+    return { session, user: session.user, csrfToken };
+  });
+}
 
-            if (isProtected && !isPublic && !session.isAuthenticated) {
-              // Redirect to login with return URL
-              const loginUrl = authConfig.loginUrl ?? '/login'
-              const returnTo = encodeURIComponent(ctx.pathname)
-              redirect(\`\${loginUrl}?returnTo=\${returnTo}\`)
-            }
+function isProtected(pathname: string, config: AuthConfig<unknown>): boolean {
+  const { protectedRoutes, publicRoutes = [] } = config;
+  if (publicRoutes.some((pattern) => matchPattern(pattern, pathname))) return false;
+  if (!protectedRoutes) return false;
+  if (typeof protectedRoutes === "function") return protectedRoutes(pathname);
+  return protectedRoutes.some((pattern) => matchPattern(pattern, pathname));
+}
+```
 
-            // Add session to context — available in all downstream middleware,
-            // loaders, and server functions as ctx.session and ctx.user
-            return {
-              session,
-              user: session.user,
-            }
-          }
+Route patterns match on **segment boundaries**. A naive `pathname.startsWith('/api/public')` would make `/api/publicadmin` public; the matcher also normalizes the path the same way the router sees it, so `/dashboard/` or `/%64ashboard` can't slip past the check:
 
-          function checkProtected(pathname, config) {
-            if (!config.protectedRoutes) return false
-            if (typeof config.protectedRoutes === 'function') {
-              return config.protectedRoutes(pathname)
-            }
-            return config.protectedRoutes.some(pattern => matchPattern(pattern, pathname))
-          }
+```typescript title="packages/eigen/auth.ts"
+/** '/dashboard/*' matches '/dashboard' and '/dashboard/…' — not '/dashboard-old' */
+export function matchPattern(pattern: string, pathname: string): boolean {
+  const path = normalizePath(pathname);
+  if (pattern.endsWith("/*")) {
+    const base = pattern.slice(0, -2);
+    return path === base || path.startsWith(`${base}/`);
+  }
+  return path === pattern;
+}
 
-          function checkPublic(pathname, config) {
-            if (!config.publicRoutes) return false
-            return config.publicRoutes.some(pattern => matchPattern(pattern, pathname))
-          }
+function normalizePath(pathname: string): string {
+  let path: string;
+  try {
+    path = decodeURIComponent(pathname);
+  } catch {
+    path = pathname;
+  }
+  path = path.replace(/\/{2,}/g, "/");
+  return path.length > 1 && path.endsWith("/") ? path.slice(0, -1) : path;
+}
+```
 
-          function matchPattern(pattern, pathname) {
-            if (pattern.endsWith('/*')) {
-              return pathname.startsWith(pattern.slice(0, -2))
-            }
-            return pattern === pathname
-          }
-        `
-      }
+Register the middleware first in the global list from Part 14. It replaces Part 14's simple `sessionMiddleware`:
 
-      if (id === '\0eigen:auth-session') {
-        const isClient = this.environment?.name === 'client'
+```typescript title="src/middleware.ts"
+import { createAuthMiddleware } from "eigen/auth-middleware";
+import { authConfig } from "./auth.config";
+import { rateLimitMiddleware } from "./middleware/rate-limit";
 
-        if (isClient) {
-          // Client: read session from serialized data
-          return `
-            import { createContext, useContext, useState, useEffect } from 'react'
+export default [rateLimitMiddleware, createAuthMiddleware(authConfig)];
+```
 
-            const SessionContext = createContext(null)
+`src/middleware.ts` is only imported by the SSR branch of `eigen/routes`, so `authConfig` — and the secret it reads — never enters the client graph.
 
-            export function SessionProvider({ children, initialSession }) {
-              const [session, setSession] = useState(initialSession)
+### Typing the context
 
-              return (
-                <SessionContext.Provider value={{ session, setSession }}>
-                  {children}
-                </SessionContext.Provider>
-              )
-            }
+The middleware's return value is merged into the context at runtime. To make TypeScript promise it to every loader and server function, the application augments `EigenContext` exactly as in Part 14:
 
-            export function useSession() {
-              const ctx = useContext(SessionContext)
-              if (!ctx) throw new Error('useSession must be used within SessionProvider')
-              return ctx.session
-            }
+```typescript title="src/eigen-context.d.ts"
+import type { Session } from "eigen/auth";
+import type { User } from "./auth.config";
 
-            export function useUser() {
-              const session = useSession()
-              return session?.user ?? null
-            }
-
-            export function useIsAuthenticated() {
-              const session = useSession()
-              return session?.isAuthenticated ?? false
-            }
-          `
-        }
-
-        // Server: session comes from middleware context
-        return `
-          export function getSession(ctx) {
-            return ctx.session ?? null
-          }
-
-          export function getUser(ctx) {
-            return ctx.user ?? null
-          }
-
-          export function requireUser(ctx) {
-            const user = ctx.user
-            if (!user) {
-              throw new Response('Unauthorized', { status: 401 })
-            }
-            return user
-          }
-        `
-      }
-    },
+declare module "eigen/types" {
+  interface EigenContext {
+    session: Session<User>;
+    user: User | null;
+    csrfToken: string | null;
   }
 }
 ```
+
+The `User` type from the application's `auth.config.ts` now flows through `ctx.user` in loaders, `context.user` in server functions, and (below) `useUser()` in components — no generated declarations needed.
 
 ---
 
 ## Using auth in loaders and server functions
 
-With the auth middleware in place, every loader and server function receives the typed user:
+With the auth middleware in place, every loader and server function receives the typed user. A small helper turns "maybe a user" into "definitely a user":
 
-```typescript title="src/pages/dashboard/index.tsx"
-import { defineLoader } from 'eigen/helpers'
-import { requireUser } from 'eigen/auth/session'
+```typescript title="packages/eigen/auth.ts"
+import { redirect } from "./middleware";
 
-export const loader = defineLoader('/dashboard', async ({ params, ctx }) => {
-  // ctx.user is typed as User | null (from the auth middleware)
-  // requireUser throws 401 if not authenticated
-  const user = requireUser(ctx)
-
-  // user is now typed as User (non-null)
-  const dashboard = await db.query(
-    'SELECT * FROM dashboards WHERE org_id = $1',
-    [user.organizationId],
-  )
-
-  return { dashboard: dashboard.rows, userName: user.name }
-})
+/** Returns the user, or redirects to the login page */
+export function requireUser<TCtx extends { user: unknown; pathname: string }>(
+  ctx: TCtx,
+  loginUrl = "/login",
+): NonNullable<TCtx["user"]> {
+  if (ctx.user) return ctx.user as NonNullable<TCtx["user"]>;
+  // A server function URL is not a page — don't send the user back to it
+  const returnTo = ctx.pathname.startsWith("/_eigen/") ? "" : `?returnTo=${encodeURIComponent(ctx.pathname)}`;
+  redirect(`${loginUrl}${returnTo}`);
+}
 ```
 
-```typescript
+`redirect()` throws a `RedirectResponse` that the pipeline from Part 14 turns into a 302 for pages and an `X-Eigen-Redirect` header for `/_eigen/data` and server functions.
+
+```typescript title="src/pages/dashboard/index.tsx"
+import { defineLoader } from "eigen/helpers";
+import { requireUser } from "eigen/auth";
+import { query } from "eigen/db";
+
+export const loader = defineLoader("/dashboard", async ({ ctx }) => {
+  // ctx.user is typed as User | null (from the EigenContext augmentation)
+  const user = requireUser(ctx);
+
+  // user is now typed as User (non-null)
+  const dashboard = await query("SELECT * FROM dashboards WHERE org_id = $1", [user.organizationId]);
+
+  return { dashboard: dashboard.rows, userName: user.name };
+});
+```
+
+```typescript title="src/pages/settings/profile.tsx"
 // Server function with auth
-import { createServerFn } from 'eigen/server'
-import { requireUser } from 'eigen/auth/session'
+import { createServerFn } from "eigen/server";
+import { requireUser } from "eigen/auth";
+import { query } from "eigen/db";
+import { z } from "zod";
 
-export const updateProfile = createServerFn({ method: 'POST' })
+export const updateProfile = createServerFn({ method: "POST" })
+  .validator(z.object({ name: z.string().min(1).max(100) }))
   .handler(async ({ data, context }) => {
-    const user = requireUser(context)
+    // context includes what global middleware added (Part 15 runs the
+    // global chain before the handler), so context.user is set here
+    const user = requireUser(context);
 
-    await db.query(
-      'UPDATE users SET name = $1 WHERE id = $2',
-      [data.name, user.id],
-    )
+    await query("UPDATE users SET name = $1 WHERE id = $2", [data.name, user.id]);
 
-    return { success: true }
-  })
+    return { success: true };
+  });
+```
+
+---
+
+## Logging in and out
+
+Login and logout set and clear the cookie, so they are plain `Request → Response` handlers mounted on the H3 app — the same app serves dev ([Part 3](/03-server-side-rendering)) and production ([Part 6](/06-production-builds)), so there's one implementation:
+
+```typescript title="src/server/auth-routes.ts"
+import { clearSessionCookie, sessionCookie } from "eigen/auth";
+import { checkCSRF, safeReturnTo } from "eigen/csrf";
+import { authConfig } from "../auth.config";
+import { createSession, deleteSession, verifyPassword } from "../lib/sessions";
+
+export async function handleLogin(request: Request): Promise<Response> {
+  // "Login CSRF": a cross-site form could otherwise log the victim into the
+  // attacker's account. There's no session yet, so this is the Origin check.
+  const denied = await checkCSRF(request, null, authConfig.secret);
+  if (denied) return denied;
+
+  const form = await request.formData();
+  const returnTo = safeReturnTo(form.get("returnTo"));
+  const user = await verifyPassword(String(form.get("email") ?? ""), String(form.get("password") ?? ""));
+
+  if (!user) {
+    const location = `/login?error=invalid&returnTo=${encodeURIComponent(returnTo)}`;
+    return new Response(null, { status: 303, headers: { Location: location } });
+  }
+
+  // Always issue a NEW random session ID at login — reusing one that existed
+  // before authentication enables session fixation
+  const session = await createSession(user.id); // { id, expiresAt }
+  return new Response(null, {
+    status: 303,
+    headers: { Location: returnTo, "Set-Cookie": sessionCookie(session.id, session.expiresAt) },
+  });
+}
+
+export async function handleLogout(request: Request): Promise<Response> {
+  const session = await authConfig.getSession(request);
+  const denied = await checkCSRF(request, session.sessionId, authConfig.secret);
+  if (denied) return denied;
+
+  // Revoke server-side, not just in the browser: a copied cookie stops working too
+  if (session.sessionId) await deleteSession(session.sessionId);
+
+  return new Response(null, {
+    status: 303,
+    headers: { Location: "/", "Set-Cookie": clearSessionCookie() },
+  });
+}
+```
+
+```typescript title="server.ts"
+// Before the catch-all page handler
+app.post("/api/login", (event) => handleLogin(event.req));
+app.post("/api/logout", (event) => handleLogout(event.req));
+```
+
+### Validating `returnTo`
+
+`returnTo` arrives from the query string, so it's attacker-controlled. Redirecting to it unchecked is an **open redirect**: `/login?returnTo=https://evil.example` would send a freshly logged-in user to a phishing page. Only same-origin paths are allowed:
+
+```typescript title="packages/eigen/csrf.ts"
+export function safeReturnTo(value: FormDataEntryValue | string | null, fallback = "/"): string {
+  if (typeof value !== "string") return fallback;
+  // One leading slash only: '//evil.example' and '/\evil.example' are
+  // treated by browsers as protocol-relative URLs to another host
+  if (!value.startsWith("/") || value.startsWith("//") || value.startsWith("/\\")) return fallback;
+  // Final check after the URL parser strips tabs/newlines and normalizes
+  const base = "http://eigen.invalid";
+  const url = new URL(value, base);
+  if (url.origin !== base) return fallback;
+  return url.pathname + url.search + url.hash;
+}
 ```
 
 ---
 
 ## Client-side auth: the `useSession` hook
 
-The session needs to be available in client components without prop drilling. The framework serializes a *safe subset* of the session into the HTML (no secret tokens) and provides context hooks:
+The session needs to be available in client components without prop drilling. The framework serializes a _safe subset_ of the session into the HTML and provides context hooks. This is an ordinary framework module (no environment-specific code), so the same file renders on the server and hydrates on the client:
 
-```typescript
-// In the SSR pipeline — serialize session (minus sensitive fields)
-function serializeSessionForClient<TUser>(session: Session<TUser>): object {
-  return {
-    user: session.user,          // Safe: user profile data
-    isAuthenticated: session.isAuthenticated,
-    expiresAt: session.expiresAt,
-    // NOT included: sessionId, tokens, secrets
+```tsx title="packages/eigen/auth-session.tsx"
+import { createContext, use, type ReactNode } from "react";
+import type { EigenContext } from "./types";
+
+/** The application's User type, taken from its EigenContext augmentation */
+type AppUser = EigenContext extends { user: infer U } ? NonNullable<U> : unknown;
+
+export interface ClientSession {
+  user: AppUser | null;
+  isAuthenticated: boolean;
+  expiresAt: number | null;
+  /** Sent back with state-changing requests (see CSRF below) */
+  csrfToken: string | null;
+  // NOT included: sessionId — the cookie is HttpOnly for a reason
+}
+
+declare global {
+  interface Window {
+    __EIGEN_SESSION__?: ClientSession;
   }
 }
 
-// Injected into HTML alongside __EIGEN_DATA__
-const clientSession = serializeSessionForClient(ctx.session)
-template.replace(
-  '</head>',
-  `<script>window.__EIGEN_SESSION__=${JSON.stringify(clientSession)}</script></head>`,
-)
+const SessionContext = createContext<ClientSession | null>(null);
+
+export function SessionProvider({ initialSession, children }: { initialSession: ClientSession; children: ReactNode }) {
+  return <SessionContext value={initialSession}>{children}</SessionContext>;
+}
+
+export function useSession(): ClientSession {
+  const session = use(SessionContext);
+  if (!session) throw new Error("useSession must be used within SessionProvider");
+  return session;
+}
+
+export function useUser(): AppUser | null {
+  return useSession().user;
+}
+
+export function useIsAuthenticated(): boolean {
+  return useSession().isAuthenticated;
+}
+
+export function useCsrfToken(): string {
+  return useSession().csrfToken ?? "";
+}
 ```
 
-In the client entry, the `SessionProvider` wraps the app:
+On the server, `render()` builds the client session from the middleware context, wraps the app in the provider, and adds the serialized session to the `head` string introduced in [Part 30](/30-route-metadata-seo). `serializeForScript` (Part 3) escapes `<`, so a user who names themselves `</script><script>…` can't inject markup:
+
+```tsx title="entry-server.tsx"
+import { serializeForScript } from "eigen/serialize";
+import { SessionProvider, type ClientSession } from "eigen/auth/session";
+import type { EigenContext } from "eigen/types";
+
+function serializeSessionForClient(ctx: EigenContext): ClientSession {
+  return {
+    user: ctx.user,
+    isAuthenticated: ctx.session.isAuthenticated,
+    expiresAt: ctx.session.expiresAt,
+    csrfToken: ctx.csrfToken,
+  };
+}
+
+// Inside render(), after runRoute() and the Part 30 metadata step:
+const clientSession = serializeSessionForClient(result.context);
+
+const html = renderToString(
+  <SessionProvider initialSession={clientSession}>
+    <App match={match} data={result.data} />
+  </SessionProvider>,
+);
+const head =
+  renderMetadataToHTML(meta) + `\n    <script>window.__EIGEN_SESSION__=${serializeForScript(clientSession)}</script>`;
+
+return { html, status: 200, data: result.data, head };
+```
+
+A page that embeds a session is personalized, so it must not be stored in a shared cache: send `Cache-Control: private, no-store` whenever `clientSession.isAuthenticated` is true.
+
+In the client entry, the `SessionProvider` wraps the app with the same value:
 
 ```tsx title="src/entry-client.tsx"
-import { SessionProvider } from 'eigen/auth/session'
+import { hydrateRoot } from "react-dom/client";
+import { SessionProvider } from "eigen/auth/session";
 
-const initialSession = (window as any).__EIGEN_SESSION__
+const initialSession = window.__EIGEN_SESSION__ ?? {
+  user: null,
+  isAuthenticated: false,
+  expiresAt: null,
+  csrfToken: null,
+};
 
 hydrateRoot(
-  document.getElementById('root')!,
+  document.getElementById("root")!,
   <SessionProvider initialSession={initialSession}>
     <App />
   </SessionProvider>,
-)
+);
 ```
 
 Components use the hooks:
 
 ```tsx title="src/components/UserMenu.tsx"
-'use client'
-
-import { useUser, useIsAuthenticated } from 'eigen/auth/session'
+import { useCsrfToken, useUser } from "eigen/auth/session";
 
 export function UserMenu() {
-  const user = useUser()
-  const isAuthenticated = useIsAuthenticated()
+  const user = useUser();
+  const csrfToken = useCsrfToken();
 
-  if (!isAuthenticated) {
-    return <a href="/login">Sign in</a>
+  if (!user) {
+    return <a href="/login">Sign in</a>;
   }
 
   return (
@@ -360,128 +527,187 @@ export function UserMenu() {
       <span>Welcome, {user.name}</span>
       <a href="/settings">Settings</a>
       <form action="/api/logout" method="POST">
+        <input type="hidden" name="_csrf" value={csrfToken} />
         <button type="submit">Sign out</button>
       </form>
     </div>
-  )
+  );
 }
 ```
+
+Register `eigen/auth`, `eigen/auth-middleware`, `eigen/auth/session` (→ `packages/eigen/auth-session.tsx`) and `eigen/csrf` in `resolve.alias` and tsconfig `paths`, like the other framework modules.
 
 ---
 
 ## Route-level access control
 
-Beyond "authenticated or not," routes often need role-based or permission-based access control. The framework provides a declarative convention:
+Beyond "authenticated or not," routes often need role-based or permission-based access control. Because every check must also run for `/_eigen/data` requests (client-side navigations), access control is a per-route middleware from Part 14 rather than something only the HTML render looks at:
 
 ```tsx title="src/pages/admin/users.tsx"
-import type { RouteAccess } from 'eigen/auth'
+import { defineLoader } from "eigen/helpers";
+import { requireAccess, requireUser } from "eigen/auth";
+import { query } from "eigen/db";
+import type { User } from "../../auth.config";
 
-// Declarative access control — checked by the auth middleware
-export const access: RouteAccess = {
-  roles: ['admin'],
-  // Or a custom check:
-  // check: (user) => user.organizationId === 'org_123',
-}
+// Declarative access control — runs before the loader, for HTML and data requests
+export const middleware = [
+  requireAccess<User>({
+    roles: ["admin"],
+    // Or a custom check:
+    // check: (user) => user.organizationId === 'org_123',
+  }),
+];
 
-export const loader = defineLoader('/admin/users', async ({ ctx }) => {
-  // If we get here, the user is guaranteed to be an admin
-  // (the auth middleware already checked)
-  return db.query('SELECT * FROM users')
-})
+export const loader = defineLoader("/admin/users", async ({ ctx }) => {
+  // If we get here, the middleware has already verified the user is an admin
+  requireUser(ctx);
+  const result = await query("SELECT id, email, name, role FROM users");
+  return result.rows;
+});
 ```
 
-The types:
+Part 7's transform strips the `middleware` export from the client bundle along with `loader`.
+
+The types and the middleware factory:
 
 ```typescript title="packages/eigen/auth.ts"
-export interface RouteAccess<TUser = unknown> {
+import type { BaseContext } from "./types";
+import { defineMiddleware, redirect } from "./middleware";
+
+export interface RouteAccess<TUser> {
   /** Required roles (any match grants access) */
-  roles?: string[]
+  roles?: string[];
   /** Required permissions (all must match) */
-  permissions?: string[]
+  permissions?: string[];
   /** Custom access check function */
-  check?: (user: TUser) => boolean | Promise<boolean>
+  check?: (user: TUser) => boolean | Promise<boolean>;
+}
+
+export function requireAccess<TUser extends { role?: string; permissions?: string[] }>(access: RouteAccess<TUser>) {
+  return defineMiddleware(async (ctx: BaseContext & { user: TUser | null }) => {
+    // Not logged in → login page (authentication problem)
+    const user = ctx.user ?? redirect(`/login?returnTo=${encodeURIComponent(ctx.pathname)}`);
+
+    // Logged in but not allowed → 403 (authorization problem)
+    const forbidden = new Response("Forbidden", { status: 403 });
+
+    if (access.roles && !(user.role && access.roles.includes(user.role))) return forbidden;
+    if (access.permissions && !access.permissions.every((p) => user.permissions?.includes(p))) {
+      return forbidden;
+    }
+    if (access.check && !(await access.check(user))) return forbidden;
+  });
 }
 ```
 
-The auth middleware reads the `access` export from the matched route:
-
-```typescript
-// In the auth middleware — after session resolution
-if (match.route.access) {
-  const access = match.route.access
-  const user = session.user
-
-  if (!user) redirect(loginUrl)
-
-  if (access.roles && !access.roles.includes((user as any).role)) {
-    throw new Response('Forbidden', { status: 403 })
-  }
-
-  if (access.check) {
-    const allowed = await access.check(user)
-    if (!allowed) throw new Response('Forbidden', { status: 403 })
-  }
-}
-```
+Every field in `RouteAccess` is enforced. An access rule the middleware silently ignored would _fail open_ — the page would look protected in code review and be public in production.
 
 ---
 
 ## CSRF protection for server functions
 
-Server functions (Part 14) accept POST requests from the client. Without CSRF protection, a malicious site could trigger server functions on behalf of an authenticated user.
+Server functions ([Part 15](/15-server-functions)) accept POST requests from the client. The browser attaches the session cookie to those requests automatically, so without CSRF protection a malicious site could trigger server functions on behalf of an authenticated user.
 
-The framework handles this automatically:
+The framework layers two defenses on top of `SameSite=Lax`:
 
-```typescript
-// In the auth middleware — generate CSRF token
-const csrfToken = generateCSRFToken(session.sessionId)
+1. **Origin check.** Browsers send an `Origin` header on every POST (same-origin included). A state-changing request whose `Origin` doesn't match our host is rejected.
+2. **Session-bound token.** The token is `HMAC-SHA256(secret, sessionId)`. It's stateless (nothing to store), can't be forged without the server's secret, and only works for the session it was issued to.
 
-// Include it in the serialized session for client-side use
-return {
-  session,
-  user: session.user,
-  csrfToken,
+```typescript title="packages/eigen/csrf.ts"
+const encoder = new TextEncoder();
+const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
+function hmacKey(secret: string, usage: "sign" | "verify"): Promise<CryptoKey> {
+  return crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, [usage]);
+}
+
+/** hex(HMAC-SHA256(secret, "csrf:" + sessionId)) — Web Crypto, so it runs on Node and edge */
+export async function generateCSRFToken(sessionId: string, secret: string): Promise<string> {
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    await hmacKey(secret, "sign"),
+    encoder.encode(`csrf:${sessionId}`),
+  );
+  return Array.from(new Uint8Array(signature), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+export async function validateCSRFToken(token: string, sessionId: string, secret: string): Promise<boolean> {
+  if (!/^[0-9a-f]{64}$/.test(token)) return false;
+  const signature = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) signature[i] = parseInt(token.slice(i * 2, i * 2 + 2), 16);
+
+  // Never compare tokens with ===: string comparison stops at the first
+  // differing character, and that timing difference lets an attacker guess
+  // a token byte by byte. subtle.verify recomputes the HMAC and compares in
+  // constant time. (On Node alone, crypto.timingSafeEqual does the same job.)
+  return crypto.subtle.verify("HMAC", await hmacKey(secret, "verify"), signature, encoder.encode(`csrf:${sessionId}`));
+}
+
+function originAllowed(request: Request): boolean {
+  const origin = request.headers.get("origin");
+  // No Origin: not a modern browser. Allow only if the request carries no
+  // cookies (e.g. an API client with a bearer token — nothing ambient to abuse).
+  if (!origin) return !request.headers.has("cookie");
+  const host = request.headers.get("host") ?? new URL(request.url).host;
+  try {
+    return new URL(origin).host === host;
+  } catch {
+    return false;
+  }
+}
+
+/** Server functions send the token in a header; plain HTML forms in a _csrf field */
+async function readToken(request: Request): Promise<string> {
+  const header = request.headers.get("x-eigen-csrf");
+  if (header) return header;
+  const type = request.headers.get("content-type") ?? "";
+  if (type.startsWith("application/x-www-form-urlencoded") || type.startsWith("multipart/form-data")) {
+    // clone(): the handler still needs to read the body
+    const value = (await request.clone().formData()).get("_csrf");
+    return typeof value === "string" ? value : "";
+  }
+  return "";
+}
+
+/**
+ * Returns a 403 Response if a state-changing request fails the CSRF checks,
+ * or null if it may proceed. Safe methods are never checked — which is why
+ * GET handlers must never change state.
+ */
+export async function checkCSRF(request: Request, sessionId: string | null, secret: string): Promise<Response | null> {
+  if (SAFE_METHODS.has(request.method)) return null;
+
+  if (!originAllowed(request)) {
+    return Response.json({ error: "Cross-origin request blocked" }, { status: 403 });
+  }
+
+  // Without a cookie session there's no ambient credential to protect
+  if (sessionId && !(await validateCSRFToken(await readToken(request), sessionId, secret))) {
+    return Response.json({ error: "Invalid CSRF token" }, { status: 403 });
+  }
+
+  return null;
 }
 ```
 
-```typescript
-// In the server function RPC endpoint — validate CSRF
-server.middlewares.use(async (req, res, next) => {
-  if (!req.url?.startsWith('/_eigen/fn/')) return next()
-
-  // Verify CSRF token on all mutation requests
-  const csrfToken = req.headers['x-eigen-csrf']
-  const sessionToken = parseCookie(req.headers.cookie, 'session')
-
-  if (!csrfToken || !validateCSRFToken(csrfToken, sessionToken)) {
-    res.writeHead(403)
-    res.end(JSON.stringify({ error: 'Invalid CSRF token' }))
-    return
-  }
-
-  next()
-})
-```
-
-The client-side server function stub (generated by the `transform` hook) automatically includes the CSRF token:
+`checkCSRF` runs inside the auth middleware, and the server function endpoint from Part 15 runs the global middleware chain before every handler — in the dev server and in the production server alike. The token reaches the browser in `window.__EIGEN_SESSION__.csrfToken`, and the client stub generated by Part 15's `transform` hook sends it back:
 
 ```typescript
 // Generated client stub
 export const updateProfile = async (args) => {
-  const csrfToken = window.__EIGEN_SESSION__?.csrfToken
-  const res = await fetch('/_eigen/fn/b4e2a1', {
-    method: 'POST',
+  const res = await fetch("/_eigen/fn/b4e2a1", {
+    method: "POST",
     headers: {
-      'Content-Type': 'application/json',
-      'X-Eigen-CSRF': csrfToken ?? '',
+      "Content-Type": "application/json",
+      "X-Eigen-CSRF": window.__EIGEN_SESSION__?.csrfToken ?? "",
     },
     body: JSON.stringify(args),
-  })
+  });
   // ...
-}
+};
 ```
 
-Developers never think about CSRF — the framework handles token generation, injection, and validation transparently.
+Developers never think about CSRF — the framework handles token generation, injection, and validation transparently. The `EIGEN_AUTH_SECRET` must be long, random, and server-only; rotating it invalidates every outstanding token (users just reload the page).
 
 ---
 
@@ -493,58 +719,127 @@ The `AuthConfig.getSession` function is the integration point. Any auth library 
 <Tab value="Better Auth">
 
 ```typescript title="src/auth.config.ts"
-import { betterAuth } from 'better-auth'
+// User and requireEnv: as defined in the cookie-session version above
+import { betterAuth } from "better-auth";
+import { anonymousSession, type AuthConfig } from "eigen/auth";
 
-const auth = betterAuth({ /* ... */ })
+const auth = betterAuth({
+  /* database, providers, ... */
+  user: {
+    // Extra columns on Better Auth's user table, so session.user carries them
+    additionalFields: {
+      role: { type: "string", defaultValue: "viewer", input: false },
+      permissions: { type: "string[]", defaultValue: [], input: false },
+      organizationId: { type: "string", input: false },
+    },
+  },
+});
 
 export const authConfig: AuthConfig<User> = {
+  secret: requireEnv("EIGEN_AUTH_SECRET"),
   async getSession(request) {
-    const session = await auth.api.getSession({ headers: request.headers })
-    if (!session) return { user: null, sessionId: null, isAuthenticated: false, expiresAt: null }
+    const result = await auth.api.getSession({ headers: request.headers });
+    if (!result) return anonymousSession;
+    const { user, session } = result;
     return {
-      user: session.user,
-      sessionId: session.session.id,
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        role: user.role as User["role"],
+        permissions: user.permissions ?? [],
+        organizationId: user.organizationId,
+      },
+      sessionId: session.id,
       isAuthenticated: true,
-      expiresAt: new Date(session.session.expiresAt).getTime(),
-    }
+      expiresAt: new Date(session.expiresAt).getTime(),
+    };
   },
-}
+};
 ```
+
+Better Auth sets its own session cookie (HttpOnly, SameSite=Lax, Secure in production) and serves its endpoints from its handler; mount `auth.handler` on the H3 app for `/api/auth/*`.
 
 </Tab>
 <Tab value="Auth.js">
 
 ```typescript title="src/auth.config.ts"
-import { getSession as getAuthJsSession } from '@auth/core'
+// User and requireEnv: as defined in the cookie-session version above
+import { Auth, createActionURL, setEnvDefaults, type AuthConfig as AuthJsConfig } from "@auth/core";
+import GitHub from "@auth/core/providers/github";
+import { anonymousSession, type AuthConfig } from "eigen/auth";
+import { getCookie } from "eigen/cookies";
+import { findUserByEmail } from "./lib/users";
+
+// Auth.js's own routes (/auth/signin, /auth/callback/github, ...) are served
+// by passing those requests to Auth(request, authJs) from the H3 app
+export const authJs: AuthJsConfig = { providers: [GitHub], basePath: "/auth", trustHost: true };
 
 export const authConfig: AuthConfig<User> = {
+  secret: requireEnv("EIGEN_AUTH_SECRET"),
   async getSession(request) {
-    const session = await getAuthJsSession(request, authOptions)
-    // ... map to Eigen's Session type
+    // @auth/core has no getSession(); ask its session endpoint, as the
+    // official framework integrations do
+    setEnvDefaults(process.env, authJs); // AUTH_SECRET, AUTH_URL, ...
+    const protocol = new URL(request.url).protocol.replace(":", "");
+    const url = createActionURL("session", protocol, request.headers, process.env, authJs);
+    const response = await Auth(new Request(url, { headers: { cookie: request.headers.get("cookie") ?? "" } }), authJs);
+    const data = await response.json();
+    if (!response.ok || !data?.user?.email) return anonymousSession;
+
+    const user = await findUserByEmail(data.user.email);
+    if (!user) return anonymousSession;
+
+    // Auth.js doesn't expose a session ID; bind CSRF tokens to its session cookie
+    const sessionToken =
+      getCookie(request, "__Secure-authjs.session-token") ?? getCookie(request, "authjs.session-token");
+
+    return {
+      user,
+      sessionId: sessionToken ?? null,
+      isAuthenticated: true,
+      expiresAt: Date.parse(data.expires),
+    };
   },
-}
+};
 ```
 
 </Tab>
 <Tab value="Custom JWT">
 
 ```typescript title="src/auth.config.ts"
-import { jwtVerify } from 'jose'
+// User and requireEnv: as defined in the cookie-session version above
+import { jwtVerify } from "jose";
+import { anonymousSession, type AuthConfig } from "eigen/auth";
+
+const jwtSecret = new TextEncoder().encode(requireEnv("JWT_SECRET"));
 
 export const authConfig: AuthConfig<User> = {
+  secret: requireEnv("EIGEN_AUTH_SECRET"),
   async getSession(request) {
-    const token = request.headers.get('authorization')?.replace('Bearer ', '')
-    if (!token) return { user: null, sessionId: null, isAuthenticated: false, expiresAt: null }
+    const header = request.headers.get("authorization");
+    if (!header?.startsWith("Bearer ")) return anonymousSession;
 
-    const { payload } = await jwtVerify(token, secret)
-    return {
-      user: payload as User,
-      sessionId: null,
-      isAuthenticated: true,
-      expiresAt: (payload.exp ?? 0) * 1000,
+    try {
+      const { payload } = await jwtVerify<{ user: User }>(header.slice("Bearer ".length), jwtSecret, {
+        algorithms: ["HS256"], // pin the algorithm
+        issuer: "https://auth.example.com",
+        audience: "eigen-app",
+      });
+      return {
+        user: payload.user,
+        // A bearer header isn't attached by the browser automatically,
+        // so there's no ambient credential for CSRF to abuse
+        sessionId: null,
+        isAuthenticated: true,
+        expiresAt: payload.exp ? payload.exp * 1000 : null,
+      };
+    } catch {
+      // Expired, malformed, or badly signed tokens are "not logged in", not a 500
+      return anonymousSession;
     }
   },
-}
+};
 ```
 
 </Tab>
@@ -554,47 +849,26 @@ The framework doesn't care which strategy you use. It provides the typed pipelin
 
 ---
 
-## Generated type declarations
-
-The auth plugin generates types so the session and user are correctly typed throughout:
-
-```typescript title="node_modules/.eigen/eigen-auth.d.ts"
-declare module 'eigen/auth/session' {
-  import type { User } from '/src/auth.config'
-  import type { Session } from 'eigen/auth'
-
-  export function useSession(): Session<User>
-  export function useUser(): User | null
-  export function useIsAuthenticated(): boolean
-
-  export function getSession(ctx: Record<string, unknown>): Session<User>
-  export function getUser(ctx: Record<string, unknown>): User | null
-  export function requireUser(ctx: Record<string, unknown>): User
-}
-```
-
-The `User` type from the application's `auth.config.ts` flows through to every hook and helper. Hover over `useUser()` in your IDE and you see your application's `User` type — not a generic `unknown`.
-
----
-
 ## What to observe
 
-1. **Visit a protected route without a session.** The auth middleware redirects to `/login?returnTo=/dashboard` before any loader runs.
+1. **Visit a protected route without a session.** The auth middleware redirects to `/login?returnTo=%2Fdashboard` before any loader runs. Try `/dashboard-old` and `/api/publicadmin` too: segment-boundary matching treats them as the separate routes they are.
 
-2. **Log in, then check `window.__EIGEN_SESSION__`** in the browser console. The user profile is there, but no session tokens or secrets.
+2. **Try `/login?returnTo=//evil.example` and log in.** You land on `/`, not on another site.
 
-3. **Hover over `ctx.user` in a loader.** TypeScript shows your application's `User` type with all its properties — not `unknown` or `any`.
+3. **Log in, then check `window.__EIGEN_SESSION__`** in the browser console. The user profile and a CSRF token are there, but no session ID — and `document.cookie` doesn't show `__Host-session`, because it's `HttpOnly`.
 
-4. **Call a server function from a different origin** (simulate CSRF). The request is rejected with 403 before the handler runs.
+4. **Hover over `ctx.user` in a loader.** TypeScript shows your application's `User` type with all its properties — not `unknown` or `any`.
 
-5. **Add a `roles: ['admin']` access control** to a route. Visit it as a non-admin user. You get a 403 instead of a redirect — the framework distinguishes between "not authenticated" (redirect to login) and "not authorized" (403 forbidden).
+5. **Call a server function from a different origin** (simulate CSRF), or replay a request in DevTools without the `X-Eigen-CSRF` header. Both are rejected with 403 before the handler runs.
+
+6. **Add a `requireAccess({ roles: ['admin'] })` middleware** to a route. Visit it as a non-admin user. You get a 403 instead of a redirect — the framework distinguishes between "not authenticated" (redirect to login) and "not authorized" (403 forbidden).
 
 ---
 
 ## Key insight
 
-The framework's auth contribution is *plumbing, not policy*. It provides the pipeline that carries auth state from the HTTP request through middleware, into loaders and server functions, across the SSR/client serialization boundary, and into React components via context hooks. The application plugs in a `getSession` function and a `User` type — everything else is handled.
+The framework's auth contribution is _plumbing, not policy_. It provides the pipeline that carries auth state from the HTTP request through middleware, into loaders and server functions, across the SSR/client serialization boundary, and into React components via context hooks. The application plugs in a `getSession` function and a `User` type — everything else is handled.
 
 This separation means the framework works with any auth provider (Better Auth, Auth.js, Lucia, custom JWT, Salesforce SSO, SAML) without coupling to any of them. The middleware context accumulation pattern from Part 14 is the foundation — auth is its most important application.
 
-The CSRF protection is an example of something the framework *should* handle because it's tied to the server function transport mechanism (Part 14). The framework generates the RPC endpoints, so it's responsible for securing them. If it didn't, every application would need to implement CSRF protection independently, and most would get it wrong.
+The CSRF protection is an example of something the framework _should_ handle because it's tied to the server function transport mechanism (Part 15). The framework generates the RPC endpoints, so it's responsible for securing them. If it didn't, every application would need to implement CSRF protection independently, and most would get it wrong.

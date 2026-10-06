@@ -9,95 +9,113 @@ concepts:
   - "background refetching"
 ---
 
-
-*This module builds the data fetching strategy layer — the framework infrastructure that sits between "a loader calls fetch" and "the user sees data." It covers request deduplication, fetch-level caching, parallel loader execution, client-side cache management, and TanStack Query integration for seamless SSR-to-client handoff.*
----
+## _This module builds the data fetching strategy layer — the framework infrastructure that sits between "a loader calls fetch" and "the user sees data." It covers request-scoped deduplication, safe credential forwarding, parallel loader execution, client-side cache management, and TanStack Query integration for seamless SSR-to-client handoff._
 
 ## The problems with naive data fetching
 
 Our loaders from Part 5 call `fetch` or query a database directly. This works, but it has several issues at scale:
 
-**Problem 1: Duplicate requests.** A layout loader and a page loader might both need the current user. Without deduplication, the database gets hit twice for the same data in the same render pass.
+**Problem 1: Duplicate requests.** A layout loader and a page loader might both need the current user. Without deduplication, the API gets hit twice for the same data in the same request.
 
-**Problem 2: Waterfall loading.** With nested layouts (Part 12), loaders run sequentially by default — the root layout loader finishes before the child layout loader starts. If each takes 200ms, a three-level layout stack takes 600ms.
+**Problem 2: Waterfall loading.** With nested layouts ([Part 13](/13-nested-layouts)), the first version of our pipeline ran loaders sequentially — the root layout loader finishes before the child layout loader starts. If each takes 200ms, a three-level layout stack takes 600ms. Part 13 sketched a parallel alternative; here it becomes the default, wired into the middleware context from Part 14.
 
 **Problem 3: No client-side cache.** After hydration, every client-side navigation fetches fresh data from the server. There's no caching, no stale-while-revalidate, no optimistic updates.
 
-**Problem 4: No prefetching.** When a user hovers over a link, we could start fetching data before they click. Our current router doesn't do this.
+**Problem 4: No cache-aware prefetching.** [Part 23](/23-advanced-router) preloads a route's loader data on hover, but that preload lives in its own short-lived map; nothing else on the page can share or invalidate it.
 
 ---
 
-## Request deduplication
+## A request-scoped fetch
 
-During a single SSR render pass, the framework provides a request-scoped cache that deduplicates identical fetches:
+Two jobs belong to the server-side `fetch` that loaders use: deduplicating identical GETs within one request, and forwarding the user's credentials to _our own_ APIs. Both depend on the incoming request, so the framework creates a fresh fetch per request rather than keeping a module-level cache (a module-level `Map` would be shared by every concurrent request in the process — one user's response could be served to another):
 
 ```typescript title="packages/eigen/fetch.ts"
-// Per-request cache (scoped to the current render, not shared across requests)
-const requestCache = new Map<string, Promise<unknown>>()
+export type Fetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
-/**
- * A fetch wrapper that deduplicates identical requests within a render pass.
- * Two components calling eigenFetch('/api/user') in the same render
- * produce one network request.
- */
-export async function eigenFetch(
-  input: RequestInfo | URL,
-  init?: RequestInit & {
-    /** Cache behavior: 'default' deduplicates, 'no-store' skips cache */
-    cache?: 'default' | 'no-store' | 'force-cache'
-    /** Revalidation interval in seconds */
-    revalidate?: number
-  },
-): Promise<Response> {
-  const url = typeof input === 'string' ? input : input.toString()
-  const method = init?.method?.toUpperCase() ?? 'GET'
-
-  // Only cache GET requests
-  if (method !== 'GET' || init?.cache === 'no-store') {
-    return fetch(input, init)
-  }
-
-  const cacheKey = `${method}:${url}`
-
-  if (requestCache.has(cacheKey)) {
-    // Return a clone so each consumer can read the body independently
-    const cached = await requestCache.get(cacheKey)!
-    return (cached as Response).clone()
-  }
-
-  const promise = fetch(input, init)
-  requestCache.set(cacheKey, promise)
-
-  const response = await promise
-  // Store the response for cloning
-  requestCache.set(cacheKey, Promise.resolve(response.clone()))
-
-  return response
+export interface ServerFetchOptions {
+  /**
+   * Origins (besides the app's own) allowed to receive the user's cookie and
+   * Authorization header. Everything else gets the request without them.
+   */
+  forwardCredentialsTo?: string[];
 }
 
 /**
- * Clear the request cache. Called at the start of each SSR render
- * to ensure no data leaks between requests.
+ * A fetch bound to one incoming request:
+ *  - identical GETs made while handling this request share one network call
+ *  - cookies/authorization are forwarded only to trusted origins
  */
-export function clearRequestCache() {
-  requestCache.clear()
+export function createServerFetch(request: Request, options: ServerFetchOptions = {}): Fetch {
+  // Lives exactly as long as this request — nothing leaks between users
+  const cache = new Map<string, Promise<Response>>();
+  const trusted = new Set([new URL(request.url).origin, ...(options.forwardCredentialsTo ?? [])]);
+
+  return async (input, init) => {
+    const source = input instanceof Request ? input : undefined;
+    // Relative URLs resolve against the incoming request, like in a browser
+    const url = new URL(source ? source.url : String(input), request.url);
+    const method = (init?.method ?? source?.method ?? "GET").toUpperCase();
+    const headers = new Headers(init?.headers ?? source?.headers);
+
+    // Forwarding the session cookie to a third-party API would hand that
+    // API the user's credentials — only trusted origins get them
+    if (trusted.has(url.origin)) {
+      const cookie = request.headers.get("cookie");
+      if (cookie && !headers.has("cookie")) headers.set("cookie", cookie);
+      const auth = request.headers.get("authorization");
+      if (auth && !headers.has("authorization")) headers.set("authorization", auth);
+    }
+
+    const doFetch = () => fetch(url, { ...init, method, headers });
+
+    // Only GETs are deduplicated; 'no-store' opts out
+    if (method !== "GET" || init?.cache === "no-store") return doFetch();
+
+    const key = url.href;
+    let pending = cache.get(key);
+    if (!pending) {
+      pending = doFetch();
+      cache.set(key, pending);
+      // A failed request must not be cached for the rest of the request
+      pending.catch(() => cache.delete(key));
+    }
+
+    // The cached Response is never handed out or read — every caller gets
+    // its own clone, so one consumer reading the body can't break another
+    return (await pending).clone();
+  };
 }
 ```
 
-<Callout type="warn" title="Per-process, not per-request">
-The module-level `requestCache` shown above is a simplification. In a production server handling concurrent requests, a module-level `Map` is shared across all in-flight requests. The `clearRequestCache()` call at the start of each render prevents stale data, but concurrent requests could still interfere. A production implementation would use `AsyncLocalStorage` to create a truly request-scoped cache.
-</Callout>
+The fetch reaches loaders through the middleware context. A global middleware ([Part 14](/14-framework-middleware)) creates it — along with the per-request `QueryClient` used later in this module:
 
-The SSR pipeline calls `clearRequestCache()` at the start of each request:
+```typescript title="src/middleware/data.ts"
+import { defineMiddleware } from "eigen/middleware";
+import { createServerFetch } from "eigen/fetch";
+import { createQueryClient } from "eigen/query";
 
-```typescript title="entry-server.tsx"
-export async function render(pathname: string, request: Request) {
-  clearRequestCache()  // Fresh cache per request
-  // ... run middleware, loaders, render
+export const dataMiddleware = defineMiddleware((ctx) => ({
+  fetch: createServerFetch(ctx.request, {
+    forwardCredentialsTo: ["https://api.example.com"],
+  }),
+  // One QueryClient per request — a shared one would leak cached data between users
+  queryClient: createQueryClient(),
+}));
+```
+
+```typescript title="src/eigen-context.d.ts"
+import type { QueryClient } from "@tanstack/react-query";
+import type { Fetch } from "eigen/fetch";
+
+declare module "eigen/types" {
+  interface EigenContext {
+    fetch: Fetch;
+    queryClient: QueryClient;
+  }
 }
 ```
 
-Now two loaders that both call `eigenFetch('https://api.example.com/user')` produce one network request. This is the same pattern Next.js uses with its extended `fetch` — but we're making it explicit rather than monkey-patching the global `fetch`.
+Add `dataMiddleware` to the global list in `src/middleware.ts`. Now two loaders that both call `ctx.fetch('https://api.example.com/user')` produce one network request. This is the same idea as Next.js's request memoization of `fetch` — but explicit, rather than patching the global `fetch`.
 
 ---
 
@@ -118,187 +136,181 @@ gantt
         Page loader           :b3, 0, 200
 ```
 
-Nested layouts (Part 12) create a loader hierarchy. By default, they run sequentially because each layout wraps its children. But layout loaders are usually independent — the root layout's user data doesn't depend on the dashboard layout's metrics data.
+Nested layouts create a loader hierarchy. Running the loaders one after another mirrors the component nesting, but layout loaders are usually independent — the root layout's user data doesn't depend on the dashboard layout's metrics data.
 
-The framework runs all matched loaders in parallel:
+So the loader step inside `runRoute` runs all matched loaders at once, after middleware, all sharing the same context:
 
-```typescript title="entry-server.tsx"
+```typescript title="packages/eigen/run-route.ts"
+import type { RouteMatch } from "eigen/match-route";
+import type { EigenContext } from "eigen/types";
+
 async function executeLoaders(
   match: RouteMatch,
+  ctx: EigenContext,
 ): Promise<{ layoutData: Record<string, unknown>; pageData: unknown }> {
-  // Collect all loaders (layouts + page)
-  const loaderTasks: Array<{
-    id: string
-    loader: Function
-    params: Record<string, string>
-  }> = []
+  const tasks: Array<Promise<readonly [string, unknown]>> = [];
 
   for (const layout of match.layouts) {
     if (layout.loader) {
-      loaderTasks.push({ id: layout.path, loader: layout.loader, params: match.params })
+      tasks.push(
+        Promise.resolve(layout.loader({ params: match.params, ctx })).then((data) => [layout.path, data] as const),
+      );
     }
   }
 
-  if (match.route.loader) {
-    loaderTasks.push({ id: '__page', loader: match.route.loader, params: match.params })
-  }
+  const pagePromise = match.route.loader
+    ? Promise.resolve(match.route.loader({ params: match.params, ctx }))
+    : Promise.resolve(null);
 
-  // Run ALL loaders in parallel
-  const results = await Promise.all(
-    loaderTasks.map(async (task) => {
-      const data = await task.loader({ params: task.params, ctx: match.context })
-      return [task.id, data] as const
-    }),
-  )
+  // Run ALL loaders in parallel. If any rejects (including a thrown
+  // redirect()), Promise.all rejects and runRoute handles it as before.
+  const [layoutResults, pageData] = await Promise.all([Promise.all(tasks), pagePromise]);
 
-  const dataMap = Object.fromEntries(results)
-  const pageData = dataMap.__page ?? null
-  delete dataMap.__page
-
-  return { layoutData: dataMap, pageData }
+  return { layoutData: Object.fromEntries(layoutResults), pageData };
 }
 ```
 
-A three-level layout stack with 200ms loaders now takes ~200ms total (parallel) instead of ~600ms (sequential). This is the Remix approach — all loaders for matched routes run concurrently.
+A three-level layout stack with 200ms loaders now takes ~200ms total instead of ~600ms. This is the Remix approach — all loaders for matched routes run concurrently. And because they share `ctx.fetch`, two of them asking for the same URL still cost one request.
 
 ---
 
 ## Client-side data management with TanStack Query
 
-[TanStack Query](https://tanstack.com/query) (formerly React Query) is a data fetching and caching library for React. It manages server state on the client — caching responses, background refetching when data becomes stale, retry logic, and cache invalidation on mutations. Its `prefetchQuery` method lets loaders seed the cache during SSR, and its `HydrationBoundary` component transfers that cache to the client after hydration.
+[TanStack Query](https://tanstack.com/query) (formerly React Query) is a data fetching and caching library for React. It manages server state on the client — caching responses, background refetching when data becomes stale, retry logic, and cache invalidation on mutations. Its `dehydrate` function serializes a server-side cache, and its `HydrationBoundary` component restores it on the client.
 
 After hydration, the client needs its own data management strategy. Raw `fetch` calls on every navigation waste bandwidth and show loading states unnecessarily. TanStack Query provides the client-side cache layer:
 
 ```typescript title="packages/eigen/query.ts"
-import { QueryClient, dehydrate, hydrate } from '@tanstack/react-query'
+import { QueryClient } from "@tanstack/react-query";
 
 /**
  * Create a QueryClient configured for SSR.
- * The server populates it during rendering,
- * then dehydrates it to JSON for the client to hydrate.
+ * On the server: one per request (created by dataMiddleware).
+ * On the client: one for the lifetime of the page.
  */
 export function createQueryClient(): QueryClient {
   return new QueryClient({
     defaultOptions: {
       queries: {
         // On the server: don't retry (fail fast)
-        retry: typeof window === 'undefined' ? false : 3,
-        // Data fetched during SSR is fresh for 60 seconds
+        retry: typeof window === "undefined" ? false : 3,
+        // Data fetched during SSR is fresh for 60 seconds, so the client
+        // doesn't immediately refetch what the server just loaded
         staleTime: 60 * 1000,
       },
     },
-  })
+  });
 }
 ```
 
 ### Seeding the query cache in loaders
 
-The loader doesn't just return data — it populates the query cache so the client can pick up where the server left off:
-
-```typescript title="packages/eigen/helpers.ts"
-import type { QueryClient } from '@tanstack/react-query'
-import type { RouteParamsMap } from 'eigen/route-types'
-
-export function defineQueryLoader<
-  TPath extends keyof RouteParamsMap,
-  TData,
->(
-  path: TPath,
-  options: {
-    queryKey: (params: RouteParamsMap[TPath]) => unknown[]
-    queryFn: (params: RouteParamsMap[TPath]) => Promise<TData>
-    staleTime?: number
-  },
-) {
-  return {
-    // The loader populates the query cache during SSR
-    loader: async ({ params, ctx }: { params: RouteParamsMap[TPath]; ctx: any }) => {
-      const queryClient: QueryClient = ctx.queryClient
-
-      await queryClient.prefetchQuery({
-        queryKey: options.queryKey(params),
-        queryFn: () => options.queryFn(params),
-        staleTime: options.staleTime,
-      })
-
-      // Return the data for the initial render
-      return queryClient.getQueryData(options.queryKey(params)) as TData
-    },
-    // The query key and fn, for client-side use
-    queryKey: options.queryKey,
-    queryFn: options.queryFn,
-  }
-}
-```
-
-### Usage in a page
+A query is described once with TanStack's `queryOptions` helper and used in three places: the loader (server), the component (client), and hover prefetching. The `fetch` is a parameter, so the server can pass the request-scoped `ctx.fetch` while the browser uses its own:
 
 ```tsx title="src/pages/posts/[id].tsx"
-import { useQuery } from '@tanstack/react-query'
-import { defineQueryLoader } from 'eigen/helpers'
+import { queryOptions, useQuery, type QueryClient } from "@tanstack/react-query";
+import { defineLoader } from "eigen/helpers";
+import type { Fetch } from "eigen/fetch";
+import type { PageProps } from "eigen/types";
 
-export const { loader, queryKey, queryFn } = defineQueryLoader('/posts/:id', {
-  queryKey: (params) => ['posts', params.id],
-  queryFn: async (params) => {
-    const res = await eigenFetch(`https://api.example.com/posts/${params.id}`)
-    return res.json() as Promise<{ title: string; body: string }>
-  },
-  staleTime: 5 * 60 * 1000,  // 5 minutes
-})
+interface Post {
+  title: string;
+  body: string;
+}
 
-export default function PostPage({ params }: { params: { id: string } }) {
-  // On initial SSR: data is already in the cache (from the loader)
-  // On client navigation: uses cached data if fresh, refetches if stale
-  const { data, isLoading } = useQuery({
-    queryKey: queryKey(params),
-    queryFn: () => queryFn(params),
-  })
+const postQuery = (id: string, fetcher: Fetch = fetch) =>
+  queryOptions({
+    queryKey: ["posts", id],
+    queryFn: async (): Promise<Post> => {
+      const res = await fetcher(`https://api.example.com/posts/${encodeURIComponent(id)}`);
+      if (!res.ok) throw new Error(`Failed to load post ${id}: ${res.status}`);
+      return res.json();
+    },
+    staleTime: 5 * 60 * 1000, // 5 minutes
+  });
 
-  if (isLoading) return <div>Loading...</div>
-  return <article><h1>{data.title}</h1><p>{data.body}</p></article>
+export const loader = defineLoader("/posts/:id", ({ params, ctx }) =>
+  // ensureQueryData returns the data and THROWS if the query fails.
+  // (prefetchQuery never throws — a failing fetch would silently become
+  // `undefined` data and bypass the route's error boundary from Part 35.)
+  ctx.queryClient.ensureQueryData(postQuery(params.id, ctx.fetch)),
+);
+
+// Used by the router to warm the cache on hover (see below)
+export function prefetch(params: { id: string }, queryClient: QueryClient) {
+  return queryClient.prefetchQuery(postQuery(params.id));
+}
+
+export default function PostPage({ params, data: initialPost }: PageProps<"/posts/:id", Post>) {
+  // On initial SSR and hydration: the cache already holds the post.
+  // initialData covers client navigations, where the loader's result arrives
+  // via /_eigen/data; it's ignored whenever the cache already has the query.
+  // Because initialData is always defined, `data` is typed Post (never undefined).
+  const { data } = useQuery({ ...postQuery(params.id), initialData: initialPost });
+
+  return (
+    <article>
+      <h1>{data.title}</h1>
+      <p>{data.body}</p>
+    </article>
+  );
 }
 ```
+
+Part 7's transform strips `loader` from the client bundle; `postQuery`, `prefetch` and the component remain.
 
 ### The SSR → client handoff
 
-The query cache is dehydrated (serialized to JSON) during SSR and hydrated on the client:
+On the server, the app renders inside a `QueryClientProvider` for the request's client — `useQuery` needs one, even when the data is already cached. The cache is then dehydrated and embedded next to the session from Part 33:
 
-```typescript title="entry-server.tsx"
-import { dehydrate } from '@tanstack/react-query'
+```tsx title="entry-server.tsx"
+import { QueryClientProvider, dehydrate } from "@tanstack/react-query";
+import { serializeForScript } from "eigen/serialize";
 
-export async function render(pathname: string, request: Request) {
-  const queryClient = createQueryClient()
-  // Pass queryClient through middleware context so loaders can use it
-  const ctx = { ...baseCtx, queryClient }
+// Inside render(), after runRoute():
+const { queryClient } = result.context;
 
-  // ... run loaders (they populate queryClient)
+const html = renderToString(
+  <SessionProvider initialSession={clientSession}>
+    <QueryClientProvider client={queryClient}>
+      <App match={match} data={result.data} />
+    </QueryClientProvider>
+  </SessionProvider>,
+);
 
-  const dehydratedState = dehydrate(queryClient)
+// Only successful queries are dehydrated by default
+const queryState = dehydrate(queryClient);
+const head =
+  renderMetadataToHTML(meta) +
+  `\n    <script>window.__EIGEN_SESSION__=${serializeForScript(clientSession)}</script>` +
+  `\n    <script>window.__EIGEN_QUERY_STATE__=${serializeForScript(queryState)}</script>`;
 
-  // Serialize alongside page data
-  return {
-    html,
-    status: 200,
-    data: pageData,
-    queryState: dehydratedState,  // Sent to client as JSON
-  }
-}
+return { html, status: 200, data: result.data, head };
 ```
 
 ```tsx title="entry-client.tsx"
-import { HydrationBoundary, QueryClientProvider } from '@tanstack/react-query'
+import { hydrateRoot } from "react-dom/client";
+import { HydrationBoundary, QueryClientProvider, type DehydratedState } from "@tanstack/react-query";
+import { createQueryClient } from "eigen/query";
 
-const queryClient = createQueryClient()
-const dehydratedState = (window as any).__EIGEN_QUERY_STATE__
+declare global {
+  interface Window {
+    __EIGEN_QUERY_STATE__?: DehydratedState;
+  }
+}
+
+const queryClient = createQueryClient();
 
 hydrateRoot(
-  document.getElementById('root')!,
-  <QueryClientProvider client={queryClient}>
-    <HydrationBoundary state={dehydratedState}>
-      <App />
-    </HydrationBoundary>
-  </QueryClientProvider>,
-)
+  document.getElementById("root")!,
+  <SessionProvider initialSession={initialSession}>
+    <QueryClientProvider client={queryClient}>
+      <HydrationBoundary state={window.__EIGEN_QUERY_STATE__}>
+        <App />
+      </HydrationBoundary>
+    </QueryClientProvider>
+  </SessionProvider>,
+);
 ```
 
 After hydration, TanStack Query manages all subsequent data fetching: background refetching when data becomes stale, cache invalidation on mutations, optimistic updates, and retry logic. The framework's loader seeds the cache; TanStack Query manages it from there.
@@ -307,23 +319,18 @@ After hydration, TanStack Query manages all subsequent data fetching: background
 
 ## Prefetching on navigation intent
 
-The advanced router (Part 22) introduced preloading. With TanStack Query integration, prefetching becomes cache-aware:
+The advanced router ([Part 23](/23-advanced-router)) preloads loader data on hover. When a route also exports `prefetch`, the generated routes module exposes it as `route.prefetch` (the same way it exposes other optional exports), and the `Link` component calls it alongside the existing preload, putting the data into the shared query cache:
 
 ```typescript
 // In the Link component — prefetch on hover
 function handleMouseEnter() {
-  const match = matchRoute(href)
-  if (match?.route.queryKey && match?.route.queryFn) {
-    // Prefetch into the query cache
-    queryClient.prefetchQuery({
-      queryKey: match.route.queryKey(match.params),
-      queryFn: () => match.route.queryFn(match.params),
-    })
-  }
+  preloadRoute(href); // Part 23: warms /_eigen/data
+  const match = matchRoute(new URL(href, location.href).pathname, routes);
+  match?.route.prefetch?.(match.params, queryClient);
 }
 ```
 
-If the data is already cached and fresh, the prefetch is a no-op. If it's stale or missing, TanStack Query fetches it in the background. By the time the user clicks, the data is already in the cache and the page renders instantly.
+If the data is already cached and fresh, `prefetchQuery` is a no-op. If it's stale or missing, TanStack Query fetches it in the background. Unlike Part 23's private preload map, the result lives in the same cache every component reads, so it can be invalidated by mutations and refetched on focus.
 
 ---
 
@@ -331,65 +338,36 @@ If the data is already cached and fresh, the prefetch is a no-op. If it's stale 
 
 `fetch` behaves differently across environments:
 
-| Environment | `fetch` source | Differences |
-|---|---|---|
-| Browser | Native `window.fetch` | Sends cookies automatically, respects CORS |
-| Node SSR | `undici` (built into Node 18+) | No cookies, no CORS, different redirect handling |
-| Edge (Workers) | Web standard `fetch` | Similar to browser but no cookie jar |
+| Environment    | `fetch` source                 | Differences                                              |
+| -------------- | ------------------------------ | -------------------------------------------------------- |
+| Browser        | Native `window.fetch`          | Sends cookies automatically (same-origin), respects CORS |
+| Node SSR       | `undici` (built into Node 18+) | No cookie jar, no CORS, relative URLs throw              |
+| Edge (Workers) | Web standard `fetch`           | Similar to browser but no cookie jar                     |
 
-The framework normalizes this by providing `eigenFetch` as the standard data fetching function. On the server, it forwards relevant headers (cookies, authorization) from the incoming request:
-
-```typescript
-// In the SSR pipeline — create a fetch that forwards auth headers
-function createServerFetch(request: Request): typeof fetch {
-  return (input: RequestInfo | URL, init?: RequestInit) => {
-    const headers = new Headers(init?.headers)
-
-    // Forward cookies from the incoming request
-    const cookie = request.headers.get('cookie')
-    if (cookie && !headers.has('cookie')) {
-      headers.set('cookie', cookie)
-    }
-
-    // Forward auth header
-    const auth = request.headers.get('authorization')
-    if (auth && !headers.has('authorization')) {
-      headers.set('authorization', auth)
-    }
-
-    return fetch(input, { ...init, headers })
-  }
-}
-```
-
-This is injected into the context so loaders use it automatically:
-
-```typescript
-const ctx = {
-  ...baseCtx,
-  fetch: createServerFetch(request),  // Auth-aware fetch
-  queryClient,
-}
-```
+`createServerFetch` normalizes the server side: relative URLs resolve against the incoming request, and the user's cookie and `Authorization` header are forwarded — but only to the app's own origin and the origins listed in `forwardCredentialsTo`. Forwarding them to every URL would leak the user's session to any third-party API a loader happens to call.
 
 ---
 
 ## What to observe
 
-1. **Add two loaders that fetch the same URL.** Check your API server's logs — only one request arrives, even though two loaders called `eigenFetch` with the same URL.
+1. **Make two loaders fetch the same URL through `ctx.fetch`.** Check your API server's logs — only one request arrives per page load, and a second page load makes its own request (the cache is per request).
 
-2. **Add `console.log` to each layout loader.** With parallel execution, all logs appear at nearly the same timestamp. With sequential execution (disable parallel mode), they're staggered.
+2. **Add `console.log` with a timestamp to each layout loader.** With parallel execution, all logs appear at nearly the same time instead of 200ms apart.
 
-3. **Navigate to a page, then navigate away and back.** With TanStack Query, the second visit shows data instantly (from cache) while a background refetch runs. Without it, the second visit shows a loading spinner.
+3. **Point a loader at a third-party URL not in `forwardCredentialsTo`.** Inspect the outgoing request: no `cookie` header. Add the origin to the list and it appears.
 
-4. **Hover over a link for 200ms, then click.** The data is already in the query cache from the prefetch — the page renders with no loading state.
+4. **Leave a post page open past its `staleTime`, then refocus the window.** TanStack Query refetches in the background (`refetchOnWindowFocus`) and the page updates without a navigation.
+
+5. **Hover over a post link.** The Network tab shows the API request fired on hover — the query is in the cache before you click.
+
+6. **Make the post API return 500.** The loader throws (thanks to `ensureQueryData`), and the route's error boundary renders instead of a page with `undefined` data.
 
 ---
 
 ## Key insight
 
-Data fetching strategy is the layer between "the loader returns data" and "the user sees content." Without it, every navigation is a cold fetch, every render pass might duplicate requests, and there's no continuity between server-rendered data and client-side interactions.
+Data fetching strategy is the layer between "the loader returns data" and "the user sees content." Without it, every navigation is a cold fetch, every request might duplicate API calls, and there's no continuity between server-rendered data and client-side interactions.
 
-The framework provides three things: request deduplication (per-render cache), parallel loader execution (Promise.all instead of sequential await), and a query cache handoff pattern (server seeds it, client manages it). TanStack Query is the natural client-side cache manager because it's designed for exactly this SSR → client transition — `dehydrate` on the server, `HydrationBoundary` on the client, and automatic cache management from there.
+The framework provides three things: a request-scoped fetch (deduplication plus safe credential forwarding), parallel loader execution (`Promise.all` instead of sequential `await`), and a query cache handoff pattern (server seeds it, client manages it). TanStack Query is the natural client-side cache manager because it's designed for exactly this SSR → client transition — `dehydrate` on the server, `HydrationBoundary` on the client, and automatic cache management from there.
 
-This is the pattern TanStack Start uses natively — its loaders integrate with TanStack Query through `prefetchQuery`, and `useSuspenseQuery` provides streaming support. We're implementing the same architecture explicitly.
+This is the pattern TanStack Start uses natively — its loaders call `queryClient.ensureQueryData` with shared query options, and `useSuspenseQuery` provides streaming support. We're implementing the same architecture explicitly.

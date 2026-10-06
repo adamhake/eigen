@@ -1,6 +1,6 @@
 ---
 title: "Part 3: Server-Side Rendering"
-description: "Vite's SSR mode, ssrLoadModule, H3 for the HTTP layer, and dual module graphs."
+description: "Vite's SSR mode, the ModuleRunner, H3 for the HTTP layer, and dual module graphs."
 concepts:
   - "server-side rendering"
   - "dual module graphs"
@@ -8,20 +8,19 @@ concepts:
   - "programmatic dev server"
 ---
 
-
-*This is the fourth installment in a series where we build a toy Next.js on top of Vite. In [Part 2](/02-route-discovery-plugin), we built a route discovery plugin with type-safe virtual modules. Now we'll add server-side rendering — the feature that transforms a Vite SPA into a full-stack framework.*
+_This is the fourth installment in a series where we build a toy Next.js on top of Vite. In [Part 2](/02-route-discovery-plugin), we built a route discovery plugin with type-safe virtual modules. Now we'll add server-side rendering — the feature that transforms a Vite SPA into a full-stack framework._
 
 ---
 
 ## What SSR means for a Vite plugin
 
-Server-side rendering requires Vite to do two things simultaneously: serve the client app to the browser (with HMR, code splitting, and lazy loading) *and* run our React components on the server to produce HTML strings.
+Server-side rendering requires Vite to do two things simultaneously: serve the client app to the browser (with HMR, code splitting, and lazy loading) _and_ run our React components on the server to produce HTML strings.
 
 This is where the ["two module graphs" concept from Part 0](/00-the-mental-model#the-two-module-graphs) becomes concrete. The client module graph resolves imports for the browser. The SSR module graph resolves imports for the server. The same virtual module — `eigen/routes` — generates different code in each graph, because the server needs static imports and loaders while the client needs lazy imports and no loaders.
 
 <Callout type="info" title="&quot;Server&quot; doesn't always mean Node">
 
-The SSR module graph targets whatever non-browser environment runs your app. During development that's usually Node, but in production it could be Cloudflare Workers, Deno, Bun, or a Netlify Edge Function — each with its own runtime APIs and constraints. The key distinction is *client vs. not-client*: the browser gets one module graph, and everything else shares the other. Vite's [Environment API](https://vite.dev/guide/api-environment) takes this further by letting you define multiple named server environments, but the two-graph mental model is enough for now.
+The SSR module graph targets whatever non-browser environment runs your app. During development that's usually Node, but in production it could be Cloudflare Workers, Deno, Bun, or a Netlify Edge Function — each with its own runtime APIs and constraints. The key distinction is _client vs. not-client_: the browser gets one module graph, and everything else shares the other. Vite's [Environment API](https://vite.dev/guide/api-environment) takes this further by letting you define multiple named server environments, but the two-graph mental model is enough for now.
 
 </Callout>
 
@@ -36,7 +35,7 @@ sequenceDiagram
     H3->>Vite: Vite middleware (no match, passes through)
     H3->>Vite: vite.transformIndexHtml(url, template)
     Vite-->>H3: HTML with /@vite/client injected
-    H3->>Vite: vite.ssrLoadModule('/src/entry-server.tsx')
+    H3->>Vite: ssrEnv.runner.import('/src/entry-server.tsx')
     Vite->>SSR: resolveId → load → transform
     SSR-->>H3: { render }
     H3->>SSR: render('/posts/42')
@@ -55,7 +54,7 @@ pnpm add h3
 pnpm add -D tsx
 ```
 
-We're using H3 instead of Express for the HTTP layer. H3 is a lightweight server framework from the [UnJS ecosystem](https://unjs.io) built on web-standard [`Request`](https://developer.mozilla.org/en-US/docs/Web/API/Request)/[`Response`](https://developer.mozilla.org/en-US/docs/Web/API/Response) — the same foundation that [TanStack Start](https://tanstack.com/start) and [Nuxt](https://nuxt.com) use under the hood (via [Nitro](https://nitro.build), which builds on H3). We'll cover why this matters at the end of this section.
+We're using H3 instead of Express for the HTTP layer. H3 is a lightweight server framework from the [UnJS ecosystem](https://unjs.io) built on web-standard [`Request`](https://developer.mozilla.org/en-US/docs/Web/API/Request)/[`Response`](https://developer.mozilla.org/en-US/docs/Web/API/Response) — the same foundation [Nuxt](https://nuxt.com) uses under the hood (via [Nitro](https://nitro.build), which builds on H3). This series targets H3 v2. We'll cover why this matters at the end of this section.
 
 ---
 
@@ -67,70 +66,112 @@ Before writing the server entry, we need a route matcher. This logic will eventu
 import type { RouteDefinition } from "./types";
 
 export interface RouteMatch {
-	route: RouteDefinition;
-	params: Record<string, string>;
+  route: RouteDefinition;
+  params: Record<string, string>;
 }
 
-export function matchRoute(
-	pathname: string,
-	routes: RouteDefinition[],
-): RouteMatch | null {
-	for (const route of routes) {
-		if (route.path === pathname) return { route, params: {} };
+export function matchRoute(pathname: string, routes: RouteDefinition[]): RouteMatch | null {
+  for (const route of routes) {
+    if (route.path === pathname) return { route, params: {} };
 
-		const routeParts = route.path.split("/");
-		const pathParts = pathname.split("/");
-		if (routeParts.length !== pathParts.length) continue;
+    const routeParts = route.path.split("/");
+    const pathParts = pathname.split("/");
+    if (routeParts.length !== pathParts.length) continue;
 
-		const params: Record<string, string> = {};
-		const match = routeParts.every((part, i) => {
-			if (part.startsWith(":")) {
-				params[part.slice(1)] = pathParts[i];
-				return true;
-			}
-			return part === pathParts[i];
-		});
+    const params: Record<string, string> = {};
+    const match = routeParts.every((part, i) => {
+      if (part.startsWith(":")) {
+        params[part.slice(1)] = pathParts[i];
+        return true;
+      }
+      return part === pathParts[i];
+    });
 
-		if (match) return { route, params };
-	}
-	return null;
+    if (match) return { route, params };
+  }
+  return null;
 }
 ```
 
-This is a new file in `packages/eigen/`, so we need to register it in both TypeScript and Vite's resolution before any file can import it. Add the `eigen/match-route` path to the existing `paths` object in `tsconfig.json`:
+## Safe data serialization
+
+The server will also embed each page's loader data in the HTML as an inline `<script>`, so the client can pick it up during hydration. Dropping raw `JSON.stringify` output into a `<script>` is a classic injection bug: if any string in the data contains `</script>`, the browser ends the script element right there and parses whatever follows as HTML. Loader data routinely contains user-generated text, so this has to be handled once, in the framework:
+
+```typescript title="packages/eigen/serialize.ts"
+const SCRIPT_ESCAPES: Record<string, string> = {
+  "<": "\\u003c",
+  ">": "\\u003e",
+  "&": "\\u0026",
+  "\u2028": "\\u2028",
+  "\u2029": "\\u2029",
+};
+
+/**
+ * Serialize a value as JSON that is safe to embed inside an inline
+ * <script>. Escaping `<` means a string containing "</script>" or
+ * "<!--" can't close the script element early; U+2028/U+2029 are
+ * escaped because older JavaScript engines treat them as line terminators.
+ */
+export function serializeForScript(value: unknown): string {
+  return (JSON.stringify(value) ?? "null").replace(/[<>&\u2028\u2029]/g, (char) => SCRIPT_ESCAPES[char]);
+}
+```
+
+The output is still valid JSON _and_ a valid JavaScript expression — `\u003c` inside a string literal is just `<` — so `window.__EIGEN_DATA__` receives exactly the original value. Every place Eigen writes JSON into HTML from here on goes through `serializeForScript`.
+
+## Registering the new modules
+
+`match-route.ts` and `serialize.ts` are new files in `packages/eigen/`, so we need to register them in both TypeScript and Vite's resolution before any file can import them. Add them to the existing `paths` object in `tsconfig.json`:
 
 ```json title="tsconfig.json"
 {
   "compilerOptions": {
     "paths": {
       "eigen/types": ["./packages/eigen/types.ts"],
-      "eigen/match-route": ["./packages/eigen/match-route.ts"] // [!code ++]
+      "eigen/match-route": ["./packages/eigen/match-route.ts"], // [!code ++]
+      "eigen/serialize": ["./packages/eigen/serialize.ts"] // [!code ++]
     }
   }
 }
 ```
 
+The dev server we're about to write (`server.ts`) also imports `eigen/serialize`, and it's type-checked by `tsconfig.node.json`, so add the same mapping there:
+
+```json title="tsconfig.node.json"
+{
+  "compilerOptions": {
+    "paths": {
+      // [!code ++]
+      "eigen/serialize": ["./packages/eigen/serialize.ts"] // [!code ++]
+    } // [!code ++]
+  }
+}
+```
+
+At runtime, `server.ts` is executed by `tsx`, which reads the `paths` in `tsconfig.json` — so the import resolves there too.
+
 And update `vite.config.ts`:
 
 ```typescript title="vite.config.ts"
-import { resolve } from 'node:path'
-import react from '@vitejs/plugin-react'
-import inspect from 'vite-plugin-inspect'
-import { defineConfig } from 'vite'
-import eigenRoutes from './plugins/eigen-routes'
+import { resolve } from "node:path";
+import react from "@vitejs/plugin-react";
+import inspect from "vite-plugin-inspect";
+import { defineConfig } from "vite";
+import eigenRoutes from "./plugins/eigen-routes";
 
 export default defineConfig({
   plugins: [react(), eigenRoutes(), inspect()],
   resolve: {
     alias: {
-      'eigen/types': resolve(__dirname, 'packages/eigen/types.ts'),
-      'eigen/match-route': resolve(__dirname, 'packages/eigen/match-route.ts'), // [!code ++]
+      "eigen/types": resolve(__dirname, "packages/eigen/types.ts"),
+      "eigen/match-route": resolve(__dirname, "packages/eigen/match-route.ts"), // [!code ++]
+      "eigen/serialize": resolve(__dirname, "packages/eigen/serialize.ts"), // [!code ++]
     },
   },
-})
+});
 ```
 
-As the framework grows, we'll accumulate more `eigen/*` aliases here. In [Part 11](/11-framework-plugin), when we consolidate into a single framework plugin, the plugin's [`resolveId` hook](/00-the-mental-model#the-three-core-hooks) will handle all `eigen/*` imports and these manual aliases will go away.
+As the framework grows, we'll accumulate one `eigen/*` alias (and matching `paths` entry) per framework file. We stay explicit rather than writing a catch-all `eigen/*` alias because Vite's alias plugin runs before user plugins: a wildcard would rewrite `eigen/routes` to a nonexistent file before our route plugin's `resolveId` ever saw it. In [Part 40](/40-monorepo-publishing), Eigen becomes a real workspace package with an `exports` map and these aliases go away.
 
 ---
 
@@ -144,26 +185,26 @@ import { matchRoute } from "eigen/match-route";
 import { routes } from "eigen/routes";
 
 export interface RenderResult {
-	html: string;
-	status: number;
-	data: unknown;
+  html: string;
+  status: number;
+  data: unknown;
 }
 
 export async function render(pathname: string): Promise<RenderResult> {
-	const match = matchRoute(pathname, routes);
-	if (!match) return { html: "<h1>404</h1>", status: 404, data: null };
+  const match = matchRoute(pathname, routes);
+  if (!match) return { html: "<h1>404</h1>", status: 404, data: null };
 
-	const { route, params } = match;
-	const Component = route.component;
+  const { route, params } = match;
+  const Component = route.component;
 
-	// Call the loader if it exists
-	let data: unknown = null;
-	if (route.loader) {
-		data = await route.loader({ params });
-	}
+  // Call the loader if it exists
+  let data: unknown = null;
+  if (route.loader) {
+    data = await route.loader({ params });
+  }
 
-	const html = renderToString(<Component params={params} data={data} />);
-	return { html, status: 200, data };
+  const html = renderToString(<Component params={params} data={data} />);
+  return { html, status: 200, data };
 }
 ```
 
@@ -178,13 +219,19 @@ The server needs to inject rendered HTML into `index.html`. Add an SSR outlet ma
 ```html title="index.html"
 <!DOCTYPE html>
 <html lang="en">
-<head><title>Eigen Framework</title></head>
-<body>
-  <div id="root"></div> <!-- [!code --] -->
-  <div id="root"><!--ssr-outlet--></div> <!-- [!code ++] -->
-  <script type="module" src="/src/main.tsx"></script> <!-- [!code --] -->
-  <script type="module" src="/src/entry-client.tsx"></script> <!-- [!code ++] -->
-</body>
+  <head>
+    <title>Eigen Framework</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <!-- [!code --] -->
+    <div id="root"><!--ssr-outlet--></div>
+    <!-- [!code ++] -->
+    <script type="module" src="/src/main.tsx"></script>
+    <!-- [!code --] -->
+    <script type="module" src="/src/entry-client.tsx"></script>
+    <!-- [!code ++] -->
+  </body>
 </html>
 ```
 
@@ -206,88 +253,83 @@ We replace `npx vite` with a custom server that uses Vite in [**middleware mode*
 ```typescript title="server.ts"
 import { readFileSync } from "node:fs";
 import { H3, serve, fromNodeHandler } from "h3/node";
-import {
-	createServer as createViteServer,
-	type ViteDevServer,
-} from "vite";
+import { createServer as createViteServer, isRunnableDevEnvironment, type ViteDevServer } from "vite";
+import { serializeForScript } from "eigen/serialize";
 
 interface RenderResult {
-	html: string;
-	status: number;
-	data: unknown;
+  html: string;
+  status: number;
+  data: unknown;
 }
 
 async function start() {
-	// Create Vite server in middleware mode — it won't serve
-	// index.html automatically or listen on a port
-	const vite: ViteDevServer = await createViteServer({
-		server: { middlewareMode: true },
-		appType: "custom",
-	});
+  // Create Vite server in middleware mode — it won't serve
+  // index.html automatically or listen on a port
+  const vite: ViteDevServer = await createViteServer({
+    server: { middlewareMode: true },
+    appType: "custom",
+  });
 
-	const app = new H3();
+  // The SSR environment executes modules in this Node process
+  // through a ModuleRunner
+  const ssrEnv = vite.environments.ssr;
+  if (!isRunnableDevEnvironment(ssrEnv)) {
+    throw new Error("SSR environment is not runnable");
+  }
 
-	// Mount Vite's connect middleware into H3 — this handles
-	// HMR websocket, static files, and on-demand module transforms
-	app.use(
-		fromNodeHandler(
-			vite.middlewares as Parameters<typeof fromNodeHandler>[0],
-		),
-	);
+  const app = new H3();
 
-	// Handle all remaining routes with SSR
-	app.all("/**", async (event) => {
-		const url = event.url.pathname;
+  // Mount Vite's connect middleware into H3 — this serves
+  // /@vite/client, static files, and on-demand module transforms
+  app.use(fromNodeHandler(vite.middlewares as Parameters<typeof fromNodeHandler>[0]));
 
-		try {
-			// 1. Read the HTML template from disk
-			let template = readFileSync("index.html", "utf-8");
+  // Handle all remaining routes with SSR
+  app.all("/**", async (event) => {
+    const url = event.url.pathname;
 
-			// 2. Apply Vite's HTML transforms — this injects /@vite/client
-			//    for HMR and rewrites asset URLs
-			template = await vite.transformIndexHtml(url, template);
+    try {
+      // 1. Read the HTML template from disk
+      let template = readFileSync("index.html", "utf-8");
 
-			// 3. Load the server entry module through Vite's SSR pipeline
-			const { render } = (await vite.ssrLoadModule(
-				"/src/entry-server.tsx",
-			)) as {
-				render: (pathname: string) => Promise<RenderResult>;
-			};
+      // 2. Apply Vite's HTML transforms — this injects /@vite/client
+      //    for HMR and rewrites asset URLs
+      template = await vite.transformIndexHtml(url, template);
 
-			// 4. Render the app to HTML
-			const { html: appHtml, status, data } = await render(url);
+      // 3. Load the server entry module through the SSR environment
+      const { render } = (await ssrEnv.runner.import("/src/entry-server.tsx")) as {
+        render: (pathname: string) => Promise<RenderResult>;
+      };
 
-			// 5. Inject rendered HTML and serialized data into the template
-			const finalHtml = template
-				.replace("<!--ssr-outlet-->", appHtml)
-				.replace(
-					"</head>",
-					`<script>window.__EIGEN_DATA__ = ${JSON.stringify(data)}</script></head>`,
-				);
+      // 4. Render the app to HTML
+      const { html: appHtml, status, data } = await render(url);
 
-			return new Response(finalHtml, {
-				status,
-				headers: { "Content-Type": "text/html" },
-			});
-		} catch (e) {
-			if (e instanceof Error) {
-				vite.ssrFixStacktrace(e);
-				console.error(e.stack);
-				return new Response(e.message, { status: 500 });
-			}
-		}
-	});
+      // 5. Inject rendered HTML and safely serialized data into the template
+      const finalHtml = template
+        .replace("<!--ssr-outlet-->", appHtml)
+        .replace("</head>", `<script>window.__EIGEN_DATA__ = ${serializeForScript(data)}</script></head>`);
 
-	const server = serve(app, { port: 3000 });
-	console.log("http://localhost:3000");
+      return new Response(finalHtml, {
+        status,
+        headers: { "Content-Type": "text/html; charset=utf-8" },
+      });
+    } catch (e) {
+      // The runner applies source maps, so this stack trace
+      // already points at your original TypeScript
+      console.error(e);
+      return new Response(e instanceof Error ? e.message : "Internal Server Error", { status: 500 });
+    }
+  });
 
-	// Graceful shutdown — close Vite's file watchers and
-	// WebSocket server so the process can actually exit
-	process.on("SIGINT", async () => {
-		await server.close();
-		await vite.close();
-		process.exit(0);
-	});
+  const server = serve(app, { port: 3000 });
+  console.log("http://localhost:3000");
+
+  // Graceful shutdown — close Vite's file watchers and
+  // WebSocket server so the process can actually exit
+  process.on("SIGINT", async () => {
+    await server.close();
+    await vite.close();
+    process.exit(0);
+  });
 }
 
 start();
@@ -297,17 +339,19 @@ start();
 
 We import from [`h3/node`](https://h3.dev/guide/api/h3#node-compatibility) rather than `h3`. H3 is a web-standard framework — its core API uses [`Request`](https://developer.mozilla.org/en-US/docs/Web/API/Request), [`Response`](https://developer.mozilla.org/en-US/docs/Web/API/Response), and [`URL`](https://developer.mozilla.org/en-US/docs/Web/API/URL) — but the dev server is inherently Node-bound because Vite runs on Node. The `h3/node` entry point loads H3's Node.js compatibility layer, which includes `fromNodeHandler` for mounting Vite's [Connect](https://github.com/senchalabs/connect)-based middleware into H3.
 
-This is a dev-server concern only. The SSR handler we're writing — the `app.all('/**', ...)` function that returns a `new Response(...)` — is pure web-standard code. It doesn't use any Node APIs. In [Part 17](/17-deployment-adapters), when we introduce [Nitro](https://nitro.build) for production builds, this same handler runs unchanged on Cloudflare Workers, Deno, or any edge runtime. The Node-specific glue (`fromNodeHandler`, `readFileSync`) stays in the dev server and doesn't ship to production.
+The Node coupling is a dev-server concern. This particular handler still leans on Node and Vite — `readFileSync` for the template, `vite.transformIndexHtml`, and the SSR runner — and none of that ships to production. What _is_ portable is the contract underneath it: `render(pathname)` in `entry-server.tsx` returns plain data, and the handler turns it into a web-standard `Response`. In [Part 6](/06-production-builds), the production server keeps that shape but swaps the Vite calls for a pre-built bundle and a template read once at startup; in [Part 17](/17-deployment-adapters), the same `render` contract is wrapped for Netlify, Vercel, and Cloudflare.
 
 ### Vite middleware integration
 
 The server registers two layers in order:
 
-1. **Vite's connect middleware** (`vite.middlewares`), mounted via `fromNodeHandler`, handles HMR WebSocket connections, serves static files from your project, and transforms modules on demand.
+1. **Vite's connect middleware** (`vite.middlewares`), mounted via `fromNodeHandler`, serves `/@vite/client` and static files from your project, and transforms modules on demand.
 
 2. **The SSR handler** (`app.all('/**', ...)`) catches everything Vite doesn't handle — page navigations like `/about` or `/posts/42` — and renders them server-side.
 
-This ordering is important: Vite must see requests *first* so it can intercept `/@vite/client`, `/src/entry-client.tsx`, and other module requests. Only requests that Vite passes through reach the SSR handler.
+This ordering is important: Vite must see requests _first_ so it can intercept `/@vite/client`, `/src/entry-client.tsx`, and other module requests. Only requests that Vite passes through reach the SSR handler.
+
+The HMR WebSocket isn't part of this middleware stack at all — WebSocket upgrades never reach connect middleware. In middleware mode, Vite has no HTTP server of its own to attach to, so it starts a separate WebSocket server (port `24678` by default) and the injected `/@vite/client` connects there. If you'd rather share the app's port, pass your Node HTTP server as `server.hmr.server` when creating Vite.
 
 <Callout type="info" title="Why H3 instead of Express?">
 
@@ -315,51 +359,67 @@ Express is the traditional choice for Vite SSR examples, but it locks you into N
 
 - **Your SSR handler is portable.** The `app.all('/**', ...)` handler uses `new Response()` — the same interface that Cloudflare Workers, Deno, and Bun use natively. With Express, the `res.status(200).send(html)` pattern doesn't transfer.
 - **No `@types` needed.** H3 is written in TypeScript. Express requires a separate `@types/express` package that frequently drifts from the implementation.
-- **Same ecosystem as production frameworks.** [TanStack Start](https://tanstack.com/start), [Nuxt](https://nuxt.com), and [Analog](https://analogjs.org) all use H3/Nitro. Learning H3 here transfers directly to [Part 17](/17-deployment-adapters) when we add deployment adapters.
+- **Same ecosystem as production frameworks.** [Nuxt](https://nuxt.com) and [Analog](https://analogjs.org) run on H3 via [Nitro](https://nitro.build), and Nitro is one of [TanStack Start](https://tanstack.com/start)'s deployment paths. We'll keep using H3 for Eigen's production Node server in [Part 6](/06-production-builds).
 
 </Callout>
 
 ---
 
-## Understanding `ssrLoadModule`
+## Understanding the ModuleRunner
 
-[`vite.ssrLoadModule`](https://vite.dev/guide/api-javascript#vitedevserver-ssrloadmodule)`('/src/entry-server.tsx')` is the core SSR API. It does several things:
+[`ssrEnv.runner.import`](https://vite.dev/guide/api-environment-frameworks)`('/src/entry-server.tsx')` is the core SSR API. `vite.environments.ssr` is the SSR environment; in the default setup it's a `RunnableDevEnvironment`, which owns a **ModuleRunner** that executes modules inside the current Node process. The `isRunnableDevEnvironment` check narrows the type (an environment backed by, say, a Workers runtime wouldn't have an in-process `runner`). Calling `runner.import()` does several things:
 
 1. Resolves the module path through the SSR environment's `resolveId` hooks.
 2. Loads the source code through the `load` hooks (this is where our route plugin generates server-specific code for `eigen/routes`).
 3. Transforms the code through the `transform` hooks (TypeScript stripping, JSX compilation, etc.).
 4. Executes the transformed code in the current Node process and returns the module's exports.
 
-The critical difference from client-side module loading: `ssrLoadModule` runs the code in Node, not in the browser. This means it has access to Node APIs (`fs`, `path`, `process`), can use Node-only packages (database drivers, file system access), and resolves imports using Node's resolution algorithm.
+The critical difference from client-side module loading: the runner executes the code in Node, not in the browser. This means it has access to Node APIs (`fs`, `path`, `process`), can use Node-only packages (database drivers, file system access), and resolves imports with server-side resolve conditions. The runner also caches evaluated modules and invalidates them when files change, and it applies source maps to errors, so stack traces point at your original TypeScript.
 
-### Typing `ssrLoadModule`
+<Callout type="info" title="What about `ssrLoadModule`?">
+  Older Vite SSR examples call `vite.ssrLoadModule(url)`. That's the legacy API: Vite's docs describe `runner.import()`
+  as its modern replacement, and the runner is what enables server-side HMR. We'll use the runner throughout the series
+  — including inside plugins, via `server.environments.ssr`.
+</Callout>
 
-`ssrLoadModule` returns `Record<string, any>`. Vite can't know the shape of an arbitrary module at compile time — the module could export anything. This is a common friction point when building typed frameworks. There are three approaches:
+### Typing runner results
+
+`runner.import()` returns `Promise<any>`. Vite can't know the shape of an arbitrary module at compile time — the module could export anything. This is a common friction point when building typed frameworks. There are three approaches:
 
 **Type assertion at the call site** (what we're doing above):
+
 ```typescript
-const { render } = await vite.ssrLoadModule('/src/entry-server.tsx') as {
-  render: (pathname: string) => Promise<RenderResult>
-}
+const { render } = (await ssrEnv.runner.import("/src/entry-server.tsx")) as {
+  render: (pathname: string) => Promise<RenderResult>;
+};
 ```
 
 This is simple and local. The framework controls both the server entry and the call site, so the assertion is safe.
 
 **A typed wrapper function:**
+
 ```typescript title="packages/eigen/server.ts"
-import type { ViteDevServer } from 'vite'
+import { isRunnableDevEnvironment, type ViteDevServer } from "vite";
+
+interface RenderResult {
+  html: string;
+  status: number;
+  data: unknown;
+}
 
 export async function loadServerEntry(vite: ViteDevServer) {
-  const mod = await vite.ssrLoadModule('/src/entry-server.tsx')
-  return mod as { render: (pathname: string) => Promise<RenderResult> }
+  const ssrEnv = vite.environments.ssr;
+  if (!isRunnableDevEnvironment(ssrEnv)) throw new Error("SSR environment is not runnable");
+  const mod = await ssrEnv.runner.import("/src/entry-server.tsx");
+  return mod as { render: (pathname: string) => Promise<RenderResult> };
 }
 ```
 
 This encapsulates the assertion in a reusable function that the framework exports.
 
-**Code generation:** Generate a typed server entry that re-exports with proper types. [TanStack Start](https://tanstack.com/start) takes this approach — the build tool generates intermediate files with the correct type signatures, so the assertion is baked into generated code rather than hand-written.
+**Code generation:** Have the plugin generate a typed server entry (or a `.d.ts` for it) that re-exports with proper types, so the assertion is baked into generated code rather than hand-written — the same declaration-generation trick we used for `eigen/routes` in [Part 2](/02-route-discovery-plugin).
 
-The `ssrLoadModule` type gap is representative of a broader challenge in framework development: the boundary between build-time code (the plugin, which knows everything) and runtime code (the server, which receives `any`) requires deliberate type bridging. The plugin generates both the JavaScript and the declarations — the runtime trusts the generated types.
+The runner's type gap is representative of a broader challenge in framework development: the boundary between build-time code (the plugin, which knows everything) and runtime code (the server, which receives `any`) requires deliberate type bridging. The plugin generates both the JavaScript and the declarations — the runtime trusts the generated types.
 
 ---
 
@@ -381,19 +441,21 @@ In production, `transformIndexHtml` isn't called (there's no dev server). Instea
 
 2. **View source** in the browser. You'll see server-rendered HTML inside `<div id="root">` — actual page content, not an empty div. You'll also see the `/@vite/client` script injected by `transformIndexHtml`.
 
-3. **Check the terminal.** The `ssrLoadModule` call triggers the SSR plugin pipeline. If you're using `vite-plugin-inspect`, you can see the SSR-specific output of your route virtual module — it will have static `import` statements instead of `React.lazy`.
+3. **Check the terminal.** The `runner.import()` call triggers the SSR plugin pipeline. If you're using `vite-plugin-inspect`, you can see the SSR-specific output of your route virtual module — it will have static `import` statements instead of `React.lazy`.
 
-4. **Compare environments.** Visit `/__inspect/` and you can see both the client and SSR versions of `eigen/routes`. The client version has `React.lazy(() => import(...))`. The SSR version has plain `import Page0 from '...'` with `loader` references.
+4. **Compare environments.** Visit `/__inspect/` and you can see both the client and SSR versions of `eigen/routes`. The client version has `React.lazy(() => import(...))`. The SSR version has `import * as RouteMod0 from '...'` namespace imports with `loader` references.
 
-5. **[`ssrFixStacktrace`](https://vite.dev/guide/api-javascript#vitedevserver-ssrfixstacktrace)** — Try introducing an error in a page component and observe the error output. Without `ssrFixStacktrace`, the stack trace would reference Vite's transformed code (which doesn't match your source). With it, the stack trace points to the original TypeScript source lines.
+5. **Source-mapped errors** — Try throwing an error in a page component and observe the terminal output. The stack trace points at the original TypeScript source lines, not Vite's transformed code, because the ModuleRunner applies source maps for you — no manual stack-trace fixing needed.
+
+6. **Escaped data.** Return a string containing `</script>` from a loader and view source: the `__EIGEN_DATA__` script contains `\u003c/script\u003e`, and the page still works.
 
 ---
 
 ## Key insight
 
-This is the fundamental architecture of every Vite-based SSR framework. The dev server simultaneously handles two module graphs: one for the browser (ESM, code splitting, HMR) and one for the server (server-side imports, `ssrLoadModule`). Your plugin generates different code for each. This is what [Vinxi](https://vinxi.vercel.app) abstracted with its "router" concept, and what Vite formalizes with the [Environment API](https://vite.dev/guide/api-environment).
+This is the fundamental architecture of every Vite-based SSR framework. The dev server simultaneously handles two module graphs: one for the browser (ESM, code splitting, HMR) and one for the server (server-side imports, the ModuleRunner). Your plugin generates different code for each. This is what [Vinxi](https://vinxi.vercel.app) abstracted with its "router" concept, and what Vite formalizes with the [Environment API](https://vite.dev/guide/api-environment).
 
-The custom server (`server.ts`) is the framework's development runtime. It creates a Vite instance, layers it with H3 for SSR, and serves both module transforms and rendered pages. In production, this entire file is replaced by a [Nitro](https://nitro.build)-built server that imports pre-built bundles. The gap between dev and prod is where deployment adapters (Netlify, Vercel, Cloudflare) live — we'll build those in [Part 17](/17-deployment-adapters).
+The custom server (`server.ts`) is the framework's development runtime. It creates a Vite instance, layers it with H3 for SSR, and serves both module transforms and rendered pages. In production, this entire file is replaced by a server that imports pre-built bundles ([Part 6](/06-production-builds)). The gap between dev and prod is where deployment adapters (Netlify, Vercel, Cloudflare) live — we'll build those in [Part 17](/17-deployment-adapters).
 
 ---
 
@@ -406,42 +468,42 @@ import { describe, it, expect } from "vitest";
 import { matchRoute } from "../match-route";
 
 const routes = [
-	{ path: "/", component: () => null },
-	{ path: "/about", component: () => null },
-	{ path: "/posts/:id", component: () => null },
-	{ path: "/users/:userId/posts/:postId", component: () => null },
+  { path: "/", component: () => null },
+  { path: "/about", component: () => null },
+  { path: "/posts/:id", component: () => null },
+  { path: "/users/:userId/posts/:postId", component: () => null },
 ];
 
 describe("matchRoute", () => {
-	it("matches static routes exactly", () => {
-		const result = matchRoute("/about", routes);
-		expect(result?.route.path).toBe("/about");
-		expect(result?.params).toEqual({});
-	});
+  it("matches static routes exactly", () => {
+    const result = matchRoute("/about", routes);
+    expect(result?.route.path).toBe("/about");
+    expect(result?.params).toEqual({});
+  });
 
-	it("extracts params from dynamic segments", () => {
-		const result = matchRoute("/posts/42", routes);
-		expect(result?.route.path).toBe("/posts/:id");
-		expect(result?.params).toEqual({ id: "42" });
-	});
+  it("extracts params from dynamic segments", () => {
+    const result = matchRoute("/posts/42", routes);
+    expect(result?.route.path).toBe("/posts/:id");
+    expect(result?.params).toEqual({ id: "42" });
+  });
 
-	it("handles multiple dynamic segments", () => {
-		const result = matchRoute("/users/7/posts/99", routes);
-		expect(result?.params).toEqual({ userId: "7", postId: "99" });
-	});
+  it("handles multiple dynamic segments", () => {
+    const result = matchRoute("/users/7/posts/99", routes);
+    expect(result?.params).toEqual({ userId: "7", postId: "99" });
+  });
 
-	it("returns null for unmatched paths", () => {
-		expect(matchRoute("/nonexistent", routes)).toBeNull();
-	});
+  it("returns null for unmatched paths", () => {
+    expect(matchRoute("/nonexistent", routes)).toBeNull();
+  });
 
-	it("does not match when segment count differs", () => {
-		expect(matchRoute("/posts/42/comments", routes)).toBeNull();
-	});
+  it("does not match when segment count differs", () => {
+    expect(matchRoute("/posts/42/comments", routes)).toBeNull();
+  });
 
-	it("matches the root path", () => {
-		const result = matchRoute("/", routes);
-		expect(result?.route.path).toBe("/");
-	});
+  it("matches the root path", () => {
+    const result = matchRoute("/", routes);
+    expect(result?.route.path).toBe("/");
+  });
 });
 ```
 
@@ -453,11 +515,12 @@ Run with `pnpm vitest run packages/`.
 
 ## Further reading
 
-- [Vite SSR Guide](https://vite.dev/guide/ssr) — The official guide to server-side rendering with Vite, including middleware mode, `ssrLoadModule`, and production builds.
+- [Vite SSR Guide](https://vite.dev/guide/ssr) — The official guide to server-side rendering with Vite, including middleware mode and production builds.
 - [H3 Documentation](https://h3.dev/guide) — H3's guide covering routing, middleware, the event API, and runtime adapters.
 - [React `renderToString`](https://react.dev/reference/react-dom/server/renderToString) — React's server rendering API. Note that React recommends streaming APIs (`renderToPipeableStream`) for production — we'll migrate to streaming in [Part 12](/12-streaming-ssr).
-- [Nitro Documentation](https://nitro.build/guide) — The production server toolkit built on H3 that we'll use for deployment adapters in [Part 17](/17-deployment-adapters).
-- [Vite JavaScript API](https://vite.dev/guide/api-javascript) — Full reference for `createServer`, `ssrLoadModule`, `transformIndexHtml`, and other programmatic APIs used in custom dev servers.
+- [Nitro Documentation](https://nitro.build/guide) — The production server toolkit built on H3, worth comparing with the hand-built deployment adapters in [Part 17](/17-deployment-adapters).
+- [Vite JavaScript API](https://vite.dev/guide/api-javascript) — Full reference for `createServer`, `transformIndexHtml`, and other programmatic APIs used in custom dev servers.
+- [Vite Environment API for Frameworks](https://vite.dev/guide/api-environment-frameworks) — `RunnableDevEnvironment`, `isRunnableDevEnvironment`, and `runner.import()`.
 
 ---
 

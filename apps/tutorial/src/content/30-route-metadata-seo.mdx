@@ -8,18 +8,22 @@ concepts:
   - "sitemap generation"
 ---
 
-
-*In this installment, we add the metadata layer — route-specific `<head>` content, dynamic Open Graph tags, JSON-LD structured data, and build-time generation of sitemaps and robots.txt. This is how frameworks enable SEO without requiring developers to manually manage `<head>` tags.*
----
+## _In this installment, we add the metadata layer — route-specific `<head>` content, dynamic Open Graph tags, JSON-LD structured data, and build-time generation of sitemaps and robots.txt. This is how frameworks enable SEO without requiring developers to manually manage `<head>` tags._
 
 ## The metadata convention
 
 Each page can export a `metadata` object or an async `generateMetadata` function that receives the same params and data as the component:
 
 ```tsx title="src/pages/posts/[id].tsx"
-import type { MetadataFn } from 'eigen/metadata'
+import type { MetadataFn } from "eigen/metadata";
+import { defineLoader } from "eigen/helpers";
+import { getPost } from "../../lib/posts";
 
-export const generateMetadata: MetadataFn<'/posts/:id'> = async ({ params, data }) => {
+export const loader = defineLoader("/posts/:id", async ({ params }) => getPost(params.id));
+
+type PostData = Awaited<ReturnType<typeof loader>>;
+
+export const generateMetadata: MetadataFn<"/posts/:id", PostData> = async ({ params, data }) => {
   // data comes from the loader — no double-fetching
   return {
     title: `${data.title} | My Blog`,
@@ -27,7 +31,7 @@ export const generateMetadata: MetadataFn<'/posts/:id'> = async ({ params, data 
     openGraph: {
       title: data.title,
       description: data.body.slice(0, 160),
-      type: 'article',
+      type: "article",
       publishedTime: data.createdAt,
       images: [{ url: data.coverImage, width: 1200, height: 630 }],
     },
@@ -35,163 +39,225 @@ export const generateMetadata: MetadataFn<'/posts/:id'> = async ({ params, data 
       canonical: `https://myblog.com/posts/${params.id}`,
     },
     robots: { index: true, follow: true },
-  }
-}
+  };
+};
 ```
 
 For static metadata (no loader data needed):
 
 ```tsx title="src/pages/about.tsx"
-export const metadata = {
-  title: 'About Us | My Blog',
-  description: 'Learn about our team and mission.',
-}
+import type { RouteMetadata } from "eigen/metadata";
+
+export const metadata: RouteMetadata = {
+  title: "About Us | My Blog",
+  description: "Learn about our team and mission.",
+};
 ```
+
+`generateMetadata` is server-only: Part 7's client transform strips it (along with `loader`) from the browser bundle, so metadata code that touches a database or secret never ships to the client.
 
 ### The metadata type
 
 ```typescript title="packages/eigen/metadata.ts"
+import type { RouteParams } from "eigen/types";
+
 export interface RouteMetadata {
-  title?: string
-  description?: string
+  title?: string;
+  description?: string;
   robots?: {
-    index?: boolean
-    follow?: boolean
-    noarchive?: boolean
-  }
+    index?: boolean;
+    follow?: boolean;
+    noarchive?: boolean;
+  };
   openGraph?: {
-    title?: string
-    description?: string
-    type?: 'website' | 'article' | 'product'
-    images?: Array<{ url: string; width?: number; height?: number; alt?: string }>
-    publishedTime?: string
-    locale?: string
-    siteName?: string
-  }
+    title?: string;
+    description?: string;
+    type?: "website" | "article" | "product";
+    images?: Array<{ url: string; width?: number; height?: number; alt?: string }>;
+    publishedTime?: string;
+    locale?: string;
+    siteName?: string;
+  };
   twitter?: {
-    card?: 'summary' | 'summary_large_image' | 'player'
-    title?: string
-    description?: string
-    image?: string
-    creator?: string
-  }
+    card?: "summary" | "summary_large_image" | "player";
+    title?: string;
+    description?: string;
+    image?: string;
+    creator?: string;
+  };
   alternates?: {
-    canonical?: string
-    languages?: Record<string, string>
-  }
-  structuredData?: Record<string, unknown> | Array<Record<string, unknown>>
-  other?: Record<string, string>  // Arbitrary <meta> tags
+    canonical?: string;
+    languages?: Record<string, string>;
+  };
+  structuredData?: Record<string, unknown> | Array<Record<string, unknown>>;
+  other?: Record<string, string>; // Arbitrary <meta> tags
 }
 
-export type MetadataFn<TPath extends string = string> = (context: {
-  params: RouteParams<TPath>
-  data: unknown
-  pathname: string
-}) => Promise<RouteMetadata> | RouteMetadata
+export type MetadataFn<TPath extends string = string, TData = unknown> = (context: {
+  params: RouteParams<TPath>;
+  /** The page loader's return value */
+  data: TData;
+  pathname: string;
+}) => Promise<RouteMetadata> | RouteMetadata;
 ```
+
+The second type parameter carries the loader's return type, so `data.title` is checked against what the loader actually returns. Without it, `data` would be `unknown` and every property access would be a type error.
 
 ---
 
 ## Head injection via `transformIndexHtml` and SSR
 
-### Static metadata (build-time)
+### A placeholder in the template
 
-For pages with static `metadata` exports, the plugin can inject the tags via `transformIndexHtml`:
+The plugin uses `transformIndexHtml` to put a marker into `<head>` where per-route tags will go. It goes right after the template's existing `<meta charset>` and viewport tags (the charset declaration must stay within the first 1024 bytes of the document, so we never append it at the end of `<head>`):
 
 ```typescript
-transformIndexHtml(html, ctx) {
-  // For dev, inject default/fallback metadata
-  const defaultTags = `
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta charset="utf-8" />
-  `
-  return html.replace('</head>', `${defaultTags}</head>`)
+transformIndexHtml(html) {
+  if (html.includes('<!--eigen-head-->')) return html
+  // Insert after the last existing <meta> in the template's head,
+  // or right after <head> if there is none
+  const lastMeta = html.lastIndexOf('<meta', html.indexOf('</head>'))
+  if (lastMeta === -1) return html.replace('<head>', '<head>\n    <!--eigen-head-->')
+  const end = html.indexOf('>', lastMeta) + 1
+  return `${html.slice(0, end)}\n    <!--eigen-head-->${html.slice(end)}`
 }
 ```
 
-### Dynamic metadata (request-time)
+### Rendering metadata per request
 
-For pages with `generateMetadata`, the SSR pipeline calls it after the loader and injects the result into the HTML before streaming begins:
+Both static `metadata` and `generateMetadata` are resolved per request by the SSR pipeline: after middleware and the loader (via `runRoute` from Part 14), and before any HTML is sent. `RenderResult` gains a `head` field for the tags:
 
 ```typescript title="entry-server.tsx"
-export async function render(pathname: string, request: Request) {
-  const match = matchRoute(pathname)
+import { renderToString } from 'react-dom/server'
+import { serializeForScript } from 'eigen/serialize'
+import { matchRoute, type RouteMatch } from 'eigen/match-route'
+import { routes } from 'eigen/routes'
+import { runRoute } from 'eigen/run-route'
+import type { RouteMetadata } from 'eigen/metadata'
+
+export type RenderResult =
+  | { response: Response }
+  | { html: string; status: number; data: unknown; head: string }
+
+export async function render(request: Request): Promise<RenderResult> {
+  const { pathname } = new URL(request.url)
+  const match = matchRoute(pathname, routes)
   if (!match) return { html: '<h1>404</h1>', status: 404, data: null, head: '' }
 
-  // Run loader
-  let data = null
-  if (match.route.loader) {
-    data = await match.route.loader({ params: match.params })
-  }
+  // Middleware + loader (Part 14). A redirect or auth failure short-circuits.
+  const result = await runRoute(match, request)
+  if ('response' in result) return { response: result.response }
+  const { data } = result
 
-  // Generate metadata from loader data
-  let headTags = ''
-  if (match.route.generateMetadata) {
-    const meta = await match.route.generateMetadata({
-      params: match.params,
-      data,
-      pathname,
-    })
-    headTags = renderMetadataToHTML(meta)
-  } else if (match.route.metadata) {
-    headTags = renderMetadataToHTML(match.route.metadata)
-  }
+  // Layout metadata first (outermost → innermost), then the page on top
+  const meta = await resolveMetadata(match, { params: match.params, data, pathname })
+  const head = renderMetadataToHTML(meta)
 
-  const html = renderToString(<App pathname={pathname} data={data} />)
-  return { html, status: 200, data, head: headTags }
+  // Shown with renderToString for brevity — the real pipeline streams (Part 12).
+  // Metadata must be resolved before the shell is flushed, because <head> is in the shell.
+  const html = renderToString(<App match={match} data={data} />)
+  return { html, status: 200, data, head }
 }
 
-/** Escape HTML special characters to prevent XSS in meta tags */
+async function resolveMetadata(
+  match: RouteMatch,
+  context: { params: Record<string, string>; data: unknown; pathname: string },
+): Promise<RouteMetadata> {
+  let merged: RouteMetadata = {}
+  for (const layout of match.layouts) {
+    if (layout.metadata) merged = deepMerge(merged, layout.metadata)
+  }
+  const page = match.route.generateMetadata
+    ? await match.route.generateMetadata(context)
+    : match.route.metadata
+  return page ? deepMerge(merged, page) : merged
+}
+
+/** Plain-object deep merge: child values win; arrays are replaced, not concatenated */
+function deepMerge<T extends Record<string, unknown>>(parent: T, child: T): T {
+  const out: Record<string, unknown> = { ...parent }
+  for (const [key, value] of Object.entries(child)) {
+    const prev = out[key]
+    out[key] =
+      isPlainObject(prev) && isPlainObject(value) ? deepMerge(prev, value) : value
+  }
+  return out as T
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v)
+}
+
+/** Escape HTML special characters for text content and quoted attribute values */
 function escapeHtml(str: string): string {
   return str
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+function metaTag(attr: 'name' | 'property', key: string, value: string | number): string {
+  return `<meta ${attr}="${escapeHtml(key)}" content="${escapeHtml(String(value))}" />`
 }
 
 function renderMetadataToHTML(meta: RouteMetadata): string {
   const tags: string[] = []
 
   if (meta.title) tags.push(`<title>${escapeHtml(meta.title)}</title>`)
-  if (meta.description) tags.push(`<meta name="description" content="${escapeHtml(meta.description)}" />`)
+  if (meta.description) tags.push(metaTag('name', 'description', meta.description))
 
   if (meta.openGraph) {
     const og = meta.openGraph
-    if (og.title) tags.push(`<meta property="og:title" content="${escapeHtml(og.title)}" />`)
-    if (og.description) tags.push(`<meta property="og:description" content="${escapeHtml(og.description)}" />`)
-    if (og.type) tags.push(`<meta property="og:type" content="${og.type}" />`)
-    if (og.images) {
-      for (const img of og.images) {
-        tags.push(`<meta property="og:image" content="${escapeHtml(img.url)}" />`)
-        if (img.width) tags.push(`<meta property="og:image:width" content="${img.width}" />`)
-        if (img.height) tags.push(`<meta property="og:image:height" content="${img.height}" />`)
-      }
+    if (og.title) tags.push(metaTag('property', 'og:title', og.title))
+    if (og.description) tags.push(metaTag('property', 'og:description', og.description))
+    if (og.type) tags.push(metaTag('property', 'og:type', og.type))
+    if (og.siteName) tags.push(metaTag('property', 'og:site_name', og.siteName))
+    if (og.locale) tags.push(metaTag('property', 'og:locale', og.locale))
+    if (og.publishedTime) tags.push(metaTag('property', 'article:published_time', og.publishedTime))
+    for (const img of og.images ?? []) {
+      tags.push(metaTag('property', 'og:image', img.url))
+      if (img.width) tags.push(metaTag('property', 'og:image:width', img.width))
+      if (img.height) tags.push(metaTag('property', 'og:image:height', img.height))
+      if (img.alt) tags.push(metaTag('property', 'og:image:alt', img.alt))
     }
   }
 
   if (meta.twitter) {
     const tw = meta.twitter
-    if (tw.card) tags.push(`<meta name="twitter:card" content="${tw.card}" />`)
-    if (tw.title) tags.push(`<meta name="twitter:title" content="${escapeHtml(tw.title)}" />`)
-    if (tw.image) tags.push(`<meta name="twitter:image" content="${escapeHtml(tw.image)}" />`)
+    if (tw.card) tags.push(metaTag('name', 'twitter:card', tw.card))
+    if (tw.title) tags.push(metaTag('name', 'twitter:title', tw.title))
+    if (tw.description) tags.push(metaTag('name', 'twitter:description', tw.description))
+    if (tw.image) tags.push(metaTag('name', 'twitter:image', tw.image))
+    if (tw.creator) tags.push(metaTag('name', 'twitter:creator', tw.creator))
   }
 
   if (meta.alternates?.canonical) {
     tags.push(`<link rel="canonical" href="${escapeHtml(meta.alternates.canonical)}" />`)
   }
+  for (const [lang, href] of Object.entries(meta.alternates?.languages ?? {})) {
+    tags.push(`<link rel="alternate" hreflang="${escapeHtml(lang)}" href="${escapeHtml(href)}" />`)
+  }
 
   if (meta.robots) {
-    const directives = []
+    const directives: string[] = []
     if (meta.robots.index === false) directives.push('noindex')
     if (meta.robots.follow === false) directives.push('nofollow')
-    if (directives.length) tags.push(`<meta name="robots" content="${directives.join(', ')}" />`)
+    if (meta.robots.noarchive) directives.push('noarchive')
+    if (directives.length) tags.push(metaTag('name', 'robots', directives.join(', ')))
+  }
+
+  for (const [name, content] of Object.entries(meta.other ?? {})) {
+    tags.push(metaTag('name', name, content))
   }
 
   if (meta.structuredData) {
     const items = Array.isArray(meta.structuredData) ? meta.structuredData : [meta.structuredData]
     for (const item of items) {
-      tags.push(`<script type="application/ld+json">${JSON.stringify(item)}</script>`)
+      // serializeForScript (Part 3) escapes <, >, & so a title containing
+      // "</script>" can't break out of the tag
+      tags.push(`<script type="application/ld+json">${serializeForScript(item)}</script>`)
     }
   }
 
@@ -199,13 +265,18 @@ function renderMetadataToHTML(meta: RouteMetadata): string {
 }
 ```
 
-The server injects these tags:
+The server replaces the placeholder with these tags:
 
 ```typescript
-const finalHtml = template
-  .replace('<!--ssr-outlet-->', appHtml)
-  .replace('</head>', `    ${headTags}\n</head>`)
+const result = await render(request);
+if ("response" in result) return result.response;
+
+const finalHtml = template.replace("<!--eigen-head-->", result.head).replace("<!--ssr-outlet-->", result.html);
 ```
+
+<Callout title="What about React 19's <title> and <meta> hoisting?">
+React 19 hoists `<title>`, `<meta>` and `<link>` elements rendered anywhere in the component tree into `<head>`. That works well for client-side navigations, but a route-level convention still earns its place: metadata is resolved from loader data *before* the streamed shell is flushed, parent and child values are merged deterministically instead of producing duplicate tags, and build tools (sitemaps, SSG) can read it without rendering. If you also render `<title>` in a component, React's hoisted tag and the framework's tag will both appear — pick one source per tag.
+</Callout>
 
 ---
 
@@ -214,23 +285,25 @@ const finalHtml = template
 Structured data helps search engines understand page content. The framework makes it easy to include:
 
 ```tsx title="src/pages/posts/[id].tsx"
-export const generateMetadata: MetadataFn<'/posts/:id'> = async ({ data, params }) => ({
+export const generateMetadata: MetadataFn<"/posts/:id", PostData> = async ({ data }) => ({
   title: data.title,
   structuredData: {
-    '@context': 'https://schema.org',
-    '@type': 'Article',
+    "@context": "https://schema.org",
+    "@type": "Article",
     headline: data.title,
-    author: { '@type': 'Person', name: data.author.name },
+    author: { "@type": "Person", name: data.author.name },
     datePublished: data.createdAt,
     image: data.coverImage,
     publisher: {
-      '@type': 'Organization',
-      name: 'My Blog',
-      logo: { '@type': 'ImageObject', url: 'https://myblog.com/logo.png' },
+      "@type": "Organization",
+      name: "My Blog",
+      logo: { "@type": "ImageObject", url: "https://myblog.com/logo.png" },
     },
   },
-})
+});
 ```
+
+`renderMetadataToHTML` embeds each item with `serializeForScript`, not raw `JSON.stringify`. JSON-LD is user-influenced data inside a `<script>` element: a post titled `</script><script>alert(1)</script>` would otherwise close the tag and run arbitrary script.
 
 ---
 
@@ -239,29 +312,40 @@ export const generateMetadata: MetadataFn<'/posts/:id'> = async ({ data, params 
 The route plugin knows all routes. At build time, it generates a sitemap:
 
 ```typescript
-// In the SSG/build plugin's closeBundle hook
+// Called from the SSG plugin's buildApp hook (order: 'post', Part 16)
+function escapeXml(str: string): string {
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
 async function generateSitemap(routes: DiscoveredRoute[], baseUrl: string): Promise<string> {
-  const entries: string[] = []
+  const entries: string[] = [];
+  const addUrl = (path: string) => entries.push(`  <url><loc>${escapeXml(new URL(path, baseUrl).href)}</loc></url>`);
 
   for (const route of routes) {
-    if (route.path.includes(':')) {
+    if (route.path.includes(":")) {
       // Dynamic route — need generateStaticParams to enumerate URLs
       if (route.generateStaticParams) {
-        const paramSets = await route.generateStaticParams()
+        const paramSets = await route.generateStaticParams();
         for (const params of paramSets) {
-          const url = route.path.replace(/:(\w+)/g, (_, k) => params[k])
-          entries.push(`  <url><loc>${baseUrl}${url}</loc></url>`)
+          // Encode each param value: a slug like "a&b c" must become "a%26b%20c"
+          const path = route.path.replace(/:(\w+)/g, (_, k) => encodeURIComponent(params[k]));
+          addUrl(path);
         }
       }
     } else {
-      entries.push(`  <url><loc>${baseUrl}${route.path}</loc><priority>0.8</priority></url>`)
+      addUrl(route.path);
     }
   }
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-${entries.join('\n')}
-</urlset>`
+${entries.join("\n")}
+</urlset>`;
 }
 ```
 
@@ -272,11 +356,11 @@ function generateRobotsTxt(baseUrl: string): string {
   return `User-agent: *
 Allow: /
 
-Sitemap: ${baseUrl}/sitemap.xml`
+Sitemap: ${baseUrl}/sitemap.xml`;
 }
 ```
 
-Both are written to the client output directory during the build.
+Both are written to the client output directory during the build. Sitemap `<loc>` values must be fully-qualified and XML-escaped — an unescaped `&` in a query string makes the whole file invalid XML. We omit `<priority>` and `<changefreq>`: Google ignores both, and `<lastmod>` is only worth emitting if it's accurate.
 
 ---
 
@@ -285,28 +369,28 @@ Both are written to the client output directory during the build.
 With nested layouts (Part 13), metadata from parent layouts merges with child page metadata. A root layout might set the site name and default OG image; a page overrides the title and description:
 
 ```typescript
-// Root layout metadata
-export const metadata = {
-  openGraph: { siteName: 'My Blog', locale: 'en_US' },
-  twitter: { card: 'summary_large_image' as const },
-}
+// src/pages/layout.tsx — root layout metadata (layouts export static metadata)
+export const metadata: RouteMetadata = {
+  openGraph: { siteName: "My Blog", locale: "en_US" },
+  twitter: { card: "summary_large_image" },
+};
 
-// Page metadata (merged on top of root)
-export const generateMetadata = async ({ data }) => ({
-  title: data.title,           // Overrides root
-  openGraph: { title: data.title },  // Merges with root's siteName/locale
-})
+// src/pages/posts/[id].tsx — page metadata (merged on top of the layout's)
+export const generateMetadata: MetadataFn<"/posts/:id", PostData> = async ({ data }) => ({
+  title: data.title, // Overrides root
+  openGraph: { title: data.title }, // Merges with root's siteName/locale
+});
 
 // Result: { title: 'Post Title', openGraph: { siteName: 'My Blog', locale: 'en_US', title: 'Post Title' }, twitter: { card: 'summary_large_image' } }
 ```
 
-The merge is a deep merge — child properties override parent properties, but parent properties that the child doesn't set are preserved.
+The merge is the `deepMerge` in `resolveMetadata` above — child properties override parent properties, parent properties that the child doesn't set are preserved, and arrays (like `openGraph.images`) are replaced rather than concatenated. Layouts export static `metadata`; only pages use `generateMetadata`, because the page loader's data is what the metadata describes.
 
 ---
 
 ## Key insight
 
-Metadata is a route-level concern that the framework orchestrates. The plugin discovers `metadata` exports during route scanning (extending the same `load` hook from Part 2), the SSR pipeline calls `generateMetadata` with loader data (no double-fetching), and the build system generates sitemaps from the route tree. The developer writes metadata as typed objects; the framework renders them to HTML tags, injects them into `<head>`, and generates the SEO artifacts.
+Metadata is a route-level concern that the framework orchestrates. The generated routes module (Part 2) reads `metadata` and `generateMetadata` as optional namespace exports, the SSR pipeline calls `generateMetadata` with loader data (no double-fetching), and the build system generates sitemaps from the route tree. The developer writes metadata as typed objects; the framework renders them to HTML tags, injects them into `<head>`, and generates the SEO artifacts.
 
 ---
 

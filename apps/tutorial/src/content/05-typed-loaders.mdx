@@ -7,8 +7,7 @@ concepts:
   - "client-side data endpoints"
 ---
 
-
-*This is the sixth installment in a series where we build a toy Next.js on top of Vite. In [Part 4](/04-hydration), we connected server and client with hydration — but ended with a bug: client-side navigations don't refetch loader data, so visiting `/posts/2` after `/posts/1` shows stale content. We'll fix that here, alongside building the type machinery that lets a loader's return type flow through to the component's `data` prop. Frameworks like [Next.js](https://nextjs.org) (with `getServerSideProps`) and [Remix](https://remix.run) (with `loader`) solve the same two problems.*
+_This is the sixth installment in a series where we build a toy Next.js on top of Vite. In [Part 4](/04-hydration), we connected server and client with hydration — but ended with a bug: client-side navigations don't refetch loader data, so visiting `/posts/2` after `/posts/1` shows stale content. We'll fix that here, alongside building the type machinery that lets a loader's return type flow through to the component's `data` prop. Frameworks like [Next.js](https://nextjs.org) (with `getServerSideProps`) and [Remix](https://remix.run) (with `loader`) solve the same two problems._
 
 ---
 
@@ -19,14 +18,14 @@ When a developer writes a loader, the return type should flow through to the com
 ```tsx
 // Dream DX:
 export const loader = defineLoader("/posts/:id", async ({ params }) => {
-	// params.id is typed as string — inferred from the route path
-	const post = await fetchPost(params.id);
-	return post; // { title: string; body: string }
+  // params.id is typed as string — inferred from the route path
+  const post = await fetchPost(params.id);
+  return post; // { title: string; body: string }
 });
 
 export default function PostPage({ params, data }) {
-	// data.title: string  ← inferred from the loader return type
-	// params.id: string   ← inferred from the route path
+  // data.title: string  ← inferred from the loader return type
+  // params.id: string   ← inferred from the route path
 }
 ```
 
@@ -36,7 +35,7 @@ Getting here requires progressively more sophisticated type machinery. Let's bui
 
 ## Level 1: Manual annotation
 
-The simplest approach — the developer explicitly writes the types. This is the baseline pattern in early versions of frameworks like [Remix](https://remix.run) and [TanStack Start](https://tanstack.com/start) before they invested in deeper type inference:
+The simplest approach — the developer explicitly writes the types. This is the baseline pattern in loader-based frameworks before they invest in type inference (Next.js's `getServerSideProps` with a hand-written `Props` type is the classic example):
 
 ```tsx title="src/pages/posts/[id].tsx"
 import type { PageProps } from "eigen/types";
@@ -45,20 +44,18 @@ type Post = { id: number; title: string; body: string };
 type Props = PageProps<"/posts/:id", Post>;
 
 export async function loader({ params }: { params: { id: string } }) {
-	const res = await fetch(
-		`https://jsonplaceholder.typicode.com/posts/${params.id}`,
-	);
-	return (await res.json()) as Post;
+  const res = await fetch(`https://jsonplaceholder.typicode.com/posts/${params.id}`);
+  return (await res.json()) as Post;
 }
 
 export default function PostPage({ params, data }: Props) {
-	return (
-		<article>
-			<h1>{data.title}</h1>
-			<p>Post #{params.id}</p>
-			<p>{data.body}</p>
-		</article>
-	);
+  return (
+    <article>
+      <h1>{data.title}</h1>
+      <p>Post #{params.id}</p>
+      <p>{data.body}</p>
+    </article>
+  );
 }
 ```
 
@@ -76,30 +73,25 @@ TypeScript's [`satisfies`](https://www.typescriptlang.org/docs/handbook/release-
 import type { LoaderFn, PageProps } from "eigen/types";
 
 export const loader = (async ({ params }) => {
-	const res = await fetch(
-		`https://jsonplaceholder.typicode.com/posts/${params.id}`,
-	);
-	return (await res.json()) as { id: number; title: string; body: string };
+  const res = await fetch(`https://jsonplaceholder.typicode.com/posts/${params.id}`);
+  return (await res.json()) as { id: number; title: string; body: string };
 }) satisfies LoaderFn<"/posts/:id">;
 
 // Extract the return type automatically
 type LoaderData = Awaited<ReturnType<typeof loader>>;
 
-export default function PostPage({
-	params,
-	data,
-}: PageProps<"/posts/:id", LoaderData>) {
-	// data.id: number       ← inferred from the loader
-	// data.title: string    ← inferred from the loader
-	// data.body: string     ← inferred from the loader
-	// params.id: string     ← inferred from the route path
-	return (
-		<article>
-			<h1>{data.title}</h1>
-			<p>Post #{params.id}</p>
-			<p>{data.body}</p>
-		</article>
-	);
+export default function PostPage({ params, data }: PageProps<"/posts/:id", LoaderData>) {
+  // data.id: number       ← inferred from the loader
+  // data.title: string    ← inferred from the loader
+  // data.body: string     ← inferred from the loader
+  // params.id: string     ← inferred from the route path
+  return (
+    <article>
+      <h1>{data.title}</h1>
+      <p>Post #{params.id}</p>
+      <p>{data.body}</p>
+    </article>
+  );
 }
 ```
 
@@ -109,13 +101,13 @@ export default function PostPage({
 - The return type is a value or a `Promise<value>`.
 - The function signature otherwise conforms to `LoaderFn`.
 
-The check also flows the parameter type *into* the arrow function — that's why `params.id` is typed as `string` inside the body without an explicit annotation. This is contextual typing through `satisfies`, the same mechanism that types object literals against a target type.
+The check also flows the parameter type _into_ the arrow function — that's why `params.id` is typed as `string` inside the body without an explicit annotation. This is contextual typing through `satisfies`, the same mechanism that types object literals against a target type.
 
-Crucially, `satisfies` does *not* widen the return type to `unknown` (which is what `LoaderFn`'s default `TData` would produce). The `typeof loader` retains the narrow type `(ctx: ...) => Promise<{ id: number; title: string; body: string }>`, which `Awaited<ReturnType<...>>` extracts.
+Crucially, `satisfies` does _not_ widen the return type to `unknown` (which is what `LoaderFn`'s default `TData` would produce). The `typeof loader` retains the narrow type `(ctx: ...) => Promise<{ id: number; title: string; body: string }>`, which `Awaited<ReturnType<...>>` extracts.
 
 <TypeDeepDive title="TypeScript: The `satisfies` operator">
 
-`satisfies` (added in TS 4.9) checks that an expression matches a type *without widening it*. Compare two approaches: `const x: Type = value` widens `x` to `Type`, losing any narrower type information. `const x = value satisfies Type` checks compatibility but preserves the narrow, specific type. This distinction matters here because `ReturnType<typeof loader>` needs the narrow type. With `: LoaderFn`, the return type widens to `unknown` and `ReturnType` gives you nothing useful. With `satisfies`, TypeScript retains the exact `{ id: number; title: string; body: string }` shape while still enforcing that the function conforms to the `LoaderFn` contract.
+`satisfies` (added in TS 4.9) checks that an expression matches a type _without widening it_. Compare two approaches: `const x: Type = value` widens `x` to `Type`, losing any narrower type information. `const x = value satisfies Type` checks compatibility but preserves the narrow, specific type. This distinction matters here because `ReturnType<typeof loader>` needs the narrow type. With `: LoaderFn`, the return type widens to `unknown` and `ReturnType` gives you nothing useful. With `satisfies`, TypeScript retains the exact `{ id: number; title: string; body: string }` shape while still enforcing that the function conforms to the `LoaderFn` contract.
 
 </TypeDeepDive>
 
@@ -145,10 +137,10 @@ import type { RouteParamsMap } from "eigen/route-types";
  * - Preserves the narrow return type for inference
  */
 export function defineLoader<TPath extends keyof RouteParamsMap, TData>(
-	_path: TPath,
-	fn: (ctx: { params: RouteParamsMap[TPath] }) => Promise<TData> | TData,
+  _path: TPath,
+  fn: (ctx: { params: RouteParamsMap[TPath] }) => Promise<TData> | TData,
 ): (ctx: { params: RouteParamsMap[TPath] }) => Promise<TData> | TData {
-	return fn;
+  return fn;
 }
 ```
 
@@ -195,30 +187,27 @@ import { defineLoader } from "eigen/helpers";
 import type { PageProps } from "eigen/types";
 
 export const loader = defineLoader("/posts/:id", async ({ params }) => {
-	// params.id is typed as string — guaranteed by the route path
-	const res = await fetch(
-		`https://jsonplaceholder.typicode.com/posts/${params.id}`,
-	);
-	return (await res.json()) as { id: number; title: string; body: string };
+  // params.id is typed as string — guaranteed by the route path
+  const res = await fetch(`https://jsonplaceholder.typicode.com/posts/${params.id}`);
+  return (await res.json()) as { id: number; title: string; body: string };
 });
 
 type LoaderData = Awaited<ReturnType<typeof loader>>;
 
-export default function PostPage({
-	params,
-	data,
-}: PageProps<"/posts/:id", LoaderData>) {
-	return (
-		<article>
-			<h1>{data.title}</h1>
-			<p>Post #{params.id}</p>
-			<p>{data.body}</p>
-		</article>
-	);
+export default function PostPage({ params, data }: PageProps<"/posts/:id", LoaderData>) {
+  return (
+    <article>
+      <h1>{data.title}</h1>
+      <p>Post #{params.id}</p>
+      <p>{data.body}</p>
+    </article>
+  );
 }
 ```
 
-Now the path string is validated at compile time. If you write `defineLoader('/posts/:id', ...)` but the file is at `src/pages/users/[name].tsx`, the path won't match any entry in `RouteParamsMap` and TypeScript reports an error. The loader's params are correctly typed as `{ id: string }` without any annotation.
+Now the path string is validated at compile time. If you write `defineLoader('/post/:id', ...)` (a typo), or keep `defineLoader('/posts/:id', ...)` after renaming `posts/[id].tsx` to `articles/[id].tsx`, the path no longer matches any key of `RouteParamsMap` and TypeScript reports an error. The loader's params are correctly typed as `{ id: string }` without any annotation.
+
+Note what this check does _not_ do: `defineLoader` has no idea which file it's called from. A loader in `src/pages/users/[name].tsx` that says `defineLoader('/posts/:id', ...)` type-checks happily as long as `/posts/:id` exists somewhere. Tying the path to the file requires the per-route generation described next.
 
 You still need `Awaited<ReturnType<typeof loader>>` to bridge the loader return type to the component props. Eliminating that last piece of boilerplate requires per-route code generation.
 
@@ -231,15 +220,13 @@ To eliminate all manual type annotations, the plugin can generate per-route help
 ```typescript
 // Generated by the plugin into node_modules/.eigen/route-helpers.d.ts
 declare module "eigen/page/posts/[id]" {
-	import type { PageProps } from "eigen/types";
+  import type { PageProps } from "eigen/types";
 
-	/** Pre-typed props for this page */
-	export type Props = PageProps<"/posts/:id">;
+  /** Pre-typed props for this page */
+  export type Props = PageProps<"/posts/:id">;
 
-	/** Hook that returns this route's loader data with full types */
-	export function useLoaderData(): Awaited<
-		ReturnType<typeof import("/src/pages/posts/[id].tsx").loader>
-	>;
+  /** Hook that returns this route's loader data with full types */
+  export function useLoaderData(): Awaited<ReturnType<typeof import("../../src/pages/posts/[id]").loader>>;
 }
 ```
 
@@ -249,31 +236,31 @@ With this, the developer writes:
 import { useLoaderData } from "eigen/page/posts/[id]";
 
 export default function PostPage() {
-	const data = useLoaderData();
-	// data.title: string — fully inferred, zero annotations
+  const data = useLoaderData();
+  // data.title: string — fully inferred, zero annotations
 }
 ```
 
-This is essentially what [TanStack Router](https://tanstack.com/router)'s [code generation](https://tanstack.com/router/latest/docs/framework/react/guide/code-generation) produces. The plugin scans each route file, extracts the loader's type signature, and generates a `.d.ts` with pre-connected types. The complexity is in the plugin, not in the developer's code.
+This is the same idea behind [TanStack Router](https://tanstack.com/router)'s [code generation](https://tanstack.com/router/latest/docs/framework/react/guide/code-generation) and React Router v7's route type generation. Notice what the generator does _not_ do: it never extracts or evaluates the loader's type. It only emits `typeof import("…").loader` for each file it finds, and TypeScript's own inference fills in the rest. The plugin needs the same filesystem scan we already do in [Part 2](/02-route-discovery-plugin), plus one generated module per route file.
 
-We won't implement this in the tutorial — it requires the plugin to parse TypeScript ASTs and extract type information, which is a significant investment. But understanding that it's possible (and how it works) is important for understanding the tradeoffs real frameworks make.
+We won't implement this in the tutorial. The hard parts are mostly logistics: generated module names per route, keeping the declarations in sync as files move, and editor tooling that picks up regenerated files promptly. But knowing how little magic is involved helps explain the trade-offs real frameworks make.
 
 ---
 
 ## The spectrum of framework type inference
 
-| Level | Developer writes | Framework generates | Real-world equivalent |
-|---|---|---|---|
-| Manual | `PageProps<'/path', DataType>` | Route path union | Early Remix, hand-written types |
-| `satisfies` | `satisfies LoaderFn<'/path'>` + `ReturnType` | Route path union + param map | Modern Remix (`useLoaderData<typeof loader>()`) |
-| `defineLoader` | `defineLoader('/path', fn)` + `ReturnType` | Path validation + typed params | Eigen (this part) |
-| Full codegen | Nothing — types flow automatically | Per-route typed hooks + props | TanStack Router (`routeTree.gen.ts`) |
+| Level          | Developer writes                             | Framework generates            | Real-world equivalent                                                          |
+| -------------- | -------------------------------------------- | ------------------------------ | ------------------------------------------------------------------------------ |
+| Manual         | `PageProps<'/path', DataType>`               | Route path union               | Early Remix, hand-written types                                                |
+| `satisfies`    | `satisfies LoaderFn<'/path'>` + `ReturnType` | Route path union + param map   | Remix v2 (`useLoaderData<typeof loader>()`)                                    |
+| `defineLoader` | `defineLoader('/path', fn)` + `ReturnType`   | Path validation + typed params | Eigen (this part)                                                              |
+| Full codegen   | Nothing — types flow automatically           | Per-route typed hooks + props  | TanStack Router (`routeTree.gen.ts`), React Router v7 (`Route.ComponentProps`) |
 
 Each row builds on the one above it. Eigen ships both Levels 2 and 3 — `LoaderFn` for developers who don't want to import a helper, `defineLoader` for the slightly stronger guarantee that the path string matches a real route. Frameworks at the bottom of the table eliminate even those few lines of glue, at the cost of a code-generation step in the build pipeline.
 
 <Callout type="info" title="React Server Components sidesteps the spectrum">
 
-[Next.js App Router with Server Components](https://nextjs.org/docs/app/building-your-application/rendering/server-components) takes a different approach to the same problem. Components *are* the data fetching layer, so there's no loader/component type bridge to build — data is fetched inline with `await`, and TypeScript infers the types naturally because the fetch and the render live in one function. This is an architectural trade-off, not a strict win: RSC eliminates the loader abstraction entirely, while the loader pattern keeps a clean separation between data fetching (server-only) and rendering (universal). We'll build our own RSC layer in [Part 21](/21-react-server-components).
+[Next.js App Router with Server Components](https://nextjs.org/docs/app/building-your-application/rendering/server-components) takes a different approach to the same problem. Components _are_ the data fetching layer, so there's no loader/component type bridge to build — data is fetched inline with `await`, and TypeScript infers the types naturally because the fetch and the render live in one function. This is an architectural trade-off, not a strict win: RSC eliminates the loader abstraction entirely, while the loader pattern keeps a clean separation between data fetching (server-only) and rendering (universal). We'll build our own RSC layer in [Part 21](/21-react-server-components).
 
 </Callout>
 
@@ -281,9 +268,9 @@ Each row builds on the one above it. Eigen ships both Levels 2 and 3 — `Loader
 
 ## Client-side data fetching
 
-[Part 4](/04-hydration#what-to-observe) ended with a deliberate bug: navigating from `/posts/1` to `/posts/2` updated the URL but not the data. The component re-rendered with the new `params.id`, but `data` was always `window.__EIGEN_DATA__` — the value baked into the HTML for the *initial* page load. The client never asked the server for fresh data, because the server endpoint that would answer that question doesn't exist yet.
+[Part 4](/04-hydration#what-to-observe) ended with a deliberate bug: navigating from `/posts/1` to `/posts/2` updated the URL but not the data. The component re-rendered with the new `params.id`, but `data` was always `window.__EIGEN_DATA__` — the value baked into the HTML for the _initial_ page load. The client never asked the server for fresh data, because the server endpoint that would answer that question doesn't exist yet.
 
-The standard framework solution is to mirror the loader pipeline as a JSON endpoint. The first page load gets data through HTML (one round-trip, no extra request); subsequent navigations get it through `fetch`. [Next.js](https://nextjs.org) wires this up at `/_next/data/...`. [Remix](https://remix.run) reuses the route URL with a `?_data=` query parameter. We'll use `/_eigen/data?path=...`.
+The standard framework solution is to mirror the loader pipeline as a JSON endpoint. The first page load gets data through HTML (one round-trip, no extra request); subsequent navigations get it through `fetch`. [Next.js](https://nextjs.org)'s Pages Router wires this up at `/_next/data/<buildId>/<path>.json`. React Router v7 (and Remix with Single Fetch) requests the route URL with a `.data` suffix, e.g. `/posts/2.data`; older Remix used a `?_data=` query parameter. We'll use `/_eigen/data?path=...`.
 
 ```mermaid
 flowchart LR
@@ -304,19 +291,16 @@ flowchart LR
 
 ### A loader runner
 
-Right now `entry-server.tsx` exposes one function — `render` — that runs the loader *and* renders HTML. The data endpoint only needs the loader half. Rather than render HTML and throw it away, we extract the loader-running logic into the framework package:
+Right now `entry-server.tsx` exposes one function — `render` — that runs the loader _and_ renders HTML. The data endpoint only needs the loader half. Rather than render HTML and throw it away, we extract the loader-running logic into the framework package:
 
 ```typescript title="packages/eigen/run-loader.ts"
 import { matchRoute } from "./match-route";
 import type { RouteDefinition } from "./types";
 
-export async function runLoader(
-	pathname: string,
-	routes: RouteDefinition[],
-): Promise<unknown> {
-	const match = matchRoute(pathname, routes);
-	if (!match || !match.route.loader) return null;
-	return match.route.loader({ params: match.params });
+export async function runLoader(pathname: string, routes: RouteDefinition[]): Promise<unknown> {
+  const match = matchRoute(pathname, routes);
+  if (!match || !match.route.loader) return null;
+  return match.route.loader({ params: match.params });
 }
 ```
 
@@ -348,9 +332,10 @@ resolve: {
 
 ### The data endpoint
 
-We add a middleware to the `eigen-routes` plugin from [Part 2](/02-route-discovery-plugin). The middleware uses [`ssrLoadModule`](https://vite.dev/guide/api-javascript#vitedevserver-ssrloadmodule) to load the routes through the SSR module graph (so loaders are included), then calls `runLoader`:
+We add a middleware to the `eigen-routes` plugin from [Part 2](/02-route-discovery-plugin). It loads the routes through the SSR environment's [module runner](https://vite.dev/guide/api-environment-frameworks), the same `runner.import()` the dev server uses for `entry-server.tsx` in [Part 3](/03-server-side-rendering#the-custom-dev-server), so loaders are included. Then it calls `runLoader`:
 
 ```typescript title="plugins/eigen-routes.ts"
+import { isRunnableDevEnvironment } from "vite"; // [!code ++]
 import type { RouteDefinition } from "../packages/eigen/types"; // [!code ++]
 import { runLoader } from "../packages/eigen/run-loader"; // [!code ++]
 
@@ -366,15 +351,18 @@ configureServer(server) {
 			const pathname = url.searchParams.get("path") ?? "/";
 
 			try {
-				const { routes } = (await server.ssrLoadModule(
-					"eigen/routes",
-				)) as { routes: RouteDefinition[] };
+				const ssrEnv = server.environments.ssr;
+				if (!isRunnableDevEnvironment(ssrEnv)) {
+					throw new Error("SSR environment is not runnable");
+				}
+				const { routes } = (await ssrEnv.runner.import("eigen/routes")) as {
+					routes: RouteDefinition[];
+				};
 				const data = await runLoader(pathname, routes);
 
 				res.setHeader("Content-Type", "application/json");
 				res.end(JSON.stringify(data));
 			} catch (e) {
-				server.ssrFixStacktrace(e as Error);
 				console.error(e);
 				res.writeHead(500);
 				res.end("Internal server error");
@@ -387,8 +375,9 @@ configureServer(server) {
 A few details worth calling out:
 
 - **The middleware uses Node-style `req`/`res`.** Vite's [`configureServer`](https://vite.dev/guide/api-plugin#configureserver) hook takes [Connect](https://github.com/senchalabs/connect)-style middleware, not H3 handlers. The HTTP layer here is Node-bound by design — same reason we used `fromNodeHandler` in [Part 3](/03-server-side-rendering#why-h3node).
-- **Loaders only exist in the SSR graph.** `ssrLoadModule('eigen/routes')` triggers the [`load` hook from Part 2](/02-route-discovery-plugin#plugin-hooks) with `this.environment.name === 'ssr'`, which is the branch that emits static imports plus loader references. Loading through the client graph would give us route components without their loaders.
-- **`ssrFixStacktrace`** rewrites stack traces back to source-mapped TypeScript locations, the same way the SSR handler does it in [Part 3](/03-server-side-rendering#the-custom-dev-server). Without it, errors in a loader point at Vite's transformed output.
+- **Loaders only exist in the SSR graph.** `server.environments.ssr.runner.import('eigen/routes')` triggers the [`load` hook from Part 2](/02-route-discovery-plugin#plugin-hooks) with `this.environment.name === 'ssr'`. That is the branch whose route objects carry `loader`. The client branch's route objects only have components.
+- **Stack traces are already source-mapped.** The module runner applies source maps itself, so an error thrown in a loader points at the original TypeScript line. No `ssrFixStacktrace` call needed; that was only necessary with the legacy SSR loading API the runner replaces.
+- **The `isRunnableDevEnvironment` guard** narrows the environment's type. Only a runnable environment (one whose modules execute in this Node process) has a `runner`. Vite's default `ssr` environment is runnable; a Workers-style environment ([Part 19](/19-edge-runtimes)) would not be.
 - **No production equivalent yet.** `configureServer` is dev-only ([Part 0](/00-the-mental-model#hook-availability-dev-vs-build)). When we move to a production server in [Part 6](/06-production-builds), we'll need an equivalent route mounted directly on H3 — `runLoader` itself ports across unchanged because it has no Node-specific dependencies.
 
 ### Updating the client
@@ -397,46 +386,53 @@ Now the client can fetch fresh data on navigation. We re-introduce `data` as sta
 
 ```tsx title="src/entry-client.tsx"
 function Router() {
-	const [pathname, setPathname] = useState(window.location.pathname);
-	const data = window.__EIGEN_DATA__; // [!code --]
-	const [data, setData] = useState<unknown>(window.__EIGEN_DATA__); // [!code ++]
-	const [loading, setLoading] = useState(false); // [!code ++]
+  const [pathname, setPathname] = useState(window.location.pathname);
+  const data = window.__EIGEN_DATA__; // [!code --]
+  const [data, setData] = useState<unknown>(window.__EIGEN_DATA__); // [!code ++]
+  const [loading, setLoading] = useState(false); // [!code ++]
 
-	useEffect(() => {
-		const handler = () => { // [!code --]
-			setPathname(window.location.pathname); // [!code --]
-		}; // [!code --]
-		const handler = async () => { // [!code ++]
-			const newPath = window.location.pathname; // [!code ++]
-			setPathname(newPath); // [!code ++]
-			setLoading(true); // [!code ++]
-			try { // [!code ++]
-				const res = await fetch( // [!code ++]
-					`/_eigen/data?path=${encodeURIComponent(newPath)}`, // [!code ++]
-				); // [!code ++]
-				setData(await res.json()); // [!code ++]
-			} finally { // [!code ++]
-				setLoading(false); // [!code ++]
-			} // [!code ++]
-		}; // [!code ++]
-		window.addEventListener("popstate", handler);
-		return () => window.removeEventListener("popstate", handler);
-	}, []);
+  useEffect(() => {
+    const handler = () => {
+      // [!code --]
+      setPathname(window.location.pathname); // [!code --]
+    }; // [!code --]
+    const handler = async () => {
+      // [!code ++]
+      const newPath = window.location.pathname; // [!code ++]
+      setPathname(newPath); // [!code ++]
+      setLoading(true); // [!code ++]
+      try {
+        // [!code ++]
+        const res = await fetch(
+          // [!code ++]
+          `/_eigen/data?path=${encodeURIComponent(newPath)}`, // [!code ++]
+        ); // [!code ++]
+        setData(await res.json()); // [!code ++]
+      } finally {
+        // [!code ++]
+        setLoading(false); // [!code ++]
+      } // [!code ++]
+    }; // [!code ++]
+    window.addEventListener("popstate", handler);
+    return () => window.removeEventListener("popstate", handler);
+  }, []);
 
-	const match = matchRoute(pathname, routes);
-	if (!match) return <h1>404</h1>;
-	const Component = match.route.component;
+  const match = matchRoute(pathname, routes);
+  if (!match) return <h1>404</h1>;
+  const Component = match.route.component;
 
-	return (
-		<Suspense fallback={<div>Loading...</div>}>
-			{loading ? ( // [!code ++]
-				<div>Loading...</div> // [!code ++]
-			) : ( // [!code ++]
-				<Component params={match.params} data={data} /> // [!code ++]
-			)} // [!code ++]
-			<Component params={match.params} data={data} /> // [!code --]
-		</Suspense>
-	);
+  return (
+    <Suspense fallback={<div>Loading...</div>}>
+      {loading ? ( // [!code ++]
+        <div>Loading...</div> // [!code ++]
+      ) : (
+        // [!code ++]
+        <Component params={match.params} data={data} /> // [!code ++]
+      )}{" "}
+      // [!code ++]
+      <Component params={match.params} data={data} /> // [!code --]
+    </Suspense>
+  );
 }
 ```
 
@@ -452,7 +448,7 @@ This is the standard framework data flow: the first page load gets data through 
 
 2. **View source.** The HTML still contains a `<script>` tag with `window.__EIGEN_DATA__` for the initial load — same pattern as [Next.js](https://nextjs.org)'s `__NEXT_DATA__`. Subsequent navigations don't need this; they hit the data endpoint.
 
-3. **The loader never appears in the client bundle.** Because the client branch of [`eigen/routes`](/02-route-discovery-plugin#plugin-hooks) doesn't import loaders, Vite's tree-shaking eliminates them entirely. Visit `/__inspect/` (from [Part 2](/02-route-discovery-plugin#what-to-observe)) and inspect the client version of the virtual module — the `loader` references are gone. The full production check comes in [Part 6](/06-production-builds).
+3. **The loader still reaches the browser.** The client branch of [`eigen/routes`](/02-route-discovery-plugin#plugin-hooks) never reads `loader`. But it loads each page with `React.lazy(() => import(...))`, and the browser receives the _whole_ page module. In the Network tab, click the request for `/src/pages/posts/[id].tsx` and you'll find the loader's `fetch("https://jsonplaceholder…")` in the response. The client never _calls_ it (the data comes from `/_eigen/data`), but the code ships. [Part 6](/06-production-builds) shows that production tree-shaking doesn't remove it either, and [Part 7](/07-transform-hook) fixes it.
 
 4. **The `defineLoader` path is type-checked.** Try `defineLoader('/nonexistent', ...)` in your editor — TypeScript reports an error because `/nonexistent` isn't a key of the generated `RouteParamsMap`. Now try `defineLoader('/posts/:id', async ({ params }) => ...)` and hover over `params` — TypeScript shows `{ id: string }`, derived entirely from the path string.
 
@@ -476,48 +472,48 @@ import { runLoader } from "../run-loader";
 import type { RouteDefinition } from "../types";
 
 const routes: RouteDefinition[] = [
-	{ path: "/", component: () => null },
-	{ path: "/about", component: () => null },
-	{
-		path: "/posts/:id",
-		component: () => null,
-		loader: async ({ params }) => ({
-			id: params.id,
-			title: `Post ${params.id}`,
-		}),
-	},
+  { path: "/", component: () => null },
+  { path: "/about", component: () => null },
+  {
+    path: "/posts/:id",
+    component: () => null,
+    loader: async ({ params }) => ({
+      id: params.id,
+      title: `Post ${params.id}`,
+    }),
+  },
 ];
 
 describe("runLoader", () => {
-	it("invokes the matched route's loader with extracted params", async () => {
-		const data = await runLoader("/posts/42", routes);
-		expect(data).toEqual({ id: "42", title: "Post 42" });
-	});
+  it("invokes the matched route's loader with extracted params", async () => {
+    const data = await runLoader("/posts/42", routes);
+    expect(data).toEqual({ id: "42", title: "Post 42" });
+  });
 
-	it("returns null when the matched route has no loader", async () => {
-		expect(await runLoader("/about", routes)).toBeNull();
-	});
+  it("returns null when the matched route has no loader", async () => {
+    expect(await runLoader("/about", routes)).toBeNull();
+  });
 
-	it("returns null when no route matches", async () => {
-		expect(await runLoader("/nonexistent", routes)).toBeNull();
-	});
+  it("returns null when no route matches", async () => {
+    expect(await runLoader("/nonexistent", routes)).toBeNull();
+  });
 
-	it("propagates loader errors to the caller", async () => {
-		const failing: RouteDefinition[] = [
-			{
-				path: "/boom",
-				component: () => null,
-				loader: async () => {
-					throw new Error("loader failed");
-				},
-			},
-		];
-		await expect(runLoader("/boom", failing)).rejects.toThrow("loader failed");
-	});
+  it("propagates loader errors to the caller", async () => {
+    const failing: RouteDefinition[] = [
+      {
+        path: "/boom",
+        component: () => null,
+        loader: async () => {
+          throw new Error("loader failed");
+        },
+      },
+    ];
+    await expect(runLoader("/boom", failing)).rejects.toThrow("loader failed");
+  });
 });
 ```
 
-The error-propagation test matters more than it looks: the data endpoint relies on errors bubbling up so its `try`/`catch` can return a 500 response and `ssrFixStacktrace` can rewrite the trace. If `runLoader` ever swallowed errors silently, the endpoint would respond with `null` and the client would render an empty page with no clue why.
+The error-propagation test matters more than it looks: the data endpoint relies on errors bubbling up so its `try`/`catch` can log the source-mapped trace and return a 500 response. If `runLoader` ever swallowed errors silently, the endpoint would respond with `null` and the client would render an empty page with no clue why.
 
 Run with `pnpm vitest run packages/`.
 
@@ -528,7 +524,8 @@ Run with `pnpm vitest run packages/`.
 - [TypeScript `satisfies` Operator](https://www.typescriptlang.org/docs/handbook/release-notes/typescript-4-9.html#the-satisfies-operator) — The TypeScript 4.9 feature that enables constrained type inference without widening.
 - [TypeScript Utility Types](https://www.typescriptlang.org/docs/handbook/utility-types.html) — Reference for `ReturnType`, `Awaited`, and other built-in utility types used in loader type inference.
 - [TanStack Router Code Generation](https://tanstack.com/router/latest/docs/framework/react/guide/code-generation) — How TanStack Router generates fully typed route trees, eliminating manual type annotations entirely.
-- [Remix Data Loading](https://remix.run/docs/en/main/guides/data-loading) — Remix's approach to typed loaders using `useLoaderData<typeof loader>()`.
+- [Remix Data Loading](https://remix.run/docs/en/main/guides/data-loading) — Remix v2's approach to typed loaders using `useLoaderData<typeof loader>()`.
+- [Vite Environment API for Frameworks](https://vite.dev/guide/api-environment-frameworks) — `RunnableDevEnvironment`, `isRunnableDevEnvironment`, and `runner.import()`, the module-runner API the data endpoint uses.
 - [Next.js `getServerSideProps`](https://nextjs.org/docs/pages/building-your-application/data-fetching/get-server-side-props) — The Pages Router equivalent of the loader pattern, including the `/_next/data/...` endpoint that inspired our `/_eigen/data` design.
 - [Vite Plugin API: `configureServer`](https://vite.dev/guide/api-plugin#configureserver) — The hook used to register the client-side data fetching endpoint as Connect-style middleware.
 

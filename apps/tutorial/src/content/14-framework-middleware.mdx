@@ -1,6 +1,6 @@
 ---
 title: "Part 14: Framework Middleware"
-description: "The middleware chain pattern, typed context accumulation, and beforeLoad hooks."
+description: "The middleware chain pattern, typed context accumulation, and running guards before every loader."
 concepts:
   - "the middleware chain pattern"
   - "typed context accumulation"
@@ -8,24 +8,24 @@ concepts:
   - "auth guards"
 ---
 
-
-*This is the fourteenth installment in a series where we build a toy Next.js on top of Vite. In [Part 13](/13-nested-layouts), we built nested layouts. Now we'll implement a framework-level middleware system — a typed request pipeline that runs before loaders and route handlers, enabling authentication, redirects, context injection, and request transformation.*
+_This is the fifteenth installment in a series where we build a toy Next.js on top of Vite. In [Part 13](/13-nested-layouts), we built nested layouts. Now we'll implement a framework-level middleware system — a typed request pipeline that runs before loaders, enabling authentication, redirects, and context injection._
 
 ---
 
 ## Framework middleware vs. `configureServer` middleware
 
-In Part 8, we used `configureServer` to add Express-style middleware to the dev server. That middleware operates at the HTTP level — it receives raw `req`/`res` objects and runs for every request, including static assets.
+In [Part 8](/08-dev-middleware), we used `configureServer` to add Connect-style middleware to the dev server. That middleware operates at the HTTP level — it receives raw Node `req`/`res` objects, runs for every request (including static assets), and doesn't exist in production.
 
-Framework middleware is different. It runs inside the framework's routing pipeline — *after* route matching but *before* loaders and rendering. It has access to the matched route, its params, and can inject typed context that flows through to loaders and components.
+Framework middleware is different. It runs inside the framework's routing pipeline — _after_ route matching but _before_ loaders and rendering. It receives a web-standard `Request` plus the matched route's params, it runs identically in dev and production, and it can inject typed context that flows through to loaders.
 
 ```mermaid
 flowchart TD
-    A["HTTP Request"] --> B["Vite static asset handling\n(CSS, JS, images)"]
+    A["HTTP Request\n(page or /_eigen/data)"] --> B["Vite static asset handling\n(CSS, JS, images)"]
     B -->|"not a static asset"| C["Route matching"]
-    C -->|"matched route found"| D["Framework middleware chain"]
-    D -->|"context accumulated,\nno redirect thrown"| E["Layout loaders → Page loader"]
-    E --> F["Render → Response"]
+    C -->|"matched route found"| D["Framework middleware chain\n(global, then per-route)"]
+    D -->|"context accumulated,\nno Response returned or redirect thrown"| E["Layout loaders → Page loader"]
+    E --> F["Render HTML or return JSON"]
+    D -->|"Response / redirect"| G["Short-circuit"]
 
     style D fill:#4f46e5,color:#fff,stroke:#6366f1,stroke-width:2px
 ```
@@ -34,127 +34,232 @@ flowchart TD
 
 ## The middleware type system
 
-The key design challenge: each middleware function can add properties to a context object, and downstream middleware and loaders should *see* those added properties in their types. This requires TypeScript to accumulate types through the chain.
+The key design challenge: each middleware function can add properties to a context object, and downstream middleware and loaders should _see_ those added properties in their types.
+
+The base context lives in `eigen/types`, next to the loader types from [Part 5](/05-typed-loaders):
+
+```typescript title="packages/eigen/types.ts"
+/** What the framework knows before any middleware has run */
+export interface BaseContext {
+  request: Request;
+  params: Record<string, string>;
+  pathname: string;
+}
+
+/**
+ * The context loaders receive: BaseContext plus whatever global
+ * middleware adds. Empty by default — applications augment it.
+ */
+export interface EigenContext extends BaseContext {}
+
+// Loaders now receive the context alongside their params
+export type LoaderFn<TPath extends string, TData = unknown> = (args: {
+  params: RouteParams<TPath>;
+  ctx: EigenContext;
+}) => Promise<TData> | TData;
+
+export interface RouteDefinition {
+  path: string;
+  component: React.ComponentType<Record<string, unknown>>;
+  loader?: (args: {
+    params: Record<string, string>;
+    ctx: EigenContext; // [!code ++]
+  }) => Promise<unknown> | unknown;
+  layouts: LayoutDefinition[];
+  middleware?: MiddlewareFn<any, any>[]; // [!code ++]
+}
+```
+
+[Part 13](/13-nested-layouts)'s `LayoutDefinition` types its loader as `RouteDefinition['loader']`, so layout loaders receive `ctx` too. `RouteDefinition` refers to `MiddlewareFn`, so `types.ts` needs `import type { MiddlewareFn } from './middleware'` at the top. `defineLoader` from [Part 5](/05-typed-loaders) gets the same `ctx` argument:
+
+```typescript title="packages/eigen/helpers.ts"
+export function defineLoader<TPath extends keyof RouteParamsMap, TData>(
+  _path: TPath,
+  fn: (args: { params: RouteParamsMap[TPath]; ctx: EigenContext }) => Promise<TData> | TData,
+): (args: { params: RouteParamsMap[TPath]; ctx: EigenContext }) => Promise<TData> | TData {
+  return fn;
+}
+```
+
+The middleware module itself:
 
 ```typescript title="packages/eigen/middleware.ts"
-/** Base context available to all middleware */
-export interface BaseContext {
-  request: Request
-  params: Record<string, string>
-  pathname: string
-}
+import type { BaseContext, EigenContext } from "./types";
 
-/** A middleware function that can extend the context */
+/**
+ * A middleware function. It can:
+ *  - return an object  → merged into the context for later middleware and loaders
+ *  - return a Response → short-circuits the pipeline (e.g. a 429)
+ *  - return nothing    → passes through unchanged
+ *  - throw redirect()  → short-circuits with a redirect
+ */
 export type MiddlewareFn<
-  TInput extends BaseContext = BaseContext,
-  TOutput extends Record<string, unknown> = Record<string, never>,
-> = (ctx: TInput, next: () => Promise<Response>) => Promise<Response | TOutput>
+  TIn extends BaseContext = BaseContext,
+  TOut extends Record<string, unknown> = Record<string, unknown>,
+> = (ctx: TIn) => Promise<TOut | Response | void> | TOut | Response | void;
 
-/** 
- * Define middleware with typed context extension.
- * The return value of the handler is merged into the context
- * for downstream middleware and loaders.
+/**
+ * Identity function that exists for inference: TOut is inferred from
+ * what the handler returns, TIn from an annotated `ctx` parameter.
  */
-export function defineMiddleware<TOutput extends Record<string, unknown>>(
-  handler: MiddlewareFn<BaseContext, TOutput>,
-): MiddlewareFn<BaseContext, TOutput> {
-  return handler
+export function defineMiddleware<TOut extends Record<string, unknown> = {}, TIn extends BaseContext = BaseContext>(
+  handler: MiddlewareFn<TIn, TOut>,
+): MiddlewareFn<TIn, TOut> {
+  return handler;
 }
 
-/** 
- * A redirect response that middleware can throw to short-circuit
- * the pipeline and redirect the user.
- */
+type RedirectStatus = 301 | 302 | 303 | 307 | 308;
+
+/** Thrown by redirect() to short-circuit middleware or a loader */
 export class RedirectResponse {
   constructor(
     public readonly url: string,
-    public readonly status: 301 | 302 | 303 | 307 | 308 = 302,
+    public readonly status: RedirectStatus = 302,
   ) {}
+
+  toResponse(): Response {
+    // Not Response.redirect(): it requires an absolute URL and throws
+    // "Failed to parse URL" for '/login' on the server.
+    return new Response(null, { status: this.status, headers: { Location: this.url } });
+  }
 }
 
-export function redirect(url: string, status?: 301 | 302 | 303 | 307 | 308): never {
-  throw new RedirectResponse(url, status)
+export function redirect(url: string, status: RedirectStatus = 302): never {
+  throw new RedirectResponse(url, status);
+}
+
+export async function executeMiddleware(
+  middlewares: MiddlewareFn<any, any>[],
+  baseCtx: BaseContext,
+): Promise<{ context: EigenContext; response?: Response }> {
+  let context = { ...baseCtx } as EigenContext;
+
+  for (const mw of middlewares) {
+    try {
+      const result = await mw(context);
+
+      if (result instanceof Response) {
+        // Middleware answered the request itself (e.g. rate limiter 429)
+        return { context, response: result };
+      }
+
+      if (result && typeof result === "object") {
+        // Merge returned properties into the context
+        context = { ...context, ...result };
+      }
+    } catch (e) {
+      if (e instanceof RedirectResponse) {
+        return { context, response: e.toResponse() };
+      }
+      throw e;
+    }
+  }
+
+  return { context };
+}
+
+/**
+ * fetch() can't expose a redirect's Location header to client code, so JSON
+ * endpoints (/_eigen/data, server functions) turn redirects into a header
+ * the client acts on.
+ */
+export function asClientRedirect(response: Response): Response {
+  const location = response.headers.get("Location");
+  if (response.status >= 300 && response.status < 400 && location) {
+    return new Response(null, { status: 204, headers: { "X-Eigen-Redirect": location } });
+  }
+  return response;
 }
 ```
+
+There's deliberately no `next()` argument. An onion-style `next()` (Koa, Hono) lets middleware wrap the _rest_ of the request — but in this pipeline "the rest" is the loader and the render, which the framework calls after the chain finishes. A `next()` that resolves before the real work happens would be a trap: timing measured around it would be zero, and headers set on its return value would never reach the client. Concerns that genuinely need to wrap the whole request (timing, tracing) belong at the server level, which is where [Part 20](/20-observability) puts them.
 
 ---
 
 ## Concrete middleware examples
 
-### Authentication middleware
+### Reading cookies
 
-```typescript title="src/middleware/auth.ts"
-import { defineMiddleware, redirect } from 'eigen/middleware'
-import { verifySession } from '../lib/auth'
+Middleware works with web-standard `Request` objects, so we need a small cookie reader. It lives in the framework so later parts (like [Part 33](/33-authentication-authorization)) can reuse it:
 
-export const authMiddleware = defineMiddleware(async (ctx) => {
-  const sessionToken = getCookie(ctx.request, 'session')
-
-  if (!sessionToken) {
-    redirect('/login')
+```typescript title="packages/eigen/cookies.ts"
+export function getCookie(request: Request, name: string): string | undefined {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // Anchor on start-of-header or "; " so 'session' doesn't match 'xsession=...'
+  const match = request.headers.get("cookie")?.match(new RegExp(`(?:^|;\\s*)${escaped}=([^;]*)`));
+  if (!match) return undefined;
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return match[1];
   }
-
-  const user = await verifySession(sessionToken)
-  if (!user) {
-    redirect('/login')
-  }
-
-  // Return value is merged into context — downstream middleware
-  // and loaders can access ctx.user with full types
-  return { user }
-})
-
-function getCookie(request: Request, name: string): string | undefined {
-  const cookies = request.headers.get('cookie') ?? ''
-  const match = cookies.match(new RegExp(`${name}=([^;]+)`))
-  return match?.[1]
 }
+```
+
+Register `eigen/middleware` and `eigen/cookies` in `resolve.alias` and tsconfig `paths`, the same way as the other framework modules.
+
+### Session middleware (global)
+
+```typescript title="src/middleware/session.ts"
+import { defineMiddleware } from "eigen/middleware";
+import { getCookie } from "eigen/cookies";
+import { verifySession } from "../lib/auth"; // (token: string) => Promise<User | null>
+
+export const sessionMiddleware = defineMiddleware(async (ctx) => {
+  const token = getCookie(ctx.request, "session");
+  const user = token ? await verifySession(token) : null;
+
+  // Merged into the context: everything downstream sees ctx.user
+  return { user };
+});
+```
+
+### Auth guard (per-route)
+
+```typescript title="src/middleware/require-auth.ts"
+import { defineMiddleware, redirect } from "eigen/middleware";
+import type { EigenContext } from "eigen/types";
+
+// Annotating ctx as EigenContext tells TypeScript this middleware
+// runs after the session middleware, so ctx.user exists.
+export const requireAuth = defineMiddleware((ctx: EigenContext) => {
+  if (!ctx.user) {
+    redirect(`/login?returnTo=${encodeURIComponent(ctx.pathname)}`);
+  }
+});
 ```
 
 ### Rate limiting middleware
 
 ```typescript title="src/middleware/rate-limit.ts"
-import { defineMiddleware } from 'eigen/middleware'
+import { defineMiddleware } from "eigen/middleware";
 
-const requestCounts = new Map<string, { count: number; resetAt: number }>()
+const requestCounts = new Map<string, { count: number; resetAt: number }>();
 
-export const rateLimitMiddleware = defineMiddleware(async (ctx, next) => {
-  const ip = ctx.request.headers.get('x-forwarded-for') ?? 'unknown'
-  const now = Date.now()
+export const rateLimitMiddleware = defineMiddleware((ctx) => {
+  // x-forwarded-for is client-controlled unless your proxy overwrites it.
+  // In production, use the header your platform guarantees.
+  const ip = ctx.request.headers.get("x-forwarded-for")?.split(",")[0].trim() ?? "unknown";
+  const now = Date.now();
 
-  const entry = requestCounts.get(ip)
-  if (entry && entry.resetAt > now && entry.count >= 100) {
-    return new Response('Too Many Requests', { status: 429 })
-  }
-
+  const entry = requestCounts.get(ip);
   if (!entry || entry.resetAt <= now) {
-    requestCounts.set(ip, { count: 1, resetAt: now + 60_000 })
-  } else {
-    entry.count++
+    requestCounts.set(ip, { count: 1, resetAt: now + 60_000 });
+    return;
   }
 
-  return next()
-})
-```
-
-### Request timing middleware
-
-```typescript title="src/middleware/timing.ts"
-import { defineMiddleware } from 'eigen/middleware'
-
-export const timingMiddleware = defineMiddleware(async (ctx, next) => {
-  const start = performance.now()
-  const response = await next()
-  const duration = performance.now() - start
-
-  // Add Server-Timing header for DevTools
-  if (response instanceof Response) {
-    response.headers.set('Server-Timing', `total;dur=${duration.toFixed(1)}`)
+  entry.count++;
+  if (entry.count > 100) {
+    return new Response("Too Many Requests", {
+      status: 429,
+      headers: { "Retry-After": String(Math.ceil((entry.resetAt - now) / 1000)) },
+    });
   }
-
-  return { requestDuration: duration }
-})
+  // Returning nothing passes control to the next middleware
+});
 ```
+
+An in-memory `Map` is per-process — fine for a single Node server, useless across serverless instances. Production rate limiting uses a shared store.
 
 ---
 
@@ -162,182 +267,390 @@ export const timingMiddleware = defineMiddleware(async (ctx, next) => {
 
 ### Global middleware
 
-Global middleware runs on every route. It's registered in the framework configuration:
+Global middleware runs on every route. It's an ordered array exported from `src/middleware.ts`:
 
 ```typescript title="src/middleware.ts"
-import { authMiddleware } from './middleware/auth'
-import { timingMiddleware } from './middleware/timing'
+import { rateLimitMiddleware } from "./middleware/rate-limit";
+import { sessionMiddleware } from "./middleware/session";
 
-// Export an ordered array — middleware runs in this sequence
-export default [timingMiddleware, authMiddleware]
+// Runs in this order, before any per-route middleware
+export default [rateLimitMiddleware, sessionMiddleware];
 ```
 
-The route plugin discovers this file and generates a virtual module that wires middleware into the rendering pipeline:
+The route plugin from [Part 2](/02-route-discovery-plugin) picks this file up in its SSR branch and exposes it from `eigen/routes`, alongside each page's `middleware` export:
 
-```typescript
-// In the route plugin's load() hook — middleware integration
-if (id === resolvedVirtualModuleId) {
-  // Check if src/middleware.ts exists
-  const hasGlobalMiddleware = existsSync(resolve(pagesDir, '../middleware.ts'))
+```typescript title="plugins/eigen-routes.ts"
+// In the load() hook, SSR branch. `root` is config.root from configResolved.
+const hasGlobalMiddleware = existsSync(resolve(root, "src/middleware.ts"));
 
-  const middlewareImport = hasGlobalMiddleware
-    ? `import globalMiddleware from '/src/middleware.ts'`
-    : `const globalMiddleware = []`
-
-  return `
-    ${middlewareImport}
-    ${routeImports}
-    export const routes = [${routeEntries}]
-    export { globalMiddleware }
-  `
-}
+return [
+  hasGlobalMiddleware ? `import globalMiddlewareList from '/src/middleware.ts'` : `const globalMiddlewareList = []`,
+  ...routes.map((r, i) => `import * as RouteMod${i} from '${r.componentPath}'`),
+  `export const globalMiddleware = globalMiddlewareList`,
+  `export const routes = [`,
+  ...routes.map(
+    (r, i) =>
+      `  { path: '${r.path}', component: RouteMod${i}.default, loader: RouteMod${i}.loader, middleware: RouteMod${i}.middleware },`,
+  ),
+  `]`,
+].join("\n");
 ```
+
+Add `export const globalMiddleware: MiddlewareFn<any, any>[]` to the `eigen/routes` declaration. Creating `src/middleware.ts` while the dev server is running requires a restart (or a watcher that invalidates `eigen/routes`, as in [Part 9](/09-hmr)).
 
 ### Per-route middleware
 
-Individual routes can declare their own middleware via a `middleware` export:
+Individual routes declare their own middleware via a `middleware` export. [Part 7](/07-transform-hook)'s transform strips `middleware` from the client bundle, along with `loader` — so `verifySession` and anything else it imports never reach the browser.
 
 ```tsx title="src/pages/dashboard/index.tsx"
-import { authMiddleware } from '../../middleware/auth'
+import { defineLoader } from "eigen/helpers";
+import { redirect } from "eigen/middleware";
+import { requireAuth } from "../../middleware/require-auth";
 
-export const middleware = [authMiddleware]
+export const middleware = [requireAuth];
 
-export const loader = defineLoader('/dashboard', async ({ params, ctx }) => {
-  // ctx.user is typed — it was added by authMiddleware
-  const dashboardData = await getDashboardForUser(ctx.user.id)
-  return dashboardData
-})
+export const loader = defineLoader("/dashboard", async ({ ctx }) => {
+  // ctx: EigenContext — request, params, pathname, and user (see below).
+  // requireAuth already redirected anonymous visitors; `?? redirect()`
+  // narrows User | null to User for the type checker, and is a second
+  // line of defense if someone removes the middleware.
+  const user = ctx.user ?? redirect("/login");
+  return getDashboardForUser(user.id);
+});
 ```
+
+`redirect()` returns `never`, so `ctx.user ?? redirect('/login')` has type `User`. Loaders can throw `redirect()` too — the pipeline below catches it the same way.
+
+---
+
+## Typing the context: module augmentation
+
+How does the loader above know `ctx.user` exists? Global middleware runs on every route, so whatever it adds is safe to promise to every loader. The application declares that promise by augmenting `EigenContext`:
+
+```typescript title="src/eigen-context.d.ts"
+import type { User } from "./lib/auth";
+
+declare module "eigen/types" {
+  interface EigenContext {
+    user: User | null;
+  }
+}
+```
+
+<TypeDeepDive title="TypeScript: Declaration merging and module augmentation">
+
+Interfaces in TypeScript are _open_: two `interface EigenContext` declarations in the same module merge into one. `declare module 'eigen/types' { ... }` reopens a module from the outside, so an application can add properties to an interface the framework owns without editing the framework. The `.d.ts` file must itself be a module (it has an `import`), otherwise the `declare module` block would _declare_ a new ambient module instead of augmenting the existing one. This is the same mechanism Vite uses for `ImportMetaEnv` and that Express users use to add `req.user`. The framework only defines the empty interface; every reference to `EigenContext` — in `defineLoader`, in `executeMiddleware`'s return type — picks up the merged shape.
+
+</TypeDeepDive>
+
+The augmentation is a claim, not a proof: nothing checks that `src/middleware.ts` actually adds `user`. The typed chain builder below closes that gap.
 
 ---
 
 ## The middleware execution engine
 
-The server entry runs middleware before calling loaders:
+Middleware has to run before _every_ loader call — not just the HTML render. In [Part 5](/05-typed-loaders#the-data-endpoint), client-side navigations fetch loader data from `/_eigen/data`, which called `runLoader` directly. If middleware only ran inside the page render, an anonymous user could skip the auth guard by requesting `/_eigen/data?path=/dashboard`. So both paths go through one function, `runRoute`, which replaces `runLoader`. It lives in the framework package next to the other runtime modules (register `eigen/run-route` in `resolve.alias` and tsconfig `paths`):
 
-```typescript title="entry-server.tsx"
-export async function executeMiddleware(
-  middlewares: MiddlewareFn[],
-  baseCtx: BaseContext,
-): Promise<{ context: Record<string, unknown>; response?: Response }> {
-  let accumulatedContext: Record<string, unknown> = { ...baseCtx }
+```typescript title="packages/eigen/run-route.ts"
+import type { RouteMatch } from "eigen/match-route";
+import { globalMiddleware } from "eigen/routes";
+import { executeMiddleware, RedirectResponse } from "./middleware";
+import { loadRouteData, type RouteData } from "./route-data";
+import type { EigenContext } from "./types";
 
-  for (const mw of middlewares) {
-    try {
-      const result = await mw(accumulatedContext as any, async () => {
-        // next() — continue to the next middleware
-        return new Response() // placeholder
-      })
+export type RouteResult = { response: Response } | { data: RouteData; context: EigenContext };
 
-      if (result instanceof Response) {
-        // Middleware returned a Response directly (e.g., rate limiter 429)
-        return { context: accumulatedContext, response: result }
-      }
-
-      if (result && typeof result === 'object') {
-        // Merge returned properties into context
-        accumulatedContext = { ...accumulatedContext, ...result }
-      }
-    } catch (e) {
-      if (e instanceof RedirectResponse) {
-        return {
-          context: accumulatedContext,
-          response: Response.redirect(e.url, e.status),
-        }
-      }
-      throw e
-    }
-  }
-
-  return { context: accumulatedContext }
-}
-
-export async function render(pathname: string, request: Request) {
-  const match = matchRoute(pathname)
-  if (!match) return { html: '<h1>404</h1>', status: 404, data: null }
-
-  // Combine global + route-specific middleware
-  const allMiddleware = [
-    ...globalMiddleware,
-    ...(match.route.middleware ?? []),
-  ]
-
-  // Execute the middleware chain
-  const { context, response } = await executeMiddleware(allMiddleware, {
+/**
+ * Middleware (global, then per-route), then every loader in the matched
+ * layout stack. Shared by the page render and the /_eigen/data endpoint.
+ * Deferred values in `data` are still promises — callers resolve them.
+ */
+export async function runRoute(match: RouteMatch, request: Request): Promise<RouteResult> {
+  const { context, response } = await executeMiddleware([...globalMiddleware, ...(match.route.middleware ?? [])], {
     request,
     params: match.params,
-    pathname,
-  })
+    pathname: new URL(request.url).pathname,
+  });
+  if (response) return { response };
 
-  // If middleware returned a Response (redirect, error), send it directly
-  if (response) {
-    return { response }
+  try {
+    return { data: await loadRouteData(match, context), context };
+  } catch (e) {
+    // Loaders may throw redirect() too
+    if (e instanceof RedirectResponse) return { response: e.toResponse() };
+    throw e;
   }
-
-  // Pass the accumulated context to the loader
-  let data: unknown = null
-  if (match.route.loader) {
-    data = await match.route.loader({ params: match.params, ctx: context })
-  }
-
-  const html = renderToString(
-    <match.route.component params={match.params} data={data} />,
-  )
-  return { html, status: 200, data }
 }
+```
+
+`loadRouteData` from [Part 13](/13-nested-layouts#the-layout-loader-pipeline) gains a `ctx` parameter and hands it to every loader in the stack, layouts included. The loaders still run in parallel — they all start after the middleware has finished, because they all depend on its context:
+
+```typescript title="packages/eigen/route-data.ts"
+import type { EigenContext } from './types' // [!code ++]
+
+export async function loadRouteData({ route, params }: RouteMatch): Promise<RouteData> { // [!code --]
+export async function loadRouteData( // [!code ++]
+  { route, params }: RouteMatch, // [!code ++]
+  ctx: EigenContext, // [!code ++]
+): Promise<RouteData> { // [!code ++]
+  // Every loader in the stack runs concurrently
+  const [layoutEntries, page] = await Promise.all([
+    Promise.all(
+      route.layouts.map(async (layout) =>
+        [layout.path, layout.loader ? await layout.loader({ params }) : null] as const, // [!code --]
+        [layout.path, layout.loader ? await layout.loader({ params, ctx }) : null] as const, // [!code ++]
+      ),
+    ),
+    route.loader ? route.loader({ params }) : null, // [!code --]
+    route.loader ? route.loader({ params, ctx }) : null, // [!code ++]
+  ])
+  return { layouts: Object.fromEntries(layoutEntries), page }
+}
+```
+
+`eigen/routes` is a virtual module, so `run-route.ts` only works inside a Vite-processed module graph — the SSR environment in dev, the server bundle in production. That's exactly where it runs. The server entry uses it for both the streaming page render from [Part 12](/12-streaming-ssr) and the data endpoint. `renderStream` now takes the whole `Request` instead of a pathname, because middleware needs headers and cookies:
+
+```tsx title="src/entry-server.tsx"
+import { renderToString } from "react-dom/server";
+import { matchRoute } from "eigen/match-route";
+import { routes } from "eigen/routes";
+import { asClientRedirect } from "eigen/middleware";
+import { resolveRouteData, type RouteData } from "eigen/route-data";
+import { runRoute } from "eigen/run-route";
+
+export async function renderStream( // [!code ++]
+  request: Request, // [!code ++]
+  { template, waitForAll = false }: StreamOptions, // [!code ++]
+): Promise<Response> {
+  // [!code ++]
+  const pathname = new URL(request.url).pathname; // [!code ++]
+  const match = matchRoute(pathname, routes);
+
+  let data: RouteData | null = null; // [!code ++]
+  if (match) {
+    // [!code ++]
+    const result = await runRoute(match, request); // [!code ++]
+    // Middleware returned a Response (redirect, 429, ...) — send it as-is // [!code ++]
+    if ("response" in result) return result.response; // [!code ++]
+    data = result.data; // [!code ++]
+  } // [!code ++]
+
+  // ...unchanged from Parts 12 and 13: render <App pathname={pathname} data={data} />
+  // to a stream, and resolve deferred values with resolveRouteData() in flush()
+}
+
+export type RenderResult = { response: Response } | { html: string; status: number; data: RouteData | null };
+
+/**
+ * Non-streaming variant on the same pipeline: the middleware's Response,
+ * or the rendered HTML plus fully resolved RouteData.
+ */
+export async function render(request: Request): Promise<RenderResult> {
+  const pathname = new URL(request.url).pathname;
+  const match = matchRoute(pathname, routes);
+  if (!match) {
+    return { html: renderToString(<App pathname={pathname} data={null} />), status: 404, data: null };
+  }
+
+  const result = await runRoute(match, request);
+  if ("response" in result) return result;
+
+  // Resolve deferred values first: renderToString can't wait for Suspense data
+  const data = await resolveRouteData(result.data);
+  return { html: renderToString(<App pathname={pathname} data={data} />), status: 200, data };
+}
+
+/** The /_eigen/data endpoint: same pipeline, JSON instead of HTML */
+export async function loadData(request: Request): Promise<Response> {
+  const url = new URL(request.url);
+  const pathname = url.searchParams.get("path") ?? "/";
+  const match = matchRoute(pathname, routes);
+  if (!match) return Response.json(null, { status: 404 });
+
+  // Run the route as if the browser had requested `pathname` itself,
+  // with the same cookies and headers
+  const result = await runRoute(match, new Request(new URL(pathname, url), { headers: request.headers }));
+  if ("response" in result) return asClientRedirect(result.response);
+  return Response.json(await resolveRouteData(result.data));
+}
+```
+
+Both outputs keep [Part 13](/13-nested-layouts)'s `RouteData` shape — `{ layouts: { '/': ..., '/dashboard': ... }, page: ... }` — in `window.__EIGEN_DATA__` and in the `/_eigen/data` response. The only difference middleware makes to callers is that `renderStream` may return a redirect or a `429` instead of HTML; since it returns a `Response` either way, servers simply return it.
+
+`renderStream` is the primary path: servers and adapters use it. `render(request)` runs the same `runRoute` but returns a `RenderResult` — either the middleware's `{ response }` or `{ html, status, data }` — and tests and the Deep Dive examples in later parts use it for brevity. Callers handle both branches with `if ('response' in result) return result.response`.
+
+`loadData` replaces `packages/eigen/run-loader.ts`, which can be deleted.
+
+### Wiring the endpoints
+
+In dev, the `/_eigen/data` middleware from [Part 5](/05-typed-loaders#the-data-endpoint) stops calling `runLoader` and delegates to `loadData` through the SSR environment's module runner. Connect hands us Node's `req`/`res`, so two small adapters convert to and from web `Request`/`Response`. The response side _streams_: it forwards each chunk as it arrives, so streaming SSR and server-sent events ([Part 27](/27-ai-streaming)) work through it, and it cancels the web stream when the client disconnects:
+
+```typescript title="packages/eigen/node-http.ts"
+import type { IncomingMessage, ServerResponse } from "node:http";
+
+export async function toWebRequest(req: IncomingMessage): Promise<Request> {
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(req.headers)) {
+    if (Array.isArray(value)) for (const v of value) headers.append(key, v);
+    else if (value !== undefined) headers.set(key, value);
+  }
+
+  let body: Uint8Array | undefined;
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    body = new Uint8Array(Buffer.concat(chunks));
+  }
+  return new Request(url, { method: req.method, headers, body });
+}
+
+export async function sendWebResponse(res: ServerResponse, response: Response): Promise<void> {
+  res.statusCode = response.status;
+  for (const [key, value] of response.headers) {
+    if (key !== "set-cookie") res.setHeader(key, value);
+  }
+  const cookies = response.headers.getSetCookie();
+  if (cookies.length > 0) res.setHeader("set-cookie", cookies);
+
+  if (!response.body) {
+    res.end();
+    return;
+  }
+
+  // Send headers now — an SSE client shouldn't wait for the first event
+  res.flushHeaders();
+
+  const reader = response.body.getReader();
+  // Client went away: cancel the source (aborts React's render, ends an SSE loop)
+  res.on("close", () => {
+    if (!res.writableFinished) reader.cancel().catch(() => {});
+  });
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done || res.destroyed) break;
+      // Respect backpressure: wait for the socket to drain (or close)
+      if (!res.write(value)) {
+        await new Promise<void>((resolve) => {
+          res.once("drain", resolve);
+          res.once("close", resolve);
+        });
+      }
+    }
+  } catch (e) {
+    if (!res.destroyed) console.error("Error while streaming response:", e);
+  } finally {
+    res.end();
+  }
+}
+```
+
+```typescript title="plugins/eigen-routes.ts"
+import { isRunnableDevEnvironment } from "vite";
+import { sendWebResponse, toWebRequest } from "../packages/eigen/node-http";
+
+// inside configureServer
+server.middlewares.use(async (req, res, next) => {
+  if (!req.url?.startsWith("/_eigen/data")) return next();
+  try {
+    const ssrEnv = server.environments.ssr;
+    if (!isRunnableDevEnvironment(ssrEnv)) throw new Error("SSR environment is not runnable");
+    const { loadData } = (await ssrEnv.runner.import("/src/entry-server.tsx")) as {
+      loadData: (request: Request) => Promise<Response>;
+    };
+    await sendWebResponse(res, await loadData(await toWebRequest(req)));
+  } catch (e) {
+    next(e);
+  }
+});
+```
+
+The H3 servers already speak `Request`/`Response`. In the dev server from [Part 12](/12-streaming-ssr), pass `event.req` instead of the pathname (`renderStream(event.req, { template, waitForAll: isBot(event.req) })`). In production:
+
+```typescript title="server.prod.ts"
+app.get("/_eigen/data", (event) => loadData(event.req));
+
+app.all("/**", (event) => renderStream(event.req, { template, waitForAll: isBot(event.req) }));
+```
+
+The client router follows redirects that come back from the data endpoint. `fetch()` would otherwise follow a 302 to `/login` silently and try to parse the login page's HTML as JSON:
+
+```tsx title="src/entry-client.tsx"
+const res = await fetch(`/_eigen/data?path=${encodeURIComponent(newPath)}`);
+const redirectTo = res.headers.get("X-Eigen-Redirect"); // [!code ++]
+if (redirectTo) {
+  // [!code ++]
+  window.location.assign(redirectTo); // [!code ++]
+  return; // [!code ++]
+} // [!code ++]
+setData(await res.json());
 ```
 
 ---
 
 ## Typed context accumulation
 
-The sophisticated version: TypeScript knows the accumulated context shape at each point in the chain.
+`EigenContext` describes what every loader can rely on. Inside the chain itself, we can do better: TypeScript can track the exact context shape at each step.
 
 ```typescript title="packages/eigen/middleware.ts"
-type ChainedMiddleware<TContext extends BaseContext> = {
-  use<TOutput extends Record<string, unknown>>(
+export type ChainedMiddleware<TContext extends BaseContext> = {
+  use<TOutput extends Record<string, unknown> = {}>(
     mw: MiddlewareFn<TContext, TOutput>,
-  ): ChainedMiddleware<TContext & TOutput>
-  build(): MiddlewareFn[]
-}
+  ): ChainedMiddleware<TContext & TOutput>;
+  build(): MiddlewareFn<any, any>[];
+};
+
+/** Extract the accumulated context type from a chain */
+export type ContextOf<T> = T extends ChainedMiddleware<infer C> ? C : never;
 
 export function createMiddlewareChain(): ChainedMiddleware<BaseContext> {
-  const middlewares: MiddlewareFn[] = []
+  const middlewares: MiddlewareFn<any, any>[] = [];
 
   const chain: ChainedMiddleware<any> = {
     use(mw) {
-      middlewares.push(mw)
-      return chain // Each .use() returns a chain with extended context type
+      middlewares.push(mw);
+      return chain; // Same object at runtime; a wider type at compile time
     },
     build() {
-      return middlewares
+      return middlewares;
     },
-  }
+  };
 
-  return chain
+  return chain;
 }
 ```
 
-Usage:
+Using it for the global middleware file:
 
 ```typescript title="src/middleware.ts"
-const chain = createMiddlewareChain()
-  .use(timingMiddleware)     // Context: BaseContext & { requestDuration: number }
-  .use(authMiddleware)       // Context: ... & { user: User }
-  .use(async (ctx) => {
-    // TypeScript knows ctx has: request, params, pathname, requestDuration, user
-    console.log(`User ${ctx.user.name} requested ${ctx.pathname}`)
-    return {}
-  })
+import { createMiddlewareChain, type ContextOf } from "eigen/middleware";
+import type { EigenContext } from "eigen/types";
+import { rateLimitMiddleware } from "./middleware/rate-limit";
+import { sessionMiddleware } from "./middleware/session";
 
-export default chain.build()
+const chain = createMiddlewareChain()
+  .use(rateLimitMiddleware) // Context: BaseContext
+  .use(sessionMiddleware) // Context: BaseContext & { user: User | null }
+  .use((ctx) => {
+    // TypeScript knows ctx has: request, params, pathname, user
+    console.log(`${ctx.user?.name ?? "anonymous"} requested ${ctx.pathname}`);
+  });
+
+// Compile-time proof that the chain delivers what EigenContext promises.
+// Remove sessionMiddleware above and this line stops compiling.
+type AssertAssignable<T extends U, U> = T;
+type _GlobalContextCheck = AssertAssignable<ContextOf<typeof chain>, EigenContext>;
+
+export default chain.build();
 ```
 
-Each `.use()` call returns a new chain type that includes the properties returned by the previous middleware. TypeScript tracks the accumulation through the chain. This is the same pattern TanStack Start uses in its `createServerFn().middleware([...])` builder API.
+Each `.use()` call returns a chain type that includes the properties returned by the previous middleware. This is the same idea as TanStack Start's `createMiddleware().server(...)` and `createServerFn().middleware([...])` builders, and tRPC's `.use()`.
 
 <TypeDeepDive title="TypeScript: Intersection types and type accumulation">
 
-The `ChainedMiddleware<TContext & TOutput>` return type uses an intersection (`&`) to merge the existing context with the new properties. Each `.use()` call adds to the intersection: after `timingMiddleware`, the context is `BaseContext & { requestDuration: number }`. After `authMiddleware`, it becomes `BaseContext & { requestDuration: number } & { user: User }`. TypeScript tracks this accumulation through the generic parameter, so by the third `.use()`, the callback's `ctx` parameter has all accumulated properties. This is how typed middleware chains provide autocomplete and type checking without runtime overhead — the chain builder's generic parameter carries the full context shape at each step.
+The `ChainedMiddleware<TContext & TOutput>` return type uses an intersection (`&`) to merge the existing context with the new properties. After `sessionMiddleware`, the context is `BaseContext & { user: User | null }`. The third `.use()` callback's `ctx` parameter is contextually typed from `MiddlewareFn<TContext, TOutput>`, so it gets every accumulated property without an annotation. A middleware that returns nothing has no inference candidate for `TOutput`, so it falls back to the `= {}` default and the context type is unchanged. `ContextOf` uses `infer` to pull the final `TContext` back out, and `AssertAssignable<T extends U, U>` turns "is this assignable?" into a compile error when it isn't — there's no runtime cost to any of it.
 
 </TypeDeepDive>
 
@@ -345,114 +658,147 @@ The `ChainedMiddleware<TContext & TOutput>` return type uses an intersection (`&
 
 ## The middleware ↔ server function interaction
 
-From our ILTA architecture review, we flagged that TanStack Start has a middleware double-execution issue: if middleware is registered both globally and in a server function's middleware array, it runs twice. Our design avoids this by keeping middleware execution in one place (the rendering pipeline) and passing the accumulated context *through* to server functions:
+[Part 15](/15-server-functions)'s server functions are requests too, so they get the same treatment. The RPC endpoint builds a `BaseContext` from the incoming `Request`, runs the _global_ middleware through the same `executeMiddleware`, and then runs only the server function's own middleware. Each piece of middleware is listed in exactly one place, so nothing runs twice, and the handler's `context` is typed from `EigenContext` plus whatever the function's own middleware adds:
 
 ```typescript
-// Server functions receive the middleware context automatically
-export const updatePost = createServerFn(async (
-  data: { title: string },
-  ctx: { user: User },  // ← Injected by the middleware chain
-) => {
-  // ctx.user is available without the server function
-  // needing to declare its own middleware
-  await db.query('UPDATE posts SET title = $1 WHERE author_id = $2',
-    [data.title, ctx.user.id],
-  )
-})
+export const updatePost = createServerFn({ method: "POST" })
+  .middleware([requireAuth])
+  .validator((input: unknown) => input as { title: string })
+  .handler(async ({ data, context }) => {
+    // context.user comes from the global session middleware
+    const user = context.user ?? redirect("/login");
+    await db.query("UPDATE posts SET title = $1 WHERE author_id = $2", [data.title, user.id]);
+  });
 ```
 
 ---
 
 ## What to observe
 
-1. **Add `console.log` to each middleware.** Watch the execution order in the terminal — they run in array order, before the loader.
+1. **Add `console.log` to each middleware.** Watch the execution order in the terminal — global middleware in array order, then the route's own, then the loader.
 
-2. **Remove the session cookie** and navigate to a protected route. The auth middleware redirects to `/login` before the loader runs — no database query is wasted.
+2. **Remove the session cookie** and navigate to `/dashboard`, both by typing the URL and by clicking a `Link`. Both are redirected to `/login` before the loader runs: the first by the HTML render, the second by `/_eigen/data` returning `X-Eigen-Redirect`.
 
-3. **Check the `Server-Timing` header** in DevTools (Network tab → response headers). The timing middleware adds the total request duration.
+3. **Request `/_eigen/data?path=/dashboard` directly** without a cookie. You get a `204` with `X-Eigen-Redirect`, not the dashboard data — the data endpoint runs the same guards as the page.
 
-4. **Hover over `ctx` in a loader** that runs after auth middleware. TypeScript shows `{ user: User; requestDuration: number; ... }` — the accumulated context from all middleware in the chain.
+4. **Hover over `ctx` in a loader.** TypeScript shows `EigenContext` with `user: User | null` from your augmentation. Delete `sessionMiddleware` from `src/middleware.ts` and the `_GlobalContextCheck` line turns red.
 
 ---
 
 ## Key insight
 
-Framework middleware is a typed function pipeline that runs between route matching and data loading. Unlike HTTP-level middleware (Part 8), it operates inside the framework's abstraction — it has access to matched routes, typed params, and can inject context that flows through to loaders with full type safety.
+Framework middleware is a typed function pipeline that runs between route matching and data loading. Unlike HTTP-level middleware ([Part 8](/08-dev-middleware)), it operates inside the framework's abstraction — it sees the matched route and its params, works on web-standard `Request`/`Response` so it runs anywhere, and injects context that flows to loaders with full type safety.
 
-The type accumulation pattern (each middleware extends the context type for downstream consumers) is the TypeScript equivalent of a functional pipeline. It's the same pattern used in tRPC's middleware, TanStack Start's server function middleware, and Express's `req` extension pattern — but with compile-time type tracking instead of runtime `req.user = ...` mutations.
+The security lesson is that "before loaders" must mean _every_ path to a loader. The HTML render and the JSON data endpoint share `runRoute` from `eigen/run-route`, and [Part 15](/15-server-functions)'s RPC endpoint reuses `executeMiddleware`. A guard that only some entry points run is not a guard.
+
+The type accumulation pattern (each middleware extends the context type for downstream consumers) is the TypeScript equivalent of a functional pipeline. It's the same pattern used in tRPC's middleware, TanStack Start's middleware, and Express's `req` extension pattern — but with compile-time type tracking instead of runtime `req.user = ...` mutations.
 
 ---
 
 <TestSection title="Testing: middleware chains">
 
-The middleware execution engine is pure async logic with no HTTP or Vite dependencies — test it directly. The `executeMiddleware` function is exported from `entry-server.tsx`, and the types and `RedirectResponse` class are exported from `packages/eigen/middleware.ts`:
+`executeMiddleware` and `getCookie` are pure functions over web-standard objects, with no HTTP server or Vite dependency — test them directly:
 
-```typescript title="src/__tests__/middleware.test.ts"
-import { describe, it, expect, vi } from 'vitest'
-import { executeMiddleware } from '../entry-server'
-import { RedirectResponse } from 'eigen/middleware'
-import type { BaseContext, MiddlewareFn } from 'eigen/middleware'
+```typescript title="packages/eigen/__tests__/middleware.test.ts"
+import { describe, it, expect, vi } from "vitest";
+import { executeMiddleware, redirect, type MiddlewareFn } from "eigen/middleware";
+import { getCookie } from "eigen/cookies";
+import type { BaseContext } from "eigen/types";
 
 function makeCtx(overrides?: Partial<BaseContext>): BaseContext {
   return {
-    request: new Request('http://localhost/'),
+    request: new Request("http://localhost/"),
     params: {},
-    pathname: '/',
+    pathname: "/",
     ...overrides,
-  }
+  };
 }
 
-describe('executeMiddleware', () => {
-  it('accumulates context from each middleware', async () => {
-    const mw1: MiddlewareFn = async () => ({ user: 'alice' })
-    const mw2: MiddlewareFn = async () => ({ role: 'admin' })
+describe("executeMiddleware", () => {
+  it("accumulates context from each middleware", async () => {
+    const mw1: MiddlewareFn = async () => ({ user: "alice" });
+    const mw2: MiddlewareFn = async () => ({ role: "admin" });
 
-    const { context } = await executeMiddleware([mw1, mw2], makeCtx())
+    const { context } = await executeMiddleware([mw1, mw2], makeCtx());
 
-    expect(context).toMatchObject({ user: 'alice', role: 'admin' })
-  })
+    expect(context).toMatchObject({ user: "alice", role: "admin" });
+  });
 
-  it('short-circuits on Response return', async () => {
-    const blocker: MiddlewareFn = async () =>
-      new Response('Forbidden', { status: 403 })
-    const shouldNotRun = vi.fn(async () => ({}))
+  it("lets later middleware read earlier output", async () => {
+    const mw1: MiddlewareFn = () => ({ user: "alice" });
+    const mw2: MiddlewareFn<BaseContext & { user: string }> = (ctx) => ({
+      greeting: `hi ${ctx.user}`,
+    });
 
-    const { response } = await executeMiddleware(
-      [blocker, shouldNotRun],
-      makeCtx(),
-    )
+    const { context } = await executeMiddleware([mw1, mw2], makeCtx());
 
-    expect(response?.status).toBe(403)
-    expect(shouldNotRun).not.toHaveBeenCalled()
-  })
+    expect(context).toMatchObject({ greeting: "hi alice" });
+  });
 
-  it('handles redirect throws', async () => {
-    const authGuard: MiddlewareFn = async () => {
-      throw new RedirectResponse('/login')
-    }
+  it("short-circuits on Response return", async () => {
+    const blocker: MiddlewareFn = async () => new Response("Forbidden", { status: 403 });
+    const shouldNotRun = vi.fn(async () => ({}));
 
-    const { response } = await executeMiddleware([authGuard], makeCtx())
+    const { response } = await executeMiddleware([blocker, shouldNotRun], makeCtx());
 
-    expect(response?.status).toBe(302)
-    expect(response?.headers.get('location')).toContain('/login')
-  })
+    expect(response?.status).toBe(403);
+    expect(shouldNotRun).not.toHaveBeenCalled();
+  });
 
-  it('runs middleware in order', async () => {
-    const order: string[] = []
-    const mw1: MiddlewareFn = async () => { order.push('first'); return {} }
-    const mw2: MiddlewareFn = async () => { order.push('second'); return {} }
+  it("passes through when middleware returns nothing", async () => {
+    const noop: MiddlewareFn = () => {};
 
-    await executeMiddleware([mw1, mw2], makeCtx())
+    const { context, response } = await executeMiddleware([noop], makeCtx());
 
-    expect(order).toEqual(['first', 'second'])
-  })
-})
+    expect(response).toBeUndefined();
+    expect(context.pathname).toBe("/");
+  });
+
+  it("turns a thrown redirect into a relative-URL redirect response", async () => {
+    const authGuard: MiddlewareFn = () => redirect("/login");
+
+    const { response } = await executeMiddleware([authGuard], makeCtx());
+
+    expect(response?.status).toBe(302);
+    expect(response?.headers.get("location")).toBe("/login");
+  });
+
+  it("runs middleware in order", async () => {
+    const order: string[] = [];
+    const mw1: MiddlewareFn = () => {
+      order.push("first");
+    };
+    const mw2: MiddlewareFn = () => {
+      order.push("second");
+    };
+
+    await executeMiddleware([mw1, mw2], makeCtx());
+
+    expect(order).toEqual(["first", "second"]);
+  });
+});
+
+describe("getCookie", () => {
+  const req = (cookie: string) => new Request("http://localhost/", { headers: { cookie } });
+
+  it("matches whole cookie names only", () => {
+    expect(getCookie(req("xsession=evil; session=good"), "session")).toBe("good");
+  });
+
+  it("decodes values", () => {
+    expect(getCookie(req("name=a%20b"), "name")).toBe("a b");
+  });
+
+  it("returns undefined when missing", () => {
+    expect(getCookie(req("other=1"), "session")).toBeUndefined();
+  });
+});
 ```
 
-The test for short-circuiting is especially important — it verifies that an auth guard (returning a 403 or redirecting) prevents downstream middleware from running. Without this guarantee, a misconfigured middleware chain could leak data from protected routes.
+The short-circuit test is especially important — it verifies that an auth guard (returning a 403 or redirecting) prevents downstream middleware from running. The redirect test pins down a subtle server-side bug: `Response.redirect('/login')` throws in Node because it needs an absolute URL, which is why `RedirectResponse.toResponse()` builds the `Location` header by hand.
 
 </TestSection>
 
 ## What's next
 
-In Part 15, we'll build **server functions** — the `createServerFn` pattern where the `transform` hook replaces server-only function bodies with typed RPC client stubs. Middleware context flows into server functions automatically, so the auth check happens once and the user object is available everywhere.
+In [Part 15](/15-server-functions), we'll build **server functions** — the `createServerFn` pattern where the `transform` hook replaces server-only function bodies with typed RPC client stubs. The RPC endpoint runs the same global middleware, so the session check happens in one place and the user object is available in every handler.

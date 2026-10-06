@@ -1,23 +1,22 @@
 ---
 title: "Part 26: Partial Prerendering"
-description: "Static shell generation at build time with Suspense boundaries as dynamic insertion points."
+description: "Static shell generation at build time with React's prerender and resume APIs, and Suspense boundaries as dynamic insertion points."
 concepts:
   - "partial prerendering"
   - "static shells with dynamic holes"
   - "the build-time / request-time split"
-  - "streaming into pre-rendered HTML"
+  - "prerender, postponed state, and resume"
 ---
 
-
-*This is the twenty-sixth installment in a series where we build a toy Next.js on top of Vite. In [Part 25](/25-use-cache), we implemented the `"use cache"` directive. Now we'll build Partial Prerendering (PPR) — the architecture where a single route has a static shell rendered at build time and dynamic holes filled at request time via Suspense boundaries.*
+_This is the twenty-seventh installment in a series where we build a toy Next.js on top of Vite. In [Part 25](/25-use-cache), we implemented the `"use cache"` directive. Now we'll build Partial Prerendering (PPR) — the architecture where a single route has a static shell rendered at build time and dynamic holes filled at request time via Suspense boundaries._
 
 ---
 
 ## The convergence of SSG and SSR
 
-Throughout this series, we've treated SSG (Part 14) and SSR (Part 3) as separate rendering strategies. SSG pre-renders at build time — fast, cacheable, but stale. SSR renders at request time — fresh, personalized, but slower.
+Throughout this series, we've treated SSG ([Part 16](/16-static-site-generation)) and SSR ([Part 3](/03-server-side-rendering)) as separate rendering strategies. SSG pre-renders at build time — fast, cacheable, but stale. SSR renders at request time — fresh, personalized, but slower.
 
-Partial Prerendering eliminates the choice. A single page can be *both*: the layout, navigation, and cacheable content are pre-rendered at build time (the "static shell"), while personalized or frequently-changing content is streamed at request time (the "dynamic holes").
+Partial Prerendering eliminates the choice. A single page can be _both_: the layout, navigation, and cacheable content are pre-rendered at build time (the "static shell"), while personalized or frequently-changing content is streamed at request time (the "dynamic holes").
 
 ```mermaid
 block-beta
@@ -35,58 +34,172 @@ block-beta
   end
 ```
 
-The browser receives the shell HTML instantly (from CDN/cache). The dynamic holes show their Suspense fallbacks. Then the server streams the resolved content into those holes — the same streaming mechanism from Part 11.
+The browser receives the shell HTML immediately — it's a file the server already has. The dynamic holes show their Suspense fallbacks. Then, in the _same_ response, the server streams the resolved content into those holes — the same streaming mechanism from [Part 12](/12-streaming-ssr).
+
+---
+
+## React's PPR primitives
+
+We don't have to invent the "stop at the holes, fill them in later" machinery. React 19.2 ships it as two APIs:
+
+- **`prerender(element, { signal })`** from `react-dom/static` renders a tree and resolves with `{ prelude, postponed }`. If you abort the `signal` while some Suspense boundaries are still waiting, React doesn't fail: it writes those boundaries' fallbacks into the `prelude` HTML stream and records everything it would need to finish them in `postponed` — a JSON-serializable object. If nothing was waiting, `postponed` is `null` and the page is fully static.
+- **`resume(element, postponed)`** from `react-dom/server` takes the same element and that postponed state, renders _only the unfinished boundaries_, and returns a stream that you append after the prelude. That stream carries the hidden segments and the inline scripts (including React's own `$RC` runtime) that swap each fallback for its content.
+
+So PPR comes down to two questions: what makes a component "wait" during the build, and when do we abort?
+
+### What makes a hole
+
+A component becomes a hole when it needs _request-time_ data. Eigen exposes the incoming request through one async accessor, backed by `AsyncLocalStorage` the same way `cacheLife` is in Part 25:
+
+```typescript title="packages/eigen/request.ts"
+import { AsyncLocalStorage } from "node:async_hooks";
+
+interface RequestStore {
+  request: Request;
+  prerendering: boolean;
+}
+
+const requestStore = new AsyncLocalStorage<RequestStore>();
+
+export function runWithRequest<T>(store: RequestStore, fn: () => T): T {
+  return requestStore.run(store, fn);
+}
+
+/** Request-time data. During a build-time prerender this never resolves —
+ *  so whatever awaits it stays suspended and becomes a dynamic hole. */
+export function getRequest(): Promise<Request> {
+  const store = requestStore.getStore();
+  if (!store) throw new Error("getRequest() called outside a request");
+  if (store.prerendering) return new Promise<Request>(() => {});
+  return Promise.resolve(store.request);
+}
+```
+
+Everything else resolves during the build. Cached functions (`"use cache"`) resolve because they don't touch the request — that's exactly what makes them cacheable.
+
+### When to abort
+
+We abort once the _cacheable_ work has finished. Part 25's runtime already tracks in-flight cache fills in its `inFlight` map, so it can tell us when they've drained:
+
+```typescript title="packages/eigen/runtime/cache.ts (addition)"
+/** Resolves once no "use cache" fill is running (checked across a few event-loop turns) */
+export async function cacheFillsSettled(): Promise<void> {
+  do {
+    await new Promise((resolve) => setImmediate(resolve));
+    await Promise.allSettled(inFlight.values());
+  } while (inFlight.size > 0);
+}
+```
+
+Waiting a macrotask between checks matters: React discovers deeper cached components only after their parents resolve, so a fill can start just after the map was empty.
 
 ---
 
 ## How PPR works in the rendering pipeline
 
-### Build time: generate the static shell
+PPR builds on the RSC pipeline from [Part 21](/21-react-server-components): the `rsc` environment renders server components (async components, `"use cache"`, `getRequest()`) to an RSC payload, and the `ssr` environment turns that payload into HTML. The holes start in the `rsc` environment — a server component awaiting `getRequest()` never completes its part of the payload — and show up in the `ssr` environment as Suspense boundaries that are still waiting for their payload chunk when we abort.
 
-At build time, the framework renders each page but *stops at Suspense boundaries that wrap dynamic content*. The `renderToString` (or `onAllReady`) output excludes the Suspense children and includes the fallback HTML instead:
+### The page
 
-```typescript
-// In the SSG build step (extending Part 14)
-import { renderToReadableStream } from 'react-dom/server'
+```tsx title="src/pages/products/[id].tsx"
+import { Suspense } from "react";
+import { cacheLife, cacheTag } from "eigen/cache";
+import { getRequest } from "eigen/request";
 
-async function prerenderShell(pathname: string): Promise<string> {
-  const match = matchRoute(pathname)
-  if (!match) return '<h1>404</h1>'
+// Cached → resolves at build time → part of the static shell
+async function ProductInfo({ id }: { id: string }) {
+  "use cache";
+  cacheLife("days");
+  cacheTag(`product-${id}`);
+  const product = await cms.getProduct(id);
+  return (
+    <div>
+      <h1>{product.name}</h1>
+      <p>{product.description}</p>
+    </div>
+  );
+}
 
-  const Component = match.route.component
+// Needs the request → suspends at build time → a dynamic hole
+async function ProductPrice({ id }: { id: string }) {
+  const request = await getRequest();
+  const price = await pricing.getPrice(id, { currency: currencyFrom(request) });
+  return <span>${price.amount}</span>;
+}
 
-  // Render with a short timeout — cached components resolve immediately,
-  // dynamic components hit their Suspense fallbacks
-  const stream = await renderToReadableStream(<Component params={match.params} />, {
-    onError(error: unknown) {
-      // During shell prerendering, errors in Suspense boundaries
-      // are expected — they become dynamic holes
-    },
-  })
-
-  // DON'T await stream.allReady — we want the shell only
-  // Read the shell (everything before Suspense boundaries resolve)
-  const reader = stream.getReader()
-  let shell = ''
-  const decoder = new TextDecoder()
-
-  // Read until the shell is complete
-  // (React sends the shell first, then streams Suspense resolutions)
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    shell += decoder.decode(value)
-    // Stop after the initial shell chunk
-    // (heuristic: look for React's Suspense markers)
-    if (shell.includes('<!--/$-->')) break
-  }
-
-  reader.cancel()
-  return shell
+export default async function ProductPage({ params }: { params: { id: string } }) {
+  return (
+    <div>
+      <ProductInfo id={params.id} /> {/* Static: in the shell */}
+      <Suspense fallback={<PriceSkeleton />}>
+        <ProductPrice id={params.id} /> {/* Dynamic: streamed at request time */}
+      </Suspense>
+    </div>
+  );
 }
 ```
 
-The output is HTML with Suspense fallbacks in place of dynamic content:
+A component that awaits `getRequest()` _outside_ any Suspense boundary would leave nothing to put in the shell. Eigen treats that as a build error for the route ("request data used outside `<Suspense>`") and falls back to plain SSR for it.
+
+### Build time: generate the static shell
+
+The `rsc` entry gains a `prerendering` flag, and the `ssr` entry gains two functions — one for each half of PPR:
+
+```tsx title="src/entry-rsc.tsx (addition)"
+import { renderToReadableStream } from "@vitejs/plugin-rsc/rsc";
+import { runWithRequest } from "eigen/request";
+export { cacheFillsSettled } from "eigen/runtime/cache";
+
+export function renderRSC(request: Request, { prerendering = false } = {}) {
+  const { pathname } = new URL(request.url);
+  return runWithRequest({ request, prerendering }, () => {
+    const match = matchRoute(pathname);
+    if (!match) return renderToReadableStream(<h1>404</h1>);
+    const Component = match.route.component;
+    return renderToReadableStream(<Component params={match.params} />);
+  });
+}
+```
+
+```tsx title="src/entry-ssr.tsx (addition)"
+import { createFromReadableStream } from "@vitejs/plugin-rsc/ssr";
+import { prerender } from "react-dom/static";
+import { resume } from "react-dom/server";
+
+// The built rsc entry's exports (renderRSC, cacheFillsSettled), passed in by the caller
+type RscEntry = typeof import("./entry-rsc");
+
+export async function prerenderPage(rsc: RscEntry, request: Request) {
+  const element = await createFromReadableStream(rsc.renderRSC(request, { prerendering: true }));
+
+  const controller = new AbortController();
+  const pending = prerender(element, {
+    signal: controller.signal,
+    onError(error) {
+      // Aborting reports every still-pending boundary — that's expected
+      if (!controller.signal.aborted) console.error(error);
+    },
+  });
+
+  // Let every "use cache" fill finish, then cut off whatever is still waiting
+  await rsc.cacheFillsSettled();
+  controller.abort(new Error("eigen: prerender complete"));
+
+  const { prelude, postponed } = await pending;
+  return { prelude: await new Response(prelude).text(), postponed };
+}
+
+export async function resumePage(rsc: RscEntry, request: Request, postponed: object) {
+  // Re-run the RSC render for real. Cached components are cache hits now,
+  // so this costs little more than the dynamic parts themselves.
+  const element = await createFromReadableStream(rsc.renderRSC(request));
+  // Same element as the prerender, plus the postponed state → only the holes render
+  return resume(element, postponed);
+  // (Part 21's inline RSC payload for hydration is appended to this stream as usual)
+}
+```
+
+The prelude is ordinary Fizz output: the static HTML plus each hole's fallback, wrapped in React's boundary markers:
 
 ```html
 <div id="root">
@@ -103,140 +216,163 @@ The output is HTML with Suspense fallbacks in place of dynamic content:
 </div>
 ```
 
-This shell is saved as the pre-rendered HTML file, served from the CDN.
+### The Vite build plugin for PPR
+
+PPR is opt-in per route, through the same `staticGeneration` export Part 16 uses for SSG:
+
+```tsx title="src/pages/products/[id].tsx (addition)"
+// Not a fully static page: SSG skips it, and the PPR plugin prerenders a shell instead
+export const staticGeneration = { prerender: false, partial: true };
+```
+
+The plugin follows Part 16's SSG exactly: a `buildApp` hook with `order: 'post'`, so it runs after both environment builds and after SSG (post hooks run sequentially in plugin order, and `eigenPPR()` is listed after `eigenSSG()`). It reads the template SSG saved to `dist/server/template.html`, and reuses Part 16's `pathsToPrerender` to expand `generateStaticParams`. Shells are written under `dist/server/ppr/`, _not_ `dist/client/`: a shell served as a static file would never get its holes filled. Like SSG's `prerendered.json`, a `ppr.json` manifest tells the server which paths have shells:
+
+```typescript title="plugins/eigen-ppr.ts"
+import type { Plugin } from "vite";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+import { pathsToPrerender } from "./eigen-ssg";
+
+export default function eigenPPR(): Plugin {
+  return {
+    name: "eigen-ppr",
+    apply: "build",
+
+    buildApp: {
+      order: "post",
+      async handler(builder) {
+        const root = builder.config.root;
+        const serverDir = resolve(root, builder.environments.ssr.config.build.outDir);
+        const rscDir = resolve(root, builder.environments.rsc.config.build.outDir);
+        const load = (file: string) => import(pathToFileURL(file).href);
+
+        // plugin-rsc names each environment's entry index.js (Part 21)
+        const rsc = await load(join(rscDir, "index.js"));
+        const ssr = await load(join(serverDir, "index.js"));
+        const template = readFileSync(join(serverDir, "template.html"), "utf-8");
+
+        const shells: string[] = [];
+        for (const route of ssr.routes) {
+          if (!route.staticGeneration?.partial) continue;
+
+          // Part 16's expansion of static paths and generateStaticParams,
+          // with the SSG opt-out (prerender: false) lifted for this purpose
+          const paths = await pathsToPrerender({
+            ...route,
+            staticGeneration: { ...route.staticGeneration, prerender: true },
+          });
+
+          for (const pathname of paths) {
+            const request = new Request(new URL(pathname, "http://localhost"));
+            const { prelude, postponed } = await ssr.prerenderPage(rsc, request);
+
+            // The marker is where the request-time stream will be spliced in
+            const shellHtml = template.replace("<!--ssr-outlet-->", `${prelude}<!--eigen-resume-->`);
+
+            const dir = join(serverDir, "ppr", pathname);
+            mkdirSync(dir, { recursive: true });
+            writeFileSync(join(dir, "shell.html"), shellHtml);
+            // postponed === null means the page turned out fully static
+            writeFileSync(join(dir, "postponed.json"), JSON.stringify(postponed));
+            shells.push(pathname);
+            console.log(`  ✓ Shell: ${pathname}${postponed ? "" : " (fully static)"}`);
+          }
+        }
+
+        writeFileSync(join(serverDir, "ppr.json"), JSON.stringify(shells, null, 2));
+      },
+    },
+  };
+}
+```
+
+Add `eigenPPR()` to the plugin array returned by `eigen()`, after `eigenSSG()`. Dynamic routes without `generateStaticParams` get no shell — there's no concrete URL to prerender — and fall back to full SSR.
 
 ### Request time: fill the dynamic holes
 
-When a request comes in, the server doesn't re-render the shell. It loads the pre-rendered HTML and streams the dynamic content into the Suspense holes:
+When a request comes in, the server doesn't re-render the shell. It sends the pre-rendered HTML immediately, then pipes `resume()`'s output after it, in one streamed response. This is Part 16's production server with one more branch, checked before the SSR fallback:
 
-```typescript
-// Production server — PPR mode
-app.get('*', async (req, res) => {
-  const shellPath = `dist/client${req.path}/shell.html`
+```typescript title="server.prod.ts (PPR branch)"
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 
-  if (!existsSync(shellPath)) {
-    // No pre-rendered shell — full SSR
-    return fullSSR(req, res)
+// In RSC mode the server bundle is dist/server/index.js; renderDocument comes from it too
+const pprPaths = new Set<string>(JSON.parse(readFileSync("dist/server/ppr.json", "utf-8")));
+const rsc = await import("./dist/rsc/index.js");
+const ssr = await import("./dist/server/index.js");
+
+// Replaces Part 16's catch-all handler
+app.all("/**", async (event) => {
+  const { pathname } = event.url;
+
+  // ...Part 16's prerendered.has(pathname) branch stays first, unchanged...
+
+  // Membership check, as with prerendered.json, as with prerendered.json: request paths
+  // never reach the filesystem unless the build listed them
+  if (event.req.method !== "GET" || !pprPaths.has(pathname)) {
+    return renderDocument(event.req, template); // regular SSR (Part 16's fallback)
   }
 
-  // Send the pre-rendered shell immediately
-  const shell = readFileSync(shellPath, 'utf-8')
-  res.setHeader('Content-Type', 'text/html')
-  res.write(shell)
+  const dir = join("dist/server/ppr", pathname);
+  const shell = await readFile(join(dir, "shell.html"), "utf-8");
+  const postponed = JSON.parse(await readFile(join(dir, "postponed.json"), "utf-8"));
+  const [head, tail] = shell.split("<!--eigen-resume-->");
+  const headers = { "Content-Type": "text/html; charset=utf-8" };
 
-  // Now render only the dynamic parts
-  const match = matchRoute(req.path)
-  if (match) {
-    // Run loaders for dynamic components
-    const dynamicData = await fetchDynamicData(match)
+  if (postponed === null) return new Response(head + tail, { headers });
 
-    // Stream the Suspense resolution scripts
-    // (same format as Part 11's streaming SSR)
-    for (const [boundaryId, html] of dynamicData.entries()) {
-      res.write(`
-        <div hidden id="S:${boundaryId}">${html}</div>
-        <script>$RC("B:${boundaryId}", "S:${boundaryId}")</script>
-      `)
-    }
-  }
+  const encoder = new TextEncoder();
+  const body = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      controller.enqueue(encoder.encode(head)); // 1. the shell, immediately
+      const resumed = await ssr.resumePage(rsc, event.req, postponed);
+      for await (const chunk of resumed) {
+        // 2. the holes, as they resolve
+        controller.enqueue(chunk);
+      }
+      controller.enqueue(encoder.encode(tail)); // 3. the rest of the template
+      controller.close();
+    },
+  });
 
-  res.end()
-})
+  return new Response(body, { headers });
+});
 ```
+
+Because `resume()` produced the fill-in scripts, they match the boundary IDs in the prelude, and React's inline runtime arrives in the same stream. Hydration then works exactly as it does for Part 12's streamed boundaries.
 
 ### The `"use cache"` connection
 
-`"use cache"` determines what's in the shell vs. what's dynamic:
-
-```tsx
-// This component is cached → included in the static shell
-async function ProductInfo({ id }: { id: string }) {
-  'use cache'
-  cacheLife('days')
-  const product = await cms.getProduct(id)
-  return <div><h1>{product.name}</h1><p>{product.description}</p></div>
-}
-
-// This component is NOT cached → becomes a dynamic hole
-async function ProductPrice({ id }: { id: string }) {
-  // No "use cache" — runs at request time
-  const price = await pricing.getPrice(id, { currency: getUserCurrency() })
-  return <span>${price.amount}</span>
-}
-
-// The page composes both
-export default async function ProductPage({ params }: { params: { id: string } }) {
-  return (
-    <div>
-      <ProductInfo id={params.id} />       {/* Static: in the shell */}
-      <Suspense fallback={<PriceSkeleton />}>
-        <ProductPrice id={params.id} />    {/* Dynamic: streamed at request time */}
-      </Suspense>
-    </div>
-  )
-}
-```
-
-The build system renders `ProductInfo` at build time (it's cached, so its data is available). `ProductPrice` suspends (no cache, needs request-time data), so its Suspense fallback goes into the shell. At request time, only `ProductPrice` runs — `ProductInfo`'s output is already in the pre-rendered HTML.
-
----
-
-## The Vite build plugin for PPR
-
-Extending the SSG plugin from Part 14:
-
-```typescript title="plugins/eigen-ppr.ts"
-async closeBundle() {
-  if (this.environment?.name !== 'ssr') return
-
-  const serverBuild = await import(resolve(process.cwd(), 'dist/server/entry-server.js'))
-  const template = readFileSync('dist/client/index.html', 'utf-8')
-
-  for (const route of serverBuild.routes) {
-    // Prerender the shell for all routes (not just static ones)
-    const shell = await prerenderShell(route.path, serverBuild)
-
-    const shellHtml = template
-      .replace('<!--ssr-outlet-->', shell)
-      // Mark this as a PPR page — the production server knows to stream dynamic content
-      .replace('</head>', '<meta name="eigen-ppr" content="true"></head>')
-
-    const shellPath = route.path === '/'
-      ? 'dist/client/shell.html'
-      : `dist/client${route.path}/shell.html`
-
-    mkdirSync(dirname(shellPath), { recursive: true })
-    writeFileSync(shellPath, shellHtml)
-    console.log(`  ✓ Shell: ${route.path}`)
-  }
-}
-```
+`"use cache"` determines what's in the shell vs. what's dynamic. The build system renders `ProductInfo` at build time (it's cached, and it doesn't need the request). `ProductPrice` suspends on `getRequest()`, so its Suspense fallback goes into the shell. At request time, `resume()` renders only `ProductPrice` — `ProductInfo`'s HTML is already in the pre-rendered file.
 
 ---
 
 ## Performance characteristics
 
-| Metric | SSG | SSR | PPR |
-|---|---|---|---|
-| Time to First Byte | ~0ms (CDN) | 200ms+ (server render) | ~0ms (CDN, shell) |
-| Time to Largest Contentful Paint | ~0ms | 200ms+ | ~0ms (shell content) |
-| Time to full interactivity | Immediate | After hydration | Shell immediate, holes stream in |
-| Data freshness | Build time | Request time | Shell: cache TTL. Holes: real-time |
-| Personalization | None | Full | Holes only |
+| Metric                           | SSG        | SSR                    | PPR                                     |
+| -------------------------------- | ---------- | ---------------------- | --------------------------------------- |
+| Time to First Byte               | ~0ms (CDN) | 200ms+ (server render) | Time to read a file (shell)             |
+| Time to Largest Contentful Paint | ~0ms       | 200ms+                 | Fast if the LCP element is in the shell |
+| Time to full interactivity       | Immediate  | After hydration        | Shell immediate, holes stream in        |
+| Data freshness                   | Build time | Request time           | Shell: build time. Holes: real-time     |
+| Personalization                  | None       | Full                   | Holes only                              |
 
-PPR gives you CDN-speed initial loads with request-time personalization — the best of both worlds.
+PPR gives you near-static initial loads with request-time personalization. Unlike SSG, the response still comes from a server process (the holes need one), so the shell isn't served straight from a CDN edge cache in this design.
 
 ---
 
 ## What to observe
 
-1. **View source on a PPR page.** You'll see the static content fully rendered and the Suspense fallbacks as HTML placeholders.
+1. **Run the build and look in `dist/server/`.** `ppr.json` lists the shells, and each one in `ppr/` has a `shell.html` with the static content and the Suspense fallbacks, and a `postponed.json` (or `null` for fully static pages).
 
-2. **Watch the Network waterfall.** The document arrives fast (pre-rendered shell), then you see the incremental content streamed in as chunked transfer encoding.
+2. **Watch the Network waterfall.** The document's first bytes arrive fast (the shell), then the hole content streams in on the same response via chunked transfer encoding.
 
-3. **Compare TTFB** between a full SSR page and a PPR page. The PPR page's TTFB is the time to read a file from disk — typically \<10ms vs. 200ms+ for SSR.
+3. **Compare TTFB** between a full SSR page and a PPR page. The PPR page's TTFB is roughly the time to read a file from disk — typically \<10ms vs. 200ms+ for SSR.
 
-4. **Revalidate a cached component** (`revalidateTag`). The shell is regenerated in the background and the next request gets the updated shell.
+4. **Move `getRequest()` into `ProductInfo`.** Rebuild: the description is now part of the hole, not the shell. Then remove `"use cache"` from a component that does slow I/O but doesn't read the request — it still lands in the shell, because the prerender waits for it; caching only decides whether _request time_ repeats that work.
+
+5. **Revalidate a cached component** (`revalidateTag`). Requests still get the _old_ shell: the shell was frozen at build time and is regenerated on the next deploy. Regenerating shells when their tags are revalidated — ISR for shells — is the natural next step and is left as an exercise.
 
 ---
 
@@ -244,7 +380,7 @@ PPR gives you CDN-speed initial loads with request-time personalization — the 
 
 PPR is the logical endpoint of the rendering strategy evolution: SSG (everything static) → SSR (everything dynamic) → ISR (static with revalidation) → PPR (static shell with dynamic holes). Each step gives developers finer control over the freshness/performance tradeoff.
 
-From a Vite architecture perspective, PPR combines three mechanisms we've already built: the `closeBundle` hook for pre-rendering (Part 14), streaming SSR for dynamic content (Part 11), and `"use cache"` for declaring what's cacheable (Part 20). The framework's job is to orchestrate these at the right times — build time for the shell, request time for the holes.
+From a Vite architecture perspective, PPR combines mechanisms we've already built: a post-build `buildApp` hook for pre-rendering (the same shape as [Part 16](/16-static-site-generation)'s SSG), streaming SSR for the dynamic content (Part 12), and `"use cache"` for declaring what's cacheable (Part 25). React supplies the hard part — `prerender` and `resume` — and the framework's job is to orchestrate them at the right times: build time for the shell, request time for the holes.
 
 ---
 

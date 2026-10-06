@@ -1,6 +1,6 @@
 ---
 title: "Part 9: Hot Module Replacement"
-description: "handleHotUpdate, import.meta.hot, HMR boundaries, the module graph, and type declaration regeneration."
+description: "The hotUpdate hook, import.meta.hot, HMR boundaries, the module graph, and type declaration regeneration."
 concepts:
   - "HMR boundaries"
   - "the module graph"
@@ -8,8 +8,7 @@ concepts:
   - "type regeneration on change"
 ---
 
-
-*This is the tenth installment in a series where we build a toy Next.js on top of Vite. In [Part 8](/08-dev-middleware), we added API routes with `configureServer`. Now we'll understand the HMR system that makes Vite development feel instant, and how framework plugins integrate with it.*
+_This is the tenth installment in a series where we build a toy Next.js on top of Vite. In [Part 8](/08-dev-middleware), we added API routes with `configureServer`. Now we'll understand the HMR system that makes Vite development feel instant, and how framework plugins integrate with it._
 
 ---
 
@@ -22,28 +21,33 @@ When you save a file, the update reaches the browser in milliseconds. Here's the
 ### File change detection
 
 Vite uses [chokidar](https://github.com/paulmillr/chokidar) (a file system watcher) to monitor source files. When a file is saved, chokidar fires an event.
+
 </Step>
 <Step>
 ### Module graph lookup
 
 Vite finds the changed file in its module graph — an in-memory data structure that tracks every module and its import relationships. The module graph knows that `App.tsx` imports `Header.tsx`, which imports `Logo.tsx`, and so on.
+
 </Step>
 <Step>
 ### HMR boundary search
 
-Vite walks *up* the dependency tree (from the changed module toward the root) looking for an **HMR boundary** — a module that has registered an [`import.meta.hot`](https://vite.dev/guide/api-hmr)`.accept()` handler. This handler says "I know how to update myself when my dependencies change."
+Vite walks _up_ the dependency tree (from the changed module toward the root) looking for an **HMR boundary** — a module that has registered an [`import.meta.hot`](https://vite.dev/guide/api-hmr)`.accept()` handler. This handler says "I know how to update myself when my dependencies change."
 
-[`@vitejs/plugin-react`](https://github.com/vitejs/vite-plugin-react) injects HMR boundary code into every React component via its `transform` hook (using [Oxc](https://oxc.rs) for the [React Fast Refresh](https://github.com/facebook/react/tree/main/packages/react-refresh) transform). This is why React components hot-reload by default — each component is a boundary.
+[`@vitejs/plugin-react`](https://github.com/vitejs/vite-plugin-react) injects HMR boundary code into component modules via its `transform` hook (using [Oxc](https://oxc.rs) for the [React Fast Refresh](https://github.com/facebook/react/tree/main/packages/react-refresh) transform). This is why React components hot-reload by default — a module whose exports are all components is a boundary.
+
 </Step>
 <Step>
 ### WebSocket update
 
-Vite sends an update message via WebSocket to the `@vite/client` script running in the browser. The message identifies which modules need to be re-imported.
+Vite sends an update message over the client environment's hot channel — a WebSocket — to the `@vite/client` script running in the browser. The message identifies which modules need to be re-imported.
+
 </Step>
 <Step>
 ### Module re-import
 
 The browser re-imports the changed modules (making new HTTP requests to Vite, which transforms the updated source) and calls the accept handlers. React's Fast Refresh mechanism re-renders the affected components without losing state.
+
 </Step>
 </Steps>
 
@@ -53,18 +57,18 @@ The browser re-imports the changed modules (making new HTTP requests to Vite, wh
 
 ## The module graph
 
-Vite's module graph is the central data structure of the dev server. You can inspect it programmatically:
+Vite's module graph is the central data structure of the dev server. Since Vite 6 there isn't _one_ graph — each environment has its own. The client graph tracks what the browser has imported; the SSR graph tracks what the ModuleRunner has imported. You can inspect either programmatically:
 
 ```typescript
 configureServer(server) {
 	server.httpServer?.on("listening", () => {
 		// Wait a moment for the initial module graph to populate
 		setTimeout(() => {
-			const graph = server.moduleGraph;
+			const graph = server.environments.client.moduleGraph;
 
-			// The graph maps module IDs to ModuleNode objects
+			// The graph maps module IDs to EnvironmentModuleNode objects
 			for (const [id, mod] of graph.idToModuleMap) {
-				const importedBy = [...(mod.importers || [])]
+				const importedBy = [...mod.importers]
 					.map((m) => m.id)
 					.filter(Boolean);
 
@@ -78,59 +82,75 @@ configureServer(server) {
 }
 ```
 
-Each `ModuleNode` tracks:
+Swap `client` for `ssr` and you'll see a different graph: no `@vite/client`, no `React.lazy` chunks, but static imports of every page and its loader.
+
+Each `EnvironmentModuleNode` tracks:
+
 - **`id`** — The resolved module ID (absolute file path or virtual module ID)
 - **`importers`** — Set of modules that import this one (edges pointing up the tree)
 - **`importedModules`** — Set of modules this one imports (edges pointing down)
 - **`transformResult`** — The cached transform output (so repeated requests don't re-transform)
 - **`lastHMRTimestamp`** — When this module last received an HMR update
 
-The graph is populated lazily during development. A module only appears in the graph after the browser has requested it. This is consistent with Vite's on-demand architecture — the graph reflects what has actually been loaded, not what exists on disk.
+Each graph is populated lazily. A module only appears in the client graph after the browser has requested it, and in the SSR graph after the runner has imported it. This is consistent with Vite's on-demand architecture — the graph reflects what has actually been loaded, not what exists on disk.
+
+<Callout type="info" title="server.moduleGraph is the legacy view">
+  You'll still find `server.moduleGraph` in older plugins. In Vite 6+ it's a backward-compatibility layer that merges
+  the client and SSR graphs into mixed `ModuleNode`s. New code should pick the environment it means:
+  `server.environments.client.moduleGraph`, `server.environments.ssr.moduleGraph`, or `this.environment.moduleGraph`
+  inside a hook.
+</Callout>
 
 ---
 
-## [`handleHotUpdate`](https://vite.dev/guide/api-plugin#handlehotupdate) — Custom HMR behavior
+## [`hotUpdate`](https://vite.dev/guide/api-environment-plugins#the-hotupdate-hook) — Custom HMR behavior
 
-The `handleHotUpdate` hook lets a plugin customize what happens when a file changes. For our route plugin, we need special handling:
+When a file changes, Vite calls each plugin's `hotUpdate` hook once **per environment** — first for `client`, then for `ssr` — with `this.environment` set to the environment being updated. The hook receives:
 
-- When a page file's **content** changes (editing a component), let React HMR handle it normally.
-- When a page file is **added or deleted**, regenerate the route manifest and type declarations.
+- **`type`** — `'create'`, `'update'`, or `'delete'`
+- **`file`** — The absolute path of the changed file
+- **`modules`** — The modules in _this_ environment's graph that belong to the file
+- **`timestamp`**, **`read()`**, **`server`**
+
+Returning nothing lets Vite run its default HMR propagation. Returning an array replaces the set of modules to propagate — an empty array means "I've handled this, don't propagate anything."
+
+For our route plugin, the rules are:
+
+- When a page file's **content** changes (`type: 'update'`), do nothing. React Fast Refresh handles the client, and the SSR runner re-imports the module on the next request.
+- When a page file is **created or deleted**, the route table changed structurally. Invalidate the virtual route module in this environment and tell it to reload.
+
+[Part 2](/02-route-discovery-plugin) already has a watcher that reacts to `add` and `unlink` events. We keep it, but split its two jobs. Regenerating the `.d.ts` file is a filesystem concern that stays in the watcher (see [Debouncing](#debouncing) below). Invalidating the module graph and reloading are HMR concerns, and they move into `hotUpdate`, where Vite tells us which environment we're in. That also fixes a gap in the Part 2 version: it reloaded the browser, but invalidating the SSR graph doesn't clear the ModuleRunner's cache of already-evaluated modules, so `entry-server.tsx` could keep rendering the old route table until a restart.
 
 ```typescript title="plugins/eigen-routes.ts"
-handleHotUpdate({ file, server }) {
-	if (!file.includes("/pages/") || !file.endsWith(".tsx")) return;
+hotUpdate({ type, file }) {
+	if (type === "update") return; // Content edit — default HMR (React Fast Refresh)
+	if (!file.startsWith(pagesDir) || !file.endsWith(".tsx")) return;
 
-	// Regenerate type declarations
-	const routes = discoverRoutes(pagesDir);
-	generateRouteDeclarations(routes, resolve(root, "node_modules/.eigen"));
+	// A page was added or deleted: the route table is stale in this environment
+	const graph = this.environment.moduleGraph;
+	const routeModule = graph.getModuleById(resolvedVirtualModuleId);
+	if (routeModule) graph.invalidateModule(routeModule);
 
-	// Invalidate the virtual route module
-	const routeModule = server.moduleGraph.getModuleById(
-		resolvedVirtualModuleId,
-	);
-	if (routeModule) {
-		server.moduleGraph.invalidateModule(routeModule);
+	// client: the browser reloads the page
+	// ssr: the ModuleRunner clears its module cache, so the next
+	//      request re-imports entry-server and the fresh route table
+	this.environment.hot.send({ type: "full-reload" });
 
-		// For structural changes (new/deleted routes), do a full reload.
-		// For content changes, let React HMR handle it.
-		// We can detect structural changes by comparing route lists,
-		// but for simplicity, always reload when the virtual module changes.
-		return []; // Empty array = "we handled it, don't do default HMR"
-	}
-}
+	return []; // We handled it — skip default propagation
+},
 ```
 
-Returning an empty array from `handleHotUpdate` tells Vite "I've handled this update myself — don't propagate it through the normal HMR pipeline." This prevents a double-update (our custom handling + the default HMR propagation).
+Because the hook runs once for each environment, the same five lines keep both the browser and the server-side runner in sync. Returning `[]` prevents a double update: without it, deleting a page would also make Vite propagate an update from the deleted module up through its importers.
+
+<Callout type="info" title="handleHotUpdate is the legacy hook">
+Older plugins use `handleHotUpdate({ file, server, modules })`. In Vite 8 it still runs, but only for `'update'` events — never for created or deleted files — and it receives the mixed backward-compatible graph instead of an environment. Setting `future: { removePluginHookHandleHotUpdate: 'warn' }` in your Vite config flags plugins that still use it. Use `hotUpdate` for new code.
+</Callout>
 
 ### Module invalidation
 
-`server.moduleGraph.invalidateModule(mod)` does two things:
+`moduleGraph.invalidateModule(mod)` clears the module's cached transform result in that environment. The next time the module is requested — by the browser, or by the ModuleRunner — Vite re-runs the `resolveId` → `load` → `transform` pipeline from scratch.
 
-1. **Clears the cached transform result.** The next time this module is requested (by the browser or by `ssrLoadModule`), Vite re-runs the transform pipeline from scratch.
-
-2. **Marks the module as stale.** Dependent modules know they need to re-import it.
-
-For our route virtual module, invalidation means the next request triggers the `load` hook again, which rescans the pages directory and generates fresh route code. Combined with a full reload message, the browser gets the updated route table.
+For our route virtual module, invalidation means the next request triggers the `load` hook again, which rescans the pages directory and generates fresh route code. Invalidation alone doesn't push anything anywhere, though. That's the job of the `full-reload` message: the browser re-requests the page, and the SSR runner drops its cached modules.
 
 ---
 
@@ -145,42 +165,43 @@ When the filesystem changes, both must update:
 
 ```mermaid
 flowchart TD
-    A["Developer creates src/pages/users/[name].tsx"] --> B["Chokidar fires watcher event"]
-    B --> C["Plugin rescans pages directory"]
+    A["Developer creates src/pages/users/[name].tsx"] --> B["Chokidar fires 'add'"]
+    B --> C["Watcher (debounced)\nrescans pages directory"]
+    B --> E["hotUpdate type: 'create'\n(once per environment)"]
     C --> D["generateRouteDeclarations()\nWrites eigen-routes.d.ts"]
-    C --> E["invalidateModule(virtualModule)\nClears cached route code"]
+    E --> G["invalidateModule(virtualModule)\n+ full-reload"]
     D --> F["TS language server picks up\nnew RoutePaths union"]
-    E --> G["Browser gets full reload\nwith updated routes"]
+    G --> I["Browser reloads, SSR runner\nre-imports the new route table"]
     F --> H["IDE shows autocomplete for\n'/users/:name'"]
-    G --> I["App renders with new\nroute available"]
 ```
 
 This creates a feedback loop: the developer adds a file, and within seconds, the IDE offers autocomplete for the new route's path and params. This is the same cycle that [TanStack Router](https://tanstack.com/router)'s `@tanstack/router-plugin/vite` implements when it watches the filesystem and regenerates `routeTree.gen.ts`.
 
 ### Debouncing
 
-In practice, file watcher events can fire rapidly (a single save might trigger multiple events, or the developer might be renaming a file which fires a delete + create). Production frameworks debounce the regeneration:
+In practice, file watcher events can fire rapidly (renaming a file fires `unlink` + `add`; a `git checkout` can fire dozens). Rewriting the declaration file on every event wastes work and makes the TypeScript server re-check repeatedly. Production frameworks debounce the regeneration. Here is Part 2's watcher with a debounce added:
 
-```typescript
-let regenerateTimeout: NodeJS.Timeout | null = null;
+```typescript title="plugins/eigen-routes.ts"
+configureServer(server) {
+	let regenerateTimeout: ReturnType<typeof setTimeout> | undefined;
 
-server.watcher.on("all", (event, filePath) => {
-	if (!filePath.startsWith(pagesDir) || !filePath.endsWith(".tsx")) return;
+	const onStructuralChange = (filePath: string) => {
+		if (!filePath.startsWith(pagesDir) || !filePath.endsWith(".tsx")) return;
 
-	// Debounce: wait 100ms for additional changes before regenerating
-	if (regenerateTimeout) clearTimeout(regenerateTimeout);
-	regenerateTimeout = setTimeout(() => {
-		const routes = discoverRoutes(pagesDir);
-		generateRouteDeclarations(routes, resolve(root, "node_modules/.eigen"));
+		// Debounce: wait 100ms for additional changes before regenerating
+		clearTimeout(regenerateTimeout);
+		regenerateTimeout = setTimeout(() => {
+			const routes = discoverRoutes(pagesDir);
+			generateRouteDeclarations(routes, resolve(root, "node_modules/.eigen"));
+		}, 100);
+	};
 
-		const mod = server.moduleGraph.getModuleById(resolvedVirtualModuleId);
-		if (mod) {
-			server.moduleGraph.invalidateModule(mod);
-			server.ws.send({ type: "full-reload" });
-		}
-	}, 100);
-});
+	server.watcher.on("add", onStructuralChange);
+	server.watcher.on("unlink", onStructuralChange);
+},
 ```
+
+The watcher now only writes declarations. Graph invalidation and reloads live in `hotUpdate`, which Vite calls for the same `add`/`unlink` events (as `'create'`/`'delete'`).
 
 ---
 
@@ -188,24 +209,35 @@ server.watcher.on("all", (event, filePath) => {
 
 An HMR boundary is any module that calls `import.meta.hot.accept()`. This tells Vite "when this module or its dependencies change, I can handle the update without a full page reload."
 
-`@vitejs/plugin-react` injects this automatically into every React component via its `transform` hook. After transformation, a component file like `Home.tsx` ends up with something like:
+`@vitejs/plugin-react` injects this into component modules via its `transform` hook. After transformation, a component file like `Home.tsx` ends up with something roughly like this (simplified):
 
 ```typescript
-// What @vitejs/plugin-react injects at the end of every component file:
-if (import.meta.hot) {
-	import.meta.hot.accept();
+// Registration emitted by the Fast Refresh transform, next to each component:
+$RefreshReg$(_c, "Home");
 
-	// React Fast Refresh integration:
-	// 1. Registers the component with React's refresh runtime
-	// 2. On hot update, swaps the component's implementation
-	//    without unmounting/remounting (preserving state)
-	RefreshRuntime.register(Home, "Home");
+// Footer appended to the module:
+if (import.meta.hot) {
+  RefreshRuntime.__hmr_import(import.meta.url).then((currentExports) => {
+    RefreshRuntime.registerExportsForReactRefresh(__SOURCE__, currentExports);
+    import.meta.hot.accept((nextExports) => {
+      // If any export isn't a component, Fast Refresh can't safely
+      // swap it — escalate to the importer (usually a full reload)
+      const invalidateMessage = RefreshRuntime.validateRefreshBoundaryAndEnqueueUpdate(
+        __SOURCE__,
+        currentExports,
+        nextExports,
+      );
+      if (invalidateMessage) import.meta.hot.invalidate(invalidateMessage);
+    });
+  });
 }
 ```
 
+The validation step matters for framework authors. A module is only a Fast Refresh boundary if **every export is a React component**. A page that also exports a `loader` would fail validation and fall back to a reload — which is one more reason [Part 7](/07-transform-hook) strips loaders from the client bundle before the module ever reaches the browser.
+
 The `import.meta.hot` object is Vite's HMR client API. Its key methods:
 
-- **`accept()`** — "I'm a boundary. When I change, re-import me and call my accept handler." This is a *self-accepting* module.
+- **`accept()`** — "I'm a boundary. When I change, re-import me and call my accept handler." This is a _self-accepting_ module.
 - **`accept(deps, callback)`** — "When these specific dependencies change, call my callback with the new modules." This is for accepting specific dependency updates.
 - **`dispose(callback)`** — "Before I'm replaced, call this cleanup function." Used to tear down side effects (event listeners, intervals, subscriptions).
 - **`invalidate()`** — "I can't handle this update. Propagate upward." Forces the HMR boundary search to continue to the parent.
@@ -216,39 +248,38 @@ When Vite finds a boundary, it sends a WebSocket message to the browser. The `@v
 
 Framework authors have an additional concern: hot updates to framework internals (the router, the data loading layer) might need special handling. If the route matching logic changes, a simple component re-render won't update the router — you need a full page reload.
 
-This is why our `handleHotUpdate` returns an empty array (suppressing default HMR) and sends a full reload instead. It's the conservative choice. A more sophisticated framework could:
+That's why our `hotUpdate` hook splits the cases: content edits go through normal HMR, and structural changes (a route appearing or disappearing) force a reload. A more sophisticated framework could go further:
 
-1. Detect whether the change is structural (new route) vs. cosmetic (component markup)
-2. For structural changes, invalidate and reload
-3. For cosmetic changes, let React HMR handle it
-4. For router internals changes, force a hard refresh
+1. Diff the old and new route lists, and only reload if the route table actually changed
+2. Re-render the router in place for new routes instead of reloading the page
+3. Force a hard refresh when router internals themselves change
 
 ---
 
 ## What to observe
 
-1. **Edit a page component's markup** — just the JSX. The browser updates without a full reload. React HMR handles it.
+1. **Edit a page component's markup** — just the JSX. The browser updates without a full reload, and component state survives. React Fast Refresh handles it; our `hotUpdate` hook returns early for `type: 'update'`.
 
-2. **Create a new page file** (e.g., `src/pages/Contact.tsx`). Watch the terminal — you'll see the file watcher trigger. Check `node_modules/.eigen/eigen-routes.d.ts` — it now includes `/contact` in the `RoutePaths` union. The browser does a full reload with the new route available.
+2. **Create a new page file** (e.g., `src/pages/Contact.tsx`). Check `node_modules/.eigen/eigen-routes.d.ts` — it now includes `/contact` in the `RoutePaths` union. The browser does a full reload, and `/contact` server-renders immediately because the SSR runner dropped its cached route table.
 
-3. **Delete a page file.** The route disappears from the type declarations and from the runtime route table.
+3. **Delete a page file.** The route disappears from the type declarations and from the runtime route table, on both the client and the server.
 
-4. **Add `console.log` in the `handleHotUpdate` hook.** You can see exactly which files trigger it and trace the flow.
+4. **Add `console.log(this.environment.name, type, file)` at the top of `hotUpdate`.** Every save logs twice — once for `client`, once for `ssr` — which makes the per-environment model concrete.
 
 ---
 
 ## Key insight
 
-HMR is the module graph plus the WebSocket. The module graph tracks dependencies. The WebSocket delivers updates. HMR boundaries define where updates stop propagating. Framework plugins use `handleHotUpdate` to customize this behavior for framework-specific concerns — like regenerating route manifests and type declarations.
+HMR is the module graph plus the hot channel. Each environment's module graph tracks dependencies. The hot channel delivers updates — a WebSocket for the browser, an in-process channel for the SSR runner. HMR boundaries define where updates stop propagating. Framework plugins use `hotUpdate` to customize this behavior per environment for framework-specific concerns — like regenerating route manifests and type declarations.
 
-For a typed framework, HMR has a second dimension: declaration file regeneration. The runtime module graph and the TypeScript declaration graph are parallel structures maintained by the plugin. When the filesystem changes, both update. The module graph update is instant (invalidation). The declaration update requires a file write, which triggers the TypeScript language server to re-check and update autocomplete. This dual update loop is what gives typed frameworks their tight developer feedback cycle.
+For a typed framework, HMR has a second dimension: declaration file regeneration. The runtime module graph and the TypeScript declaration graph are parallel structures maintained by the plugin. When the filesystem changes, both update. The module graph update is instant (invalidation plus a reload message). The declaration update requires a file write, which triggers the TypeScript language server to re-check and update autocomplete. This dual update loop is what gives typed frameworks their tight developer feedback cycle.
 
 ---
 
 ## Further reading
 
 - [Vite HMR API](https://vite.dev/guide/api-hmr) — The full reference for `import.meta.hot`, including `accept`, `dispose`, `invalidate`, and `prune`.
-- [Vite Plugin API: `handleHotUpdate`](https://vite.dev/guide/api-plugin#handlehotupdate) — How plugins customize HMR behavior for framework-specific file changes.
+- [Vite Environment API: the `hotUpdate` hook](https://vite.dev/guide/api-environment-plugins#the-hotupdate-hook) — The per-environment HMR hook that replaces `handleHotUpdate`.
 - [React Fast Refresh](https://github.com/facebook/react/tree/main/packages/react-refresh) — React's hot reloading runtime that preserves component state across edits.
 - [chokidar](https://github.com/paulmillr/chokidar) — The file system watcher library that Vite uses for change detection.
 - [`@vitejs/plugin-react`](https://github.com/vitejs/vite-plugin-react) — The official React plugin for Vite, which injects HMR boundary code via the transform hook.
@@ -257,4 +288,4 @@ For a typed framework, HMR has a second dimension: declaration file regeneration
 
 ## What's next
 
-In Part 10, we'll build Eigen's **dev overlay** — an in-browser diagnostic panel showing route matching, loader performance, cache state, and streaming progress in real-time. Then in Part 11, we'll compose everything into a single `eigen()` plugin function, introduce the `buildApp` hook for production build orchestration, and examine the three-layer type architecture that frameworks ship. This is where the toy framework becomes a coherent, distributable package.
+In Part 10, we'll build Eigen's **dev overlay** — an in-browser diagnostic panel that streams request timings from the dev server in real time, with an instrumentation hook that later parts use for loaders, middleware, and caching. Then in Part 11, we'll compose everything into a single `eigen()` plugin function, introduce the `buildApp` hook for production build orchestration, and examine the three-layer type architecture that frameworks ship. This is where the toy framework becomes a coherent, distributable package.

@@ -1,6 +1,6 @@
 ---
 title: "Part 6: Production Builds"
-description: "Two Rolldown builds, the manifest as the bridge between them, and a production H3 server that ports the dev-only data endpoint over to runLoader."
+description: "Two Rolldown builds, the built HTML and manifest that connect them, and a production H3 server that ports the dev-only data endpoint over to runLoader."
 concepts:
   - "client/server build coordination"
   - "asset manifests"
@@ -8,8 +8,7 @@ concepts:
   - "porting dev middleware to production"
 ---
 
-
-*This is the seventh installment in a series where we build a toy Next.js on top of Vite. In [Part 5](/05-typed-loaders), we built typed data loaders and a `/_eigen/data` endpoint via Vite's [`configureServer`](https://vite.dev/guide/api-plugin#configureserver) — a dev-only hook ([Part 0](/00-the-mental-model#hook-availability-dev-vs-build)). Now we move to production: two Rolldown builds connected by a manifest, an H3 server that imports a pre-built bundle instead of calling `ssrLoadModule`, and the data endpoint re-mounted directly on H3 because the plugin middleware no longer exists.*
+_This is the seventh installment in a series where we build a toy Next.js on top of Vite. In [Part 5](/05-typed-loaders), we built typed data loaders and a `/_eigen/data` endpoint via Vite's [`configureServer`](https://vite.dev/guide/api-plugin#configureserver) — a dev-only hook ([Part 0](/00-the-mental-model#hook-availability-dev-vs-build)). Now we move to production: two Rolldown builds, an H3 server that imports a pre-built bundle instead of loading source through Vite's module runner, and the data endpoint re-mounted directly on H3 because the plugin middleware no longer exists._
 
 ---
 
@@ -17,32 +16,34 @@ concepts:
 
 Everything we've built so far runs on the Vite dev server — the on-demand module transformer from [Part 0](/00-the-mental-model#how-the-dev-server-actually-works). In development, the browser requests modules individually, and Vite transforms each one on the fly. This is great for DX (instant startup, fast HMR) but terrible for production: hundreds of individual HTTP requests, untransformed source files, no minification, no tree-shaking.
 
-In production, Vite switches to a completely different mode: **[Rolldown](https://rolldown.rs) bundling**. Rolldown is a Rust-based bundler ([Rollup](https://rollupjs.org)-compatible) that processes the *entire* module graph eagerly and produces optimized output:
+In production, Vite switches to a completely different mode: **[Rolldown](https://rolldown.rs) bundling**. Rolldown is a Rust-based bundler ([Rollup](https://rollupjs.org)-compatible) that processes the _entire_ module graph eagerly and produces optimized output:
 
 - **Bundling**: Hundreds of source modules are combined into a handful of chunks, eliminating the HTTP request waterfall.
-- **Tree-shaking**: Rolldown analyzes `import`/`export` relationships and removes unused code. If a module exports 10 functions but only 3 are imported, the other 7 are eliminated from the output. This is what removes loaders from the client bundle: the client branch of `eigen/routes` (from [Part 2](/02-route-discovery-plugin#plugin-hooks)) never references them.
+- **Tree-shaking**: Rolldown analyzes `import`/`export` relationships and removes unused code. If a module exports 10 functions but only 3 are statically imported, the other 7 are eliminated from the output. The word _statically_ matters here, as we'll see [below](#loaders-are-still-in-the-client-bundle): the client branch of `eigen/routes` (from [Part 2](/02-route-discovery-plugin#plugin-hooks)) loads pages with dynamic `import()`, and tree-shaking can't see through that.
 - **Scope hoisting**: Instead of wrapping each module in a function (like webpack), Rolldown concatenates modules into a single scope, reducing overhead and enabling better minification.
 - **Code splitting**: Dynamic `import()` statements (like our [`React.lazy`](https://react.dev/reference/react/lazy)`(() => import('./Page'))`) create separate chunks that load on demand.
 - **Minification**: Variable names are shortened, whitespace is removed, and dead code is eliminated.
-- **Hashed filenames**: Output files get content-based hashes (`entry-client-a1b2c3d4.js`), enabling indefinite browser caching — when code changes, the hash changes, and the browser fetches the new version.
+- **Hashed filenames**: Output files get content-based hashes (`index-a1b2c3d4.js`), enabling indefinite browser caching — when code changes, the hash changes, and the browser fetches the new version.
 
 <Callout type="info" title="Your plugins run in both modes">
-The same `resolveId`/`load`/`transform` hooks that served modules on-demand in development now process them eagerly during Rolldown's build. Your route plugin's virtual module is generated the same way — the only difference is *when* it runs (on-demand vs. ahead-of-time) and *what consumes the output* (browser requests vs. Rolldown's module graph).
+  The same `resolveId`/`load`/`transform` hooks that served modules on-demand in development now process them eagerly
+  during Rolldown's build. Your route plugin's virtual module is generated the same way — the only difference is *when*
+  it runs (on-demand vs. ahead-of-time) and *what consumes the output* (browser requests vs. Rolldown's module graph).
 </Callout>
 
-For a server-rendered framework, we need **two** Rolldown builds — one for the client (browser-targeted, code-split, hashed) and one for the server (Node-targeted, single-file, unhashed). These are the same two module graphs from [Part 0](/00-the-mental-model#the-two-module-graphs), now producing two output directories instead of two on-demand pipelines. They're connected by a manifest file.
+For a server-rendered framework, we need **two** Rolldown builds — one for the client (browser-targeted, code-split, hashed) and one for the server (Node-targeted, unhashed entry). These are the same two module graphs from [Part 0](/00-the-mental-model#the-two-module-graphs), now producing two output directories instead of two on-demand pipelines. They're connected by the built `index.html` (which already references the hashed client entry) and a manifest file.
 
 ```mermaid
 flowchart LR
     subgraph dev["Development (Part 5)"]
         DS["Vite dev server"] --> CG["Client graph (on-demand)"]
-        DS --> SG["SSR graph (ssrLoadModule)"]
+        DS --> SG["SSR graph (module runner)"]
         DS --> DM["plugin middleware<br/>/_eigen/data"]
     end
     subgraph prod["Production (this part)"]
-        VB["vite build × 2"] --> DC["dist/client/<br/>(hashed chunks + manifest)"]
+        VB["vite build × 2"] --> DC["dist/client/<br/>(index.html + hashed chunks + manifest)"]
         VB --> DSV["dist/server/<br/>(entry-server.js)"]
-        DC -.manifest.-> H3["server.prod.ts (H3)"]
+        DC -- "index.html template" --> H3["server.prod.ts (H3)"]
         DSV --> H3
     end
 ```
@@ -59,27 +60,36 @@ import inspect from "vite-plugin-inspect";
 import eigenRoutes from "./plugins/eigen-routes";
 
 export default defineConfig({
-	plugins: [react(), eigenRoutes(), inspect()],
-	resolve: {
-		alias: {
-			"eigen/types": resolve(__dirname, "packages/eigen/types.ts"),
-			"eigen/match-route": resolve(__dirname, "packages/eigen/match-route.ts"),
-			"eigen/helpers": resolve(__dirname, "packages/eigen/helpers.ts"),
-			"eigen/run-loader": resolve(__dirname, "packages/eigen/run-loader.ts"),
-		},
-	},
-	build: { // [!code ++]
-		manifest: true, // [!code ++]
-		rolldownOptions: { // [!code ++]
-			input: "src/entry-client.tsx", // [!code ++]
-		}, // [!code ++]
-	}, // [!code ++]
+  plugins: [react(), eigenRoutes(), inspect()],
+  resolve: {
+    alias: {
+      "eigen/types": resolve(__dirname, "packages/eigen/types.ts"),
+      "eigen/match-route": resolve(__dirname, "packages/eigen/match-route.ts"),
+      "eigen/helpers": resolve(__dirname, "packages/eigen/helpers.ts"),
+      "eigen/run-loader": resolve(__dirname, "packages/eigen/run-loader.ts"),
+    },
+  },
+  build: {
+    // [!code ++]
+    manifest: true, // [!code ++]
+    rolldownOptions: {
+      // [!code ++]
+      onwarn(warning, defaultHandler) {
+        // [!code ++]
+        // `RouteModN.loader` on a page without a loader is expected (see below) // [!code ++]
+        if (warning.code === "IMPORT_IS_UNDEFINED") return; // [!code ++]
+        defaultHandler(warning); // [!code ++]
+      }, // [!code ++]
+    }, // [!code ++]
+  }, // [!code ++]
 });
 ```
 
-**`build.manifest: true`** tells Vite to emit `.vite/manifest.json` alongside the build output. The manifest maps source paths to their built equivalents — we'll read it from the production server below.
+**`build.manifest: true`** tells Vite to emit `.vite/manifest.json` alongside the build output. The manifest maps source paths to their built equivalents. We'll look at what it contains below.
 
-**`build.rolldownOptions.input`** sets the entry point for the client build. Without this, Vite defaults to `index.html` and walks its `<script>` tags. That works in single-page setups, but here we want Rolldown to start from the entry module so it can produce code-split chunks for each lazy route. (`build.rollupOptions` still works as an alias — Vite 8's compatibility shim covers most Vite 7 configs, see [Part 0](/00-the-mental-model#vite-is-two-completely-different-things).)
+**`onwarn`** filters one expected warning. The SSR branch of `eigen/routes` ([Part 2](/02-route-discovery-plugin#plugin-hooks)) reads `RouteMod0.loader` from a namespace import for every page. For pages like `About.tsx` that don't export a loader, Rolldown warns `[IMPORT_IS_UNDEFINED] Import 'loader' will always be undefined`. That's exactly the intended behavior (`loader: undefined`), so we drop that warning code and pass everything else to the default handler. (Rolldown also offers `checks: { importIsUndefined: false }`, which works too.) Without the filter the build still succeeds; you just see one warning per loader-less page.
+
+**The client entry is still `index.html`.** We don't set `build.rolldownOptions.input`, so Vite uses its default: the project's `index.html`. Vite follows its `<script type="module" src="/src/entry-client.tsx">` tag into the module graph, code-splits every `React.lazy` route, and writes a _built_ `dist/client/index.html` whose script tag points at the hashed entry chunk, with the CSS `<link>` tags injected for you. That built file is the production server's template. Setting `input` to `src/entry-client.tsx` instead would still bundle the JavaScript, but Vite would then never process `index.html`, so no `dist/client/index.html` would exist. You'd have to rebuild every tag by hand from the manifest. (If you do need a custom input, it's `build.rolldownOptions.input`. `build.rollupOptions` still works as an alias via Vite 8's compatibility shim, see [Part 0](/00-the-mental-model#vite-is-two-completely-different-things).)
 
 ### Build commands
 
@@ -93,60 +103,67 @@ export default defineConfig({
 }
 ```
 
-Two `vite build` invocations against the same config — one per environment. We'll consolidate these into a single command via [`buildApp`](https://vite.dev/guide/api-plugin#buildapp) in [Part 11](/11-framework-plugin), but two scripts make the asymmetry visible: the only thing that distinguishes a server build from a client build is the `--ssr <entry>` flag and the output directory.
+Two `vite build` invocations against the same config — one per environment. We'll consolidate these into a single command via [`buildApp`](https://vite.dev/guide/api-environment-frameworks#the-buildapp-plugin-hook) in [Part 11](/11-framework-plugin), but two scripts make the asymmetry visible: the only thing that distinguishes a server build from a client build is the `--ssr <entry>` flag and the output directory.
 
 The **`--ssr` flag** changes the build fundamentally:
 
+- **Environment**: The build runs in Vite's `ssr` environment, so `this.environment.name === 'ssr'` in plugin hooks, exactly as in dev.
 - **Target**: Node instead of the browser (`platform: 'node'`).
-- **Code splitting**: Disabled — the server bundle is a single file.
-- **External dependencies**: `node_modules` packages are *not* bundled by default — they're available at runtime in Node, so bundling them would just bloat the output.
+- **Entry**: `src/entry-server.tsx` (the `--ssr` argument) replaces `index.html` as the input.
+- **External dependencies**: `node_modules` packages are _not_ bundled by default — they're available at runtime in Node, so bundling them would just bloat the output.
 - **Module format**: ESM by default.
-- **Asset handling**: No content hashing — server bundles don't need cache-busted filenames.
-- **Plugins**: The `applyToEnvironment` filter ([Part 7](/07-transform-hook#applytoenvironment--environment-scoped-plugins)) decides which plugins run. Both builds run our `eigen-routes` plugin and produce a virtual module — the client gets `React.lazy(...)` references, the server gets static imports plus loaders, just like in dev.
+- **File names**: The entry is written as `entry-server.js` with no hash, so the production server can import it by a fixed name. Code splitting still works as usual. A dynamic `import()` in server code would produce extra (hashed) chunks. Our server build ends up as one file only because the SSR branch of `eigen/routes` uses static imports.
+- **Plugins**: Both builds run our `eigen-routes` plugin and produce a virtual module — the client gets `React.lazy(...)` references, the server gets route objects with loaders, just like in dev. ([Part 7](/07-transform-hook) introduces `applyToEnvironment` for plugins that should only run in one of the two.)
 
 ---
 
 ## The manifest file
 
-After `vite build --outDir dist/client`, the manifest at `dist/client/.vite/manifest.json` looks roughly like this:
+After `vite build --outDir dist/client`, the manifest at `dist/client/.vite/manifest.json` looks like this (hashes shortened):
 
 ```json
 {
-  "src/entry-client.tsx": {
-    "file": "assets/entry-client-a1b2c3d4.js",
-    "imports": [
-      "_vendor-i9j0k1l2.js"
-    ],
-    "css": [
-      "assets/style-e5f6g7h8.css"
-    ],
-    "isEntry": true
+  "index.html": {
+    "file": "assets/index-a1b2c3d4.js",
+    "name": "index",
+    "src": "index.html",
+    "isEntry": true,
+    "dynamicImports": ["src/pages/About.tsx", "src/pages/Home.tsx", "src/pages/posts/[id].tsx"],
+    "css": ["assets/index-e5f6g7h8.css"]
   },
   "src/pages/Home.tsx": {
     "file": "assets/Home-m3n4o5p6.js",
-    "isDynamicEntry": true
+    "name": "Home",
+    "src": "src/pages/Home.tsx",
+    "isDynamicEntry": true,
+    "imports": ["index.html"]
   },
   "src/pages/posts/[id].tsx": {
     "file": "assets/_id_-q7r8s9t0.js",
-    "isDynamicEntry": true
+    "name": "_id_",
+    "src": "src/pages/posts/[id].tsx",
+    "isDynamicEntry": true,
+    "imports": ["index.html"]
   }
 }
 ```
 
-The manifest tells the production server:
+(`About.tsx` has an entry too; it's omitted here for space.) Reading it:
 
-- The client entry compiled to `assets/entry-client-a1b2c3d4.js`.
-- Each page compiled to its own chunk — because the client virtual module from [Part 2](/02-route-discovery-plugin#plugin-hooks) uses `React.lazy(() => import(...))`, Rolldown splits those dynamic imports into separate chunks.
-- The CSS extracted to `assets/style-e5f6g7h8.css`.
-- Vendor code (React, etc.) sits in a shared `_vendor-i9j0k1l2.js` chunk that the entry pulls in via the `imports` field.
+- The HTML entry compiled to `assets/index-a1b2c3d4.js`. The chunk is named after `index.html`, the build input, not after `entry-client.tsx`.
+- Each page compiled to its own chunk. The client virtual module from [Part 2](/02-route-discovery-plugin#plugin-hooks) uses `React.lazy(() => import(...))`, so Rolldown splits each dynamic import into a separate chunk and lists it under the entry's `dynamicImports`. The `[id]` in the file name is sanitized to `_id_`.
+- Shared code (React, the router) lives in the entry chunk. Each page chunk's `imports: ["index.html"]` says "load the entry chunk first". If several pages shared a large dependency that the entry didn't use, Rolldown would split it into its own chunk, with a `_`-prefixed key such as `_shared-x1y2z3.js` (the file itself is `assets/shared-x1y2z3.js`).
+- The CSS was extracted to `assets/index-e5f6g7h8.css`.
 
-The hex suffix in each filename (`a1b2c3d4`) is a hash of the file's *content*. Change the source, the hash changes, the filename changes, and the browser is forced to fetch the new version — even if the server set `Cache-Control: max-age=31536000`. This is content-addressed caching, and it's the reason production servers can ship aggressive cache headers without ever serving stale code.
+The built `dist/client/index.html` already contains the entry's `<script type="module" crossorigin src="/assets/index-a1b2c3d4.js">` and the CSS `<link>`, so for the entry itself the production server needs nothing from the manifest. The manifest earns its keep for anything the HTML can't know in advance. The main example is per-route preloading: when the server renders `/posts/1`, it can look up `src/pages/posts/[id].tsx` and emit `<link rel="modulepreload" href="/assets/_id_-q7r8s9t0.js">` so the browser fetches the page chunk in parallel with the entry instead of after it. Doing that requires knowing which source file the matched route came from, which our route objects don't carry yet. Per-route CSS in [Part 37](/37-css-styling-pipeline) is where the framework starts reading the manifest at request time.
+
+The hex suffix in each filename (`a1b2c3d4`) is a hash of the file's _content_. Change the source, the hash changes, the filename changes, and the browser is forced to fetch the new version — even if the server set `Cache-Control: max-age=31536000`. This is content-addressed caching, and it's the reason production servers can ship aggressive cache headers without ever serving stale code.
 
 ---
 
 ## Exposing the loader for production
 
-The dev `/_eigen/data` middleware in [Part 5](/05-typed-loaders#the-data-endpoint) called `server.ssrLoadModule('eigen/routes')` to grab the route table on every request and ran `runLoader(pathname, routes)` against it. Production has no `ssrLoadModule` — `eigen/routes` is bundled into `dist/server/entry-server.js` along with the rest of the server code. We expose a small wrapper from the server entry so the production server doesn't have to reach into the bundle's internals:
+The dev `/_eigen/data` middleware in [Part 5](/05-typed-loaders#the-data-endpoint) called `server.environments.ssr.runner.import('eigen/routes')` to grab the route table on every request and ran `runLoader(pathname, routes)` against it. Production has no Vite and no module runner — `eigen/routes` is bundled into `dist/server/entry-server.js` along with the rest of the server code. We expose a small wrapper from the server entry so the production server doesn't have to reach into the bundle's internals:
 
 ```tsx title="src/entry-server.tsx"
 import { Suspense } from "react";
@@ -156,41 +173,42 @@ import { routes } from "eigen/routes";
 import { runLoader } from "eigen/run-loader"; // [!code ++]
 
 function App({ match, data }: { match: RouteMatch; data: unknown }) {
-	const Component = match.route.component;
-	return (
-		<div>
-			<nav>
-				<a href="/">Home</a> | <a href="/about">About</a> |{" "}
-				<a href="/posts/1">Post 1</a> | <a href="/posts/2">Post 2</a>
-			</nav>
-			<Suspense fallback={<div>Loading...</div>}>
-				<Component params={match.params} data={data} />
-			</Suspense>
-		</div>
-	);
+  const Component = match.route.component;
+  return (
+    <div>
+      <nav>
+        <a href="/">Home</a> | <a href="/about">About</a> | <a href="/posts/1">Post 1</a> |{" "}
+        <a href="/posts/2">Post 2</a>
+      </nav>
+      <Suspense fallback={<div>Loading...</div>}>
+        <Component params={match.params} data={data} />
+      </Suspense>
+    </div>
+  );
 }
 
 export interface RenderResult {
-	html: string;
-	status: number;
-	data: unknown;
+  html: string;
+  status: number;
+  data: unknown;
 }
 
 export async function render(pathname: string): Promise<RenderResult> {
-	const match = matchRoute(pathname, routes);
-	if (!match) return { html: "<h1>404</h1>", status: 404, data: null };
+  const match = matchRoute(pathname, routes);
+  if (!match) return { html: "<h1>404</h1>", status: 404, data: null };
 
-	let data: unknown = null;
-	if (match.route.loader) {
-		data = await match.route.loader({ params: match.params });
-	}
+  let data: unknown = null;
+  if (match.route.loader) {
+    data = await match.route.loader({ params: match.params });
+  }
 
-	const html = renderToString(<App match={match} data={data} />);
-	return { html, status: 200, data };
+  const html = renderToString(<App match={match} data={data} />);
+  return { html, status: 200, data };
 }
 
-export async function loadData(pathname: string): Promise<unknown> { // [!code ++]
-	return runLoader(pathname, routes); // [!code ++]
+export async function loadData(pathname: string): Promise<unknown> {
+  // [!code ++]
+  return runLoader(pathname, routes); // [!code ++]
 } // [!code ++]
 ```
 
@@ -200,93 +218,106 @@ export async function loadData(pathname: string): Promise<unknown> { // [!code +
 
 ## The production server
 
+The HTML splicing (rendered markup into the outlet, loader data into a `<script>`) is a pure string function, so we put it in the framework package where it can be tested on its own. It serializes data with `serializeForScript` from [Part 3](/03-server-side-rendering), the same escaping the dev server uses, so a `</script>` inside a blog post's body can't break out of the tag:
+
+```typescript title="packages/eigen/compose-html.ts"
+import { serializeForScript } from "./serialize";
+
+export function composeHtml(template: string, appHtml: string, data: unknown): string {
+  return template
+    .replace("<!--ssr-outlet-->", appHtml)
+    .replace("</head>", `  <script>window.__EIGEN_DATA__ = ${serializeForScript(data)}</script>\n</head>`);
+}
+```
+
 ```typescript title="server.prod.ts"
 import { readFileSync } from "node:fs";
+import { readFile, stat } from "node:fs/promises";
+import { join } from "node:path";
 import { H3, serve, serveStatic } from "h3";
+import { composeHtml } from "./packages/eigen/compose-html";
 import type { RenderResult } from "./src/entry-server";
 
+// The built template: Vite already rewrote its <script> and <link> tags
+// to the hashed files in dist/client/assets. Read it once at startup.
 const template = readFileSync("dist/client/index.html", "utf-8");
-const manifest: Record<string, { file: string; css?: string[] }> = JSON.parse(
-	readFileSync("dist/client/.vite/manifest.json", "utf-8"),
-);
 
 // Top-level await: load the pre-built server bundle once at startup
 const { render, loadData } = (await import("./dist/server/entry-server.js")) as {
-	render: (pathname: string) => Promise<RenderResult>;
-	loadData: (pathname: string) => Promise<unknown>;
+  render: (pathname: string) => Promise<RenderResult>;
+  loadData: (pathname: string) => Promise<unknown>;
 };
 
 const app = new H3();
 
-// Serve hashed static assets with year-long caching
-app.get(
-	"/assets/**",
-	serveStatic({
-		dir: "dist/client/assets",
-		maxAge: 60 * 60 * 24 * 365, // 1 year — content hashes handle cache busting
-	}),
+// Serve hashed static assets with year-long caching.
+// serveStatic passes the full request path ("/assets/index-a1b2c3d4.js") as `id`.
+app.get("/assets/**", (event) =>
+  serveStatic(event, {
+    getContents: (id) => readFile(join("dist/client", id)),
+    getMeta: async (id) => {
+      const stats = await stat(join("dist/client", id)).catch(() => undefined);
+      if (stats?.isFile()) return { size: stats.size, mtime: stats.mtimeMs };
+    },
+    // 1 year — content hashes handle cache busting
+    headers: { "Cache-Control": "public, max-age=31536000, immutable" },
+  }),
 );
 
 // Data endpoint — the production equivalent of Part 5's plugin middleware
 app.get("/_eigen/data", async (event) => {
-	const pathname = new URL(event.request.url).searchParams.get("path") ?? "/";
-	try {
-		const data = await loadData(pathname);
-		return Response.json(data);
-	} catch (e) {
-		console.error(e);
-		return new Response("Internal server error", { status: 500 });
-	}
+  const pathname = event.url.searchParams.get("path") ?? "/";
+  try {
+    const data = await loadData(pathname);
+    return Response.json(data);
+  } catch (e) {
+    console.error(e);
+    return new Response("Internal server error", { status: 500 });
+  }
 });
 
 // SSR fallback
 app.all("/**", async (event) => {
-	try {
-		const url = new URL(event.request.url);
-		const { html: appHtml, status, data } = await render(url.pathname);
-
-		// Inject preload hints for the entry chunk and its CSS
-		const entry = manifest["src/entry-client.tsx"];
-		const headTags = [
-			`<script type="module" src="/${entry.file}"></script>`,
-			`<link rel="modulepreload" href="/${entry.file}" />`,
-			...(entry.css?.map((href) => `<link rel="stylesheet" href="/${href}" />`) ?? []),
-			`<script>window.__EIGEN_DATA__ = ${JSON.stringify(data)}</script>`,
-		].join("\n    ");
-
-		const finalHtml = template
-			.replace("<!--ssr-outlet-->", appHtml)
-			.replace("</head>", `    ${headTags}\n  </head>`);
-
-		return new Response(finalHtml, {
-			status,
-			headers: { "Content-Type": "text/html" },
-		});
-	} catch (e) {
-		console.error(e);
-		return new Response("Internal server error", { status: 500 });
-	}
+  try {
+    const { html: appHtml, status, data } = await render(event.url.pathname);
+    return new Response(composeHtml(template, appHtml, data), {
+      status,
+      headers: { "Content-Type": "text/html; charset=utf-8" },
+    });
+  } catch (e) {
+    console.error(e);
+    return new Response("Internal server error", { status: 500 });
+  }
 });
 
 serve(app, { port: 3000 });
 console.log("Production server: http://localhost:3000");
 ```
 
+Like `server.ts`, this file runs under `tsx` and is type-checked as tooling code, so add it to `tsconfig.node.json` from [Part 1](/01-bare-vite-spa):
+
+```json title="tsconfig.node.json"
+{
+  "include": ["vite.config.ts", "plugins/**/*", "server.ts"] // [!code --]
+  "include": ["vite.config.ts", "plugins/**/*", "server.ts", "server.prod.ts"] // [!code ++]
+}
+```
+
 Compared to the dev server in [Part 3](/03-server-side-rendering#the-custom-dev-server), four things changed:
 
-- **No Vite instance.** No `createViteServer`, no [`ssrLoadModule`](https://vite.dev/guide/api-javascript#vitedevserver-ssrloadmodule), no [`transformIndexHtml`](https://vite.dev/guide/api-javascript#vitedevserver-transformindexhtml), no [`fromNodeHandler(vite.middlewares)`](https://vite.dev/guide/ssr#setting-up-the-dev-server) glue. Production doesn't import `vite` at all.
-- **Static file serving replaces Vite's middleware.** [`serveStatic`](https://h3.dev/utils/serve-static) from H3 hands out the pre-built files in `dist/client/assets`. We use `h3` directly here (not `h3/node` like the dev server) — the production handler is pure web-standard code.
-- **`import()` instead of `ssrLoadModule`.** The server entry is a pre-built ESM module that Node loads once at startup. Top-level await holds the import promise so subsequent requests pay nothing.
-- **Manifest-driven asset injection.** The build already rewrote asset URLs in the HTML, but the `<script type="module" src="/src/entry-client.tsx">` tag from [Part 3](/03-server-side-rendering#updating-the-html-template) was a dev placeholder. We swap it for the hashed path resolved through the manifest, alongside `modulepreload` hints and the CSS link tag.
+- **No Vite instance.** No `createViteServer`, no module runner, no [`transformIndexHtml`](https://vite.dev/guide/api-javascript#vitedevserver-transformindexhtml), no [`fromNodeHandler(vite.middlewares)`](https://vite.dev/guide/ssr#setting-up-the-dev-server) glue. Production doesn't import `vite` at all.
+- **Static file serving replaces Vite's middleware.** H3's [`serveStatic`](https://h3.dev/examples/serve-static-assets) is called inside a handler with two callbacks. `getMeta` stats the file (a missing file makes `serveStatic` answer 404), and `getContents` reads it. It handles `HEAD`, `Last-Modified`/`If-Modified-Since`, and MIME types; the `headers` option adds our cache policy. We import from `h3` directly here (not `h3/node` like the dev server). `serve` picks the Node adapter at runtime, and the handlers themselves are web-standard code.
+- **`import()` instead of `runner.import()`.** The server entry is a pre-built ESM module that Node loads once at startup. Top-level await holds the import promise so subsequent requests pay nothing.
+- **The built template replaces `transformIndexHtml`.** In dev, `index.html` still says `<script type="module" src="/src/entry-client.tsx">` and Vite injects `/@vite/client` per request. The build has already rewritten `dist/client/index.html` to point at `/assets/index-a1b2c3d4.js` and added the CSS link. The server reads it once and only splices in the per-request parts.
 
-The data endpoint is the new piece. In dev, [Part 5's plugin middleware](/05-typed-loaders#the-data-endpoint) handled `/_eigen/data` because `configureServer` had a Vite instance to call `ssrLoadModule` on. Production has no Vite, no plugin, no `configureServer` — but it does have `loadData` exported from the pre-built bundle, which is enough. Same `runLoader` underneath, same JSON contract on the wire, different glue.
+The data endpoint is the new piece. In dev, [Part 5's plugin middleware](/05-typed-loaders#the-data-endpoint) handled `/_eigen/data` because `configureServer` had a Vite instance whose SSR environment could import `eigen/routes`. Production has no Vite, no plugin, no `configureServer` — but it does have `loadData` exported from the pre-built bundle, which is enough. Same `runLoader` underneath, same JSON contract on the wire, different glue.
 
 ```mermaid
 flowchart LR
     subgraph dev["Dev: Part 5"]
         D1["Browser"] --> D2["Vite middleware"]
         D2 --> D3["plugin /_eigen/data"]
-        D3 --> D4["ssrLoadModule('eigen/routes')"]
+        D3 --> D4["ssr runner.import('eigen/routes')"]
         D4 --> D5["runLoader(path, routes)"]
     end
     subgraph prod["Prod: this part"]
@@ -298,7 +329,7 @@ flowchart LR
 
 <Callout type="info" title="Why a separate file from `server.ts`?">
 
-Splitting the dev server (`server.ts`) and production server (`server.prod.ts`) keeps each file focused on what it actually needs. The dev server's only job is mounting Vite as middleware and forwarding requests to `ssrLoadModule`. The production server's job is reading pre-built files and serving them. Folding both into one file means a `if (process.env.NODE_ENV === 'production') { ... } else { ... }` split that doubles the imports and obscures both paths.
+Splitting the dev server (`server.ts`) and production server (`server.prod.ts`) keeps each file focused on what it actually needs. The dev server's only job is mounting Vite as middleware and rendering through the SSR environment's module runner. The production server's job is reading pre-built files and serving them. Folding both into one file means a `if (process.env.NODE_ENV === 'production') { ... } else { ... }` split that doubles the imports and obscures both paths.
 
 In [Part 17](/17-deployment-adapters), we'll replace `server.prod.ts` entirely. The production server becomes a build artifact — generated by an adapter plugin that wraps `loadData` and `render` in platform-specific glue (Netlify Functions, Cloudflare Workers, Node, etc.). For now, hand-writing it makes the moving parts visible.
 
@@ -316,25 +347,37 @@ After running `npm run build`, you'll have:
       <Folder name=".vite" defaultOpen>
         <File name="manifest.json" comment="Maps source → hashed filenames" />
       </Folder>
-      <File name="index.html" comment="Built HTML (script tags rewritten)" />
+      <File name="index.html" comment="Built HTML template (hashed script + CSS tags)" />
       <Folder name="assets" defaultOpen>
-        <File name="entry-client-a1b2c3d4.js" comment="Client entry" />
+        <File name="index-a1b2c3d4.js" comment="Client entry (entry-client.tsx + React)" />
+        <File name="index-e5f6g7h8.css" comment="Extracted CSS" />
         <File name="Home-m3n4o5p6.js" comment="Lazy-loaded page chunk" />
+        <File name="About-u1v2w3x4.js" comment="Lazy-loaded page chunk" />
         <File name="_id_-q7r8s9t0.js" comment="Lazy-loaded posts/[id] chunk" />
-        <File name="_vendor-i9j0k1l2.js" comment="Shared vendor chunk (React, ReactDOM)" />
       </Folder>
     </Folder>
     <Folder name="server" defaultOpen>
-      <File name="entry-server.js" comment="Server bundle (no hashing, no splitting)" />
+      <File name="entry-server.js" comment="Server bundle (unhashed entry)" />
     </Folder>
   </Folder>
 </Files>
 
-The `dist/client/` directory is entirely static — drop it on a CDN and it serves correctly. The `dist/server/` directory contains a single ESM module that any Node-compatible runtime can `import()`.
+The `dist/client/assets/` directory is entirely static — drop it on a CDN and it serves correctly. (`dist/client/index.html` is a _template_ with an unfilled `<!--ssr-outlet-->`, so don't serve it as a page.) The `dist/server/` directory contains an ESM module that any Node-compatible runtime can `import()`.
 
 **Type annotations are stripped.** The production bundles are pure JavaScript. TypeScript was a dev-time concern; the build output has no trace of it. The `.d.ts` files we generated in [Part 2](/02-route-discovery-plugin#type-declarations) live under `node_modules/.eigen/` and are also irrelevant at runtime — they exist to inform the type checker, not the runtime.
 
-**Loaders are gone from the client.** Search `dist/client/assets/*.js` for the body of any loader function — `fetch('https://jsonplaceholder...')`, for example — and you won't find it. The client virtual module never imports loaders, and Rolldown's tree-shaker does the rest. (Tree-shaking handles the *named-export* case from [Part 2](/02-route-discovery-plugin); for loaders that import Node-only modules at the top level, we need the `transform` hook from [Part 7](/07-transform-hook). That's the next part.)
+### Loaders are still in the client bundle
+
+Search the client output for the body of a loader:
+
+```bash
+grep -l jsonplaceholder dist/client/assets/*.js
+# dist/client/assets/_id_-q7r8s9t0.js
+```
+
+The `posts/[id]` page chunk contains the loader, `fetch("https://jsonplaceholder…")` and all. You might expect tree-shaking to remove it, since the client branch of `eigen/routes` never reads `.loader`. But that branch loads each page with `React.lazy(() => import("/src/pages/posts/[id].tsx"))`. A dynamic `import()` resolves to the module's _namespace object_, and here that object is handed straight to `React.lazy`. Rolldown can't prove which properties of it will be read, so it keeps every export. (Bundlers can tree-shake a dynamic import only when the code destructures specific names right at the call site, such as `import("./x").then(({ default: Page }) => …)`.)
+
+So in this part, loader code ships to the browser. It never _runs_ there (the client gets data from `/_eigen/data`), but it costs bytes, and it can leak server-side details. Worse, if a loader's file imports a Node-only module (`import { readFile } from "node:fs"`), Vite replaces that module with an empty browser stub and prints a warning ("Module "node:fs" has been externalized for browser compatibility"), and the page chunk carries a broken reference. Removing loaders from the client is a job for the `transform` hook, and that's [Part 7](/07-transform-hook).
 
 ---
 
@@ -342,15 +385,15 @@ The `dist/client/` directory is entirely static — drop it on a CDN and it serv
 
 1. **Run the build.** `npm run build` produces both directories. Watch the terminal output — Vite reports chunk sizes and warns about chunks larger than 500 KB.
 
-2. **Inspect the manifest.** Open `dist/client/.vite/manifest.json` and trace how source paths map to hashed filenames. Each `src/pages/*.tsx` file becomes its own `isDynamicEntry: true` chunk because of the `React.lazy` import in the client virtual module.
+2. **Inspect the manifest and the built HTML.** Open `dist/client/.vite/manifest.json` and trace how source paths map to hashed filenames. Each `src/pages/*.tsx` file becomes its own `isDynamicEntry: true` chunk because of the `React.lazy` import in the client virtual module. Then open `dist/client/index.html`: the dev `<script src="/src/entry-client.tsx">` is gone, replaced by a `<script type="module" crossorigin src="/assets/index-….js">` in `<head>` plus the CSS link, with `<!--ssr-outlet-->` still waiting to be filled.
 
 3. **Run the production server.** With both builds complete, `npx tsx server.prod.ts`. Compare it to the dev server: same HTML structure in the response body, but the asset URLs in `<head>` now point at hashed files in `/assets/`, not `/src/...` or `/@vite/client`.
 
 4. **Verify the data endpoint ported over.** Start on `http://localhost:3000/posts/1`, click "Post 2". The Network tab shows `GET /_eigen/data?path=%2Fposts%2F2` returning the new post's JSON — exactly the same flow as in [Part 5](/05-typed-loaders#what-to-observe), but now served by the H3 route in `server.prod.ts` instead of the plugin middleware.
 
-5. **Confirm loaders are gone from the client bundle.** `grep jsonplaceholder dist/client/assets/*.js` returns nothing. The same grep against `dist/server/entry-server.js` finds the loader body — it's only in the server bundle, where it belongs.
+5. **Find the loader in the client bundle.** `grep -l jsonplaceholder dist/client/assets/*.js` prints the `posts/[id]` page chunk. The same grep against `dist/server/entry-server.js` finds it too. The server is where it belongs; the client copy is the problem [Part 7](/07-transform-hook) fixes.
 
-6. **Cache headers.** The `serveStatic` config sets `max-age=31536000` (one year) on `/assets/**`. Open DevTools → Network and confirm. Hashed filenames make this safe: when you change a file, its hash changes, so the URL changes, and the browser can't serve the stale version.
+6. **Cache headers.** The `serveStatic` call sets `Cache-Control: public, max-age=31536000, immutable` (one year) on `/assets/**`. Open DevTools → Network and confirm. Request a file that doesn't exist (`/assets/nope.js`) and you get a 404 from `serveStatic`, not the SSR fallback. Hashed filenames make this safe: when you change a file, its hash changes, so the URL changes, and the browser can't serve the stale version.
 
 ---
 
@@ -358,101 +401,65 @@ The `dist/client/` directory is entirely static — drop it on a CDN and it serv
 
 The production build is where "two module graphs" becomes "two output directories." The same plugin pipeline that served on-demand modules in dev now produces concrete files; the same `eigen/routes` virtual module emits client-flavored code into `dist/client/` and server-flavored code into `dist/server/`. Nothing about the plugin changes — only when it runs and what consumes its output.
 
-The manifest is the seam. It carries the build's knowledge of "which source path became which hashed filename" forward to runtime, where the production server reads it and injects the right `<script>` and `<link>` tags. Every Vite-based SSR framework has this exact shape: build client → build server → use the manifest to bridge them at request time.
+The client build's outputs are the seam. The built `index.html` carries "which hashed files does the entry need" forward to runtime. The manifest carries the rest of the build's knowledge ("which source path became which hashed chunk") for anything the HTML can't know in advance, like per-route preloads and CSS. Every Vite-based SSR framework has this shape: build client → build server → use the client build's outputs to bridge them at request time.
 
-The data endpoint is a smaller version of the same migration. In dev, it's a closure over `server.ssrLoadModule` mounted by `configureServer`. In production, it's an H3 route over an `import()`-ed bundle. The middleware code disappears; the work it did (match → run loader → JSON) gets re-expressed against whatever runtime exists. We'll do this migration again, in different forms, for API routes ([Part 8](/08-dev-middleware)), framework middleware ([Part 14](/14-framework-middleware)), and deployment adapters ([Part 17](/17-deployment-adapters)).
+The data endpoint is a smaller version of the same migration. In dev, it's a closure over the SSR environment's module runner, mounted by `configureServer`. In production, it's an H3 route over an `import()`-ed bundle. The middleware code disappears; the work it did (match → run loader → JSON) gets re-expressed against whatever runtime exists. We'll do this migration again, in different forms, for API routes ([Part 8](/08-dev-middleware)), framework middleware ([Part 14](/14-framework-middleware)), and deployment adapters ([Part 17](/17-deployment-adapters)).
 
-In [Part 11](/11-framework-plugin), we'll see how [`buildApp`](https://vite.dev/guide/api-plugin#buildapp) — the Vite 7+ hook for build orchestration — lets the framework coordinate both builds in a single `vite build` command, eliminating the `npm run build:client && npm run build:server` shell glue.
+In [Part 11](/11-framework-plugin), we'll see how [`buildApp`](https://vite.dev/guide/api-environment-frameworks#the-buildapp-plugin-hook) — the plugin hook for app-level build orchestration — lets the framework coordinate both builds in a single `vite build` command, eliminating the `npm run build:client && npm run build:server` shell glue.
 
 ---
 
 <TestSection title="Testing: HTML composition">
 
-The production server's request-handling code is mostly I/O, but the *HTML composition* — splicing rendered markup, manifest-driven script tags, and serialized data into the template — is a pure string transformation. Like `buildHref` in [Part 4](/04-hydration), it's worth extracting and testing separately, because a typo in the splice logic produces a broken page that may not fail loudly until users see it.
-
-```typescript title="packages/eigen/compose-html.ts"
-export interface ManifestEntry {
-	file: string;
-	css?: string[];
-}
-
-export function composeHtml(
-	template: string,
-	appHtml: string,
-	entry: ManifestEntry,
-	data: unknown,
-): string {
-	const headTags = [
-		`<script type="module" src="/${entry.file}"></script>`,
-		`<link rel="modulepreload" href="/${entry.file}" />`,
-		...(entry.css?.map((href) => `<link rel="stylesheet" href="/${href}" />`) ?? []),
-		`<script>window.__EIGEN_DATA__ = ${JSON.stringify(data)}</script>`,
-	].join("\n    ");
-
-	return template
-		.replace("<!--ssr-outlet-->", appHtml)
-		.replace("</head>", `    ${headTags}\n  </head>`);
-}
-```
+The production server's request-handling code is mostly I/O, but `composeHtml`, which splices rendered markup and serialized data into the built template, is a pure string transformation. Like `buildHref` in [Part 4](/04-hydration), it's worth testing separately, because a typo in the splice logic produces a broken page that may not fail loudly until users see it.
 
 ```typescript title="packages/eigen/__tests__/compose-html.test.ts"
 import { describe, expect, it } from "vitest";
 import { composeHtml } from "../compose-html";
 
+// Shaped like dist/client/index.html after the build
 const template = `<!DOCTYPE html>
 <html>
-  <head><title>Eigen</title></head>
+  <head><title>Eigen</title>
+  <script type="module" crossorigin src="/assets/index-abc.js"></script>
+</head>
   <body><div id="root"><!--ssr-outlet--></div></body>
 </html>`;
 
 describe("composeHtml", () => {
-	it("substitutes the SSR outlet with rendered markup", () => {
-		const out = composeHtml(template, "<h1>Hello</h1>", { file: "x.js" }, null);
-		expect(out).toContain("<div id=\"root\"><h1>Hello</h1></div>");
-		expect(out).not.toContain("<!--ssr-outlet-->");
-	});
+  it("substitutes the SSR outlet with rendered markup", () => {
+    const out = composeHtml(template, "<h1>Hello</h1>", null);
+    expect(out).toContain('<div id="root"><h1>Hello</h1></div>');
+    expect(out).not.toContain("<!--ssr-outlet-->");
+  });
 
-	it("injects the entry script and modulepreload tag", () => {
-		const out = composeHtml(template, "", { file: "assets/entry-abc.js" }, null);
-		expect(out).toContain('<script type="module" src="/assets/entry-abc.js">');
-		expect(out).toContain('<link rel="modulepreload" href="/assets/entry-abc.js" />');
-	});
+  it("keeps the build's hashed entry script", () => {
+    const out = composeHtml(template, "", null);
+    expect(out).toContain('<script type="module" crossorigin src="/assets/index-abc.js">');
+  });
 
-	it("injects stylesheet links from the manifest entry", () => {
-		const out = composeHtml(
-			template,
-			"",
-			{ file: "x.js", css: ["assets/style-abc.css"] },
-			null,
-		);
-		expect(out).toContain('<link rel="stylesheet" href="/assets/style-abc.css" />');
-	});
+  it("serializes loader data into __EIGEN_DATA__", () => {
+    const data = { id: 1, title: "Post 1" };
+    const out = composeHtml(template, "", data);
+    expect(out).toContain(`<script>window.__EIGEN_DATA__ = ${JSON.stringify(data)}</script>`);
+  });
 
-	it("omits stylesheet links when the entry has no css", () => {
-		const out = composeHtml(template, "", { file: "x.js" }, null);
-		expect(out).not.toContain("rel=\"stylesheet\"");
-	});
+  it("can't be broken out of by a </script> inside the data", () => {
+    const out = composeHtml(template, "", { body: "</script><script>alert(1)</script>" });
+    expect(out.match(/<\/script>/g)).toHaveLength(2); // the entry's and ours
+    expect(out).toContain("\\u003c/script\\u003e");
+  });
 
-	it("serializes loader data into __EIGEN_DATA__", () => {
-		const data = { id: 1, title: "Post 1" };
-		const out = composeHtml(template, "", { file: "x.js" }, data);
-		expect(out).toContain(
-			`<script>window.__EIGEN_DATA__ = ${JSON.stringify(data)}</script>`,
-		);
-	});
-
-	it("inserts head tags before </head>, not after", () => {
-		const out = composeHtml(template, "", { file: "x.js" }, null);
-		const headEnd = out.indexOf("</head>");
-		const script = out.indexOf("<script type=\"module\"");
-		expect(script).toBeLessThan(headEnd);
-	});
+  it("inserts the data script before </head>, not after", () => {
+    const out = composeHtml(template, "", null);
+    const headEnd = out.indexOf("</head>");
+    const script = out.indexOf("window.__EIGEN_DATA__");
+    expect(script).toBeLessThan(headEnd);
+  });
 });
 ```
 
-The last assertion catches a real failure mode: writing `template.replace('</head>', '<script>...</script></head>')` works, but writing `'</head><script>...'` puts the script after the closing tag, which most browsers tolerate but some validators (and HTTP/2 server-push hints) won't. Tests like this make the splice contract explicit.
-
-Once `composeHtml` is extracted, swap the inline expression in `server.prod.ts` for a single call. `JSON.stringify` for `__EIGEN_DATA__` is fine for the tutorial, but a production framework should use a dedicated escaper (e.g., [`devalue`](https://github.com/Rich-Harris/devalue)) to handle `</script>` sequences inside string values — leaving that detail for [Part 12](/12-streaming-ssr), where the streaming SSR pipeline forces us to confront it anyway.
+The `</script>` test is the one that justifies `serializeForScript`. Plain `JSON.stringify` would emit the post body's `</script>` verbatim, the browser's HTML parser would end our script tag there, and whatever followed would run as markup. The last assertion catches a quieter failure mode: writing `'</head><script>…'` instead of `'<script>…</head>'` puts the script outside `<head>`. Browsers tolerate it, but it's invalid HTML. Tests like this make the splice contract explicit.
 
 Run with `pnpm vitest run packages/`.
 
@@ -464,12 +471,12 @@ Run with `pnpm vitest run packages/`.
 - [Vite SSR: Building for Production](https://vite.dev/guide/ssr#building-for-production) — The official walkthrough of the two-build pattern, including `--ssr`, externalization, and manifest usage.
 - [Vite Backend Integration](https://vite.dev/guide/backend-integration) — How non-Vite servers consume the manifest, with field-level reference for `file`, `imports`, `css`, `assets`, and `dynamicImports`.
 - [Rolldown Documentation](https://rolldown.rs/guide/introduction) — The Rust-based bundler powering Vite 8's production builds, with Rollup-compatible plugin support.
-- [H3 `serveStatic`](https://h3.dev/utils/serve-static) — Reference for the static asset middleware used in `server.prod.ts`, including ETag and `If-None-Match` handling.
+- [H3: Serve Static Assets](https://h3.dev/examples/serve-static-assets) — The `serveStatic(event, { getContents, getMeta })` pattern used in `server.prod.ts`.
 - [HTTP Caching (MDN)](https://developer.mozilla.org/en-US/docs/Web/HTTP/Caching) — Background on `Cache-Control: max-age` and content-addressed caching, which justify the year-long max-age on hashed assets.
-- [`devalue`](https://github.com/Rich-Harris/devalue) — A safer alternative to `JSON.stringify` for embedding loader data in HTML, used by [SvelteKit](https://kit.svelte.dev) and [Remix](https://remix.run).
+- [`devalue`](https://github.com/Rich-Harris/devalue) — A richer alternative to `serializeForScript`, used by [SvelteKit](https://svelte.dev/docs/kit), that also round-trips `Date`, `Map`, `Set`, and cyclic references.
 
 ---
 
 ## What's next
 
-In [Part 7](/07-transform-hook), we dive into the `transform` hook — the most powerful and dangerous tool in the plugin API. Tree-shaking removed the loaders themselves from the client bundle in this part, but it can't help when a page component's *top-level imports* drag Node-only modules (database drivers, `fs`, `path`) into the client graph. We'll write a transform that strips loader exports — and the imports only they depend on — before Rolldown ever sees them, and weigh regex-based stripping against AST parsing with the TypeScript compiler API.
+In [Part 7](/07-transform-hook), we dive into the `transform` hook — the most powerful and dangerous tool in the plugin API. Tree-shaking couldn't remove loaders from the lazily imported page chunks in this part, and it can't stop a page's _top-level imports_ from dragging Node-only modules (database drivers, `fs`, `path`) into the client graph either. We'll write a transform that strips loader exports — and the imports only they depend on — from client-side page modules, and see why that job calls for a real parser rather than regular expressions.

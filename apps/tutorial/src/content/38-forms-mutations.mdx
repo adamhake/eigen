@@ -9,8 +9,7 @@ concepts:
   - "cache revalidation after mutation"
 ---
 
-
-*Forms are where every framework layer converges — routing, server functions, validation, caching. This module builds a forms and mutations system on top of [Part 15](/15-server-functions) (server functions), [Part 14](/14-framework-middleware) (middleware), and [Part 25](/25-use-cache) (`"use cache"`). The guiding principle: progressive enhancement isn't a nice-to-have, it's the foundation the JavaScript-enhanced experience builds on.*
+_Forms are where every framework layer converges — routing, server functions, validation, caching. This module builds a forms and mutations system on top of [Part 15](/15-server-functions) (server functions), [Part 14](/14-framework-middleware) (middleware), and [Part 25](/25-use-cache) (`"use cache"`). The guiding principle: progressive enhancement isn't a nice-to-have, it's the foundation the JavaScript-enhanced experience builds on._
 
 ---
 
@@ -24,13 +23,13 @@ Submit → Validate → Mutate → Revalidate → Update UI
 
 In Eigen, this maps directly to existing primitives:
 
-| Step | Primitive | Where it runs |
-|---|---|---|
-| **Submit** | `<form action={serverFn}>` or `useServerFn()` | Client → Server |
-| **Validate** | `.validator()` (from Part 15) + client-side schema | Both |
-| **Mutate** | Server function `.handler()` | Server |
-| **Revalidate** | `revalidateTag()` (from Part 25) | Server |
-| **Update UI** | React re-render with fresh data | Client |
+| Step           | Primitive                                                           | Where it runs   |
+| -------------- | ------------------------------------------------------------------- | --------------- |
+| **Submit**     | `<Form action={serverFn}>`, or calling the server function directly | Client → Server |
+| **Validate**   | `.validator()` (from Part 15) + client-side schema                  | Both            |
+| **Mutate**     | Server function `.handler()`                                        | Server          |
+| **Revalidate** | `revalidateTag()` (from Part 25)                                    | Server          |
+| **Update UI**  | React re-render with fresh data                                     | Client          |
 
 The framework's job is wiring these steps together so they work without JavaScript (progressive enhancement) and feel instant with JavaScript (optimistic UI).
 
@@ -38,32 +37,34 @@ The framework's job is wiring these steps together so they work without JavaScri
 
 ## Progressive enhancement
 
-The foundation: a form that works with zero client-side JavaScript. The browser submits a standard HTML form, the server processes it, and the page reloads with the result.
+The foundation: a form that works with zero client-side JavaScript. The browser submits a standard HTML form, the server processes it, and the browser follows a redirect to the result.
 
 ### Wiring forms to server functions
 
-When a server function is passed as a form's `action`, Eigen generates an endpoint that accepts `FormData`:
+Every server function already knows its endpoint: [Part 15](/15-server-functions)'s transform sets `.url` (`/_eigen/fn/<id>`) on the server-side function, and the client stub carries the same `.url`. Eigen's `<Form>` component uses it:
 
-```tsx title="src/pages/NewPost.tsx"
-import { createServerFn } from 'eigen/server'
-import { db } from '../lib/database'
+```tsx title="src/pages/posts/new.tsx"
+import { z } from "zod";
+import { createServerFn } from "eigen/server";
+import { redirect } from "eigen/middleware";
+import { Form } from "eigen/forms";
+import { db } from "../../lib/database";
 
-const createPost = createServerFn()
-  .validator((fd: FormData) => ({
-    title: fd.get('title') as string,
-    body: fd.get('body') as string,
-  }))
+export const createPost = createServerFn()
+  .validator(
+    z.object({
+      title: z.string().min(1),
+      body: z.string().min(1),
+    }),
+  )
   .handler(async ({ data }) => {
-    await db.query(
-      'INSERT INTO posts (title, body) VALUES ($1, $2)',
-      [data.title, data.body],
-    )
-    return { redirect: '/posts' }
-  })
+    await db.query("INSERT INTO posts (title, body) VALUES ($1, $2)", [data.title, data.body]);
+    redirect("/posts");
+  });
 
 export default function NewPost() {
   return (
-    <form action={createPost} method="post">
+    <Form action={createPost}>
       <label>
         Title
         <input name="title" required />
@@ -73,58 +74,148 @@ export default function NewPost() {
         <textarea name="body" required />
       </label>
       <button type="submit">Create Post</button>
-    </form>
-  )
+    </Form>
+  );
 }
 ```
 
-### How the transform works
+The server function must be an `export` — Part 15's transform only rewrites exported `createServerFn(...)` chains. `redirect()` from [Part 14](/14-framework-middleware) throws, so the handler's job ends there; the endpoint turns it into the right kind of redirect for each kind of caller.
 
-The `transform` hook (from [Part 7](/07-transform-hook)) rewrites `action={createPost}` differently per environment:
+<Callout type="warning" title="CSRF token for no-JS posts">
+If your app uses [Part 33](/33-authentication-authorization)'s auth, its global CSRF middleware also guards this endpoint. The client stub sends the token in the `X-Eigen-CSRF` header, but a plain HTML form can't set headers — so put it in the body: render `<input type="hidden" name="_csrf" value={useCsrfToken()} />` (from `eigen/auth/session`) inside the `<Form>`. The middleware accepts either source.
+</Callout>
 
-**Server (SSR):** The form renders with `action="/api/__eigen/fn/createPost"` and `method="post"` — a standard HTML form pointing to the server function's generated endpoint.
+### How `<Form>` works
 
-**Client (with JS):** The form action is intercepted. Instead of a full-page navigation, the client calls the server function via `fetch` and handles the response.
+`<Form>` renders differently per environment:
 
-```typescript title="packages/eigen/src/plugins/form-actions.ts"
-import type { Plugin } from 'vite'
+**Server (SSR):** a plain HTML form — `action="/_eigen/fn/<id>" method="post"` — pointing at the server function's endpoint. It works before (or without) any JavaScript.
 
-export function eigenFormActionsPlugin(): Plugin {
-  return {
-    name: 'eigen:form-actions',
+**Client (after hydration):** a React 19 form action. React calls it inside a transition with the form's `FormData`, which is what makes `useFormStatus` and `useOptimistic` work, and resets the form after a successful submission.
 
-    transform(code, id, options) {
-      if (!id.endsWith('.tsx') && !id.endsWith('.jsx')) return null
-      if (!code.includes('action={')) return null
+```tsx title="packages/eigen/forms.tsx"
+import type { ComponentProps } from "react";
+import type { ServerFn } from "./server";
 
-      // Detect <form action={serverFn}> patterns
-      // In the SSR environment: render the endpoint URL as a string
-      // In the client environment: wrap with the form action handler
-      if (options?.ssr) {
-        // Simplified — a real implementation would check for
-        // an existing method attribute before adding one
-        return {
-          code: code.replace(
-            /action=\{(\w+)\}/g,
-            'action={$1.__url} method="post"',
-          ),
-        }
-      }
+type FormProps = Omit<ComponentProps<"form">, "action" | "method" | "encType"> & {
+  action: ServerFn<any, unknown>;
+};
 
-      // Client: wrap form submission
-      return {
-        code: code.replace(
-          /action=\{(\w+)\}/g,
-          'action={$1.__url} onSubmit={__eigenFormHandler($1)}',
-        ),
-      }
-    },
+export function Form({ action, ...props }: FormProps) {
+  if (import.meta.env.SSR) {
+    // No JavaScript yet: a real form that posts to the endpoint
+    return <form {...props} action={action.url} method="post" />;
+  }
+
+  // Hydrated: a React form action that calls the client stub
+  return (
+    <form
+      {...props}
+      action={async (formData: FormData) => {
+        // The stub sends the CSRF token as a header (Part 33), not a field
+        const { _csrf, ...input } = Object.fromEntries(formData);
+        await action(input);
+      }}
+    />
+  );
+}
+```
+
+The server and client render different `action` values, and that's fine: when the client-side `action` is a function, React skips hydration checks for the form's `action`, `method`, and `encType` attributes, precisely because frameworks render their own progressive-enhancement attributes on the server. Both paths send the validator the same shape — a plain object built from the form fields (file inputs would need a multipart path, which this toy leaves out).
+
+### The endpoint accepts form posts
+
+[Part 15](/15-server-functions)'s `handleServerFnRequest` only accepts `application/json`, so a no-JS submission (`application/x-www-form-urlencoded`) would get a 415. Part 38 extends the endpoint with a second, form-specific branch. The Origin check moves to the top so it guards both branches — browsers send `Origin` on every form `POST`, so a cross-site form is still rejected:
+
+```typescript title="packages/eigen/server-fn-endpoint.ts (Part 38 changes)"
+export async function handleServerFnRequest(
+  request: Request,
+  serverFns: Record<string, ServerFnRegistration>,
+  globalMiddleware: MiddlewareFn<any, any>[],
+): Promise<Response> {
+  if (request.method !== "POST") {
+    return new Response("Method Not Allowed", { status: 405, headers: { Allow: "POST" } });
+  }
+
+  // Now first: applies to JSON calls and form posts alike
+  if (!isSameOrigin(request)) {
+    return new Response("Forbidden", { status: 403 });
+  }
+
+  const pathname = new URL(request.url).pathname;
+  const fnId = pathname.slice(SERVER_FN_PREFIX.length);
+  const registration = Object.hasOwn(serverFns, fnId) ? serverFns[fnId] : undefined;
+  if (!registration) return Response.json({ error: "Server function not found" }, { status: 404 });
+
+  // New: a native form submission (no JavaScript)
+  if (isFormSubmission(request)) {
+    return handleFormSubmission(request, registration, globalMiddleware, pathname);
+  }
+
+  if (!request.headers.get("content-type")?.startsWith("application/json")) {
+    return new Response("Unsupported Media Type", { status: 415 });
+  }
+
+  // ...the JSON path from Part 15, unchanged
+}
+
+function isFormSubmission(request: Request): boolean {
+  const type = request.headers.get("content-type") ?? "";
+  return type.startsWith("application/x-www-form-urlencoded") || type.startsWith("multipart/form-data");
+}
+
+const seeOther = (location: string) => new Response(null, { status: 303, headers: { Location: location } });
+
+/** Send the browser back where it came from — same-origin paths only */
+function backTo(request: Request): string {
+  const referer = request.headers.get("referer");
+  if (!referer) return "/";
+  try {
+    const url = new URL(referer);
+    return url.origin === new URL(request.url).origin ? url.pathname + url.search : "/";
+  } catch {
+    return "/";
+  }
+}
+
+async function handleFormSubmission(
+  request: Request,
+  registration: ServerFnRegistration,
+  globalMiddleware: MiddlewareFn<any, any>[],
+  pathname: string,
+): Promise<Response> {
+  // Parse a clone: global middleware (e.g. Part 33's CSRF check, which reads
+  // the `_csrf` field) still needs to read the original body
+  const { _csrf, ...input } = Object.fromEntries(await request.clone().formData());
+
+  const { context, response } = await executeMiddleware(globalMiddleware, {
+    request,
+    params: {},
+    pathname,
+  });
+  // A real redirect (e.g. to /login): there's no client stub to read X-Eigen-Redirect
+  if (response) return response;
+
+  try {
+    await registration.fn(input, context);
+    return seeOther(backTo(request)); // Post/Redirect/Get back to the form's page
+  } catch (e) {
+    // redirect('/posts') in the handler → 303, so the browser follows with a GET
+    if (e instanceof RedirectResponse) return seeOther(e.url);
+    if (e instanceof Response) return e; // e.g. the 400 for invalid input
+    console.error(`Server function ${registration.exportName} (${registration.file}) failed:`, e);
+    return new Response("Server function failed", { status: 500 });
   }
 }
 ```
 
+With JavaScript, the same `redirect('/posts')` takes Part 15's JSON path: the endpoint answers with `X-Eigen-Redirect`, and the client stub navigates.
+
 <Callout type="info" title="No JavaScript? No problem.">
-With JS disabled, the browser sends a standard `POST` with `FormData`. The server function endpoint parses the `FormData`, runs the validator and handler, and responds with a redirect. The user sees a full-page reload to the new state. This is the baseline experience — everything else builds on top of it.
+  With JS disabled, the browser sends a standard `POST` with form-encoded fields. The endpoint's form branch parses
+  them, runs the global middleware, the function's middleware, the validator, and the handler, and responds with a `303
+  See Other`. The user sees a full-page navigation to the new state. This is the baseline experience — everything else
+  builds on top of it.
 </Callout>
 
 ---
@@ -133,54 +224,52 @@ With JS disabled, the browser sends a standard `POST` with `FormData`. The serve
 
 When JavaScript is available, the framework enhances forms with instant feedback, pending states, and no full-page reloads.
 
-### The `useServerFn` hook
+### Calling server functions directly
 
-For programmatic submissions outside of `<form>` elements — or when you need fine-grained control:
+For programmatic submissions outside of `<form>` elements — or when you need fine-grained control — call the server function. In the client bundle it _is_ the RPC stub from Part 15, so no hook or wrapper is needed:
 
 ```tsx title="src/components/LikeButton.tsx"
-import { useServerFn } from 'eigen/client'
-import { useTransition } from 'react'
-import { likePost } from '../actions/posts'
+import { useTransition } from "react";
+import { likePost } from "../actions/posts";
 
 export function LikeButton({ postId }: { postId: string }) {
-  const [isPending, startTransition] = useTransition()
-  const like = useServerFn(likePost)
+  const [isPending, startTransition] = useTransition();
 
   return (
     <button
       disabled={isPending}
       onClick={() => {
         startTransition(async () => {
-          await like({ postId })
-        })
+          await likePost({ postId });
+        });
       }}
     >
-      {isPending ? 'Liking...' : '♥ Like'}
+      {isPending ? "Liking..." : "♥ Like"}
     </button>
-  )
+  );
 }
 ```
 
-`useServerFn` returns a function with the same signature as the server function, but it calls the generated endpoint via `fetch` under the hood. Combined with `useTransition`, the UI stays responsive while the mutation runs.
+The stub has the same signature as the server function but calls the generated endpoint via `fetch` under the hood. Combined with `useTransition`, the UI stays responsive while the mutation runs.
 
 ### Pending states with forms
 
-For `<form>`-based submissions, Eigen provides a `useFormStatus` hook (matching React's built-in hook) that reads the pending state:
+For `<form>`-based submissions, React's `useFormStatus` hook (from `react-dom`) reads the pending state of the parent form:
 
 ```tsx title="src/components/SubmitButton.tsx"
-import { useFormStatus } from 'react-dom'
+import { useFormStatus } from "react-dom";
 
 export function SubmitButton() {
-  const { pending } = useFormStatus()
+  const { pending } = useFormStatus();
   return (
     <button type="submit" disabled={pending}>
-      {pending ? 'Saving...' : 'Save'}
+      {pending ? "Saving..." : "Save"}
     </button>
-  )
+  );
 }
 ```
 
-This works because Eigen wraps form submissions in React's action system — `startTransition` under the hood — so `useFormStatus` correctly reflects the pending state.
+`useFormStatus` only tracks a parent `<form>` whose `action` is a function — it doesn't see `onSubmit` handlers or manual `startTransition` calls. That's why the hydrated `<Form>` passes a function as `action` rather than intercepting `onSubmit`: React's form-action machinery is what reports `pending`. Render `<SubmitButton />` inside a `<Form>` (it must be a child component, not the component that renders the form).
 
 ---
 
@@ -190,80 +279,92 @@ Optimistic updates show the result of a mutation immediately, before the server 
 
 ### The `useOptimistic` pattern
 
-```tsx title="src/pages/TodoList.tsx"
-import { useOptimistic, useTransition } from 'react'
-import { useServerFn } from 'eigen/client'
-import { addTodo, type Todo } from '../actions/todos'
+```tsx title="src/pages/todos.tsx"
+import { startTransition, useOptimistic, useState } from "react";
+import { addTodo, type Todo } from "../actions/todos";
 
-export default function TodoList({ todos }: { todos: Todo[] }) {
-  const [isPending, startTransition] = useTransition()
-  const add = useServerFn(addTodo)
-  const [optimisticTodos, addOptimistic] = useOptimistic(
-    todos,
-    (state: Todo[], newTodo: Todo) => [...state, newTodo],
-  )
+export default function TodoList({ data }: { data: { todos: Todo[] } }) {
+  // Confirmed state, seeded from the loader
+  const [todos, setTodos] = useState(data.todos);
+  const [error, setError] = useState<string | null>(null);
+  const [optimisticTodos, addOptimistic] = useOptimistic(todos, (state: Todo[], newTodo: Todo) => [...state, newTodo]);
 
-  async function handleSubmit(formData: FormData) {
-    const title = formData.get('title') as string
-    const optimisticTodo: Todo = {
-      id: `temp-${Date.now()}`,
-      title,
-      completed: false,
-    }
+  // A form action: React already runs it inside a transition
+  async function addAction(formData: FormData) {
+    const title = String(formData.get("title") ?? "");
 
-    startTransition(async () => {
-      // Show the todo immediately
-      addOptimistic(optimisticTodo)
+    // Show the todo immediately
+    addOptimistic({ id: `temp-${Date.now()}`, title, completed: false });
+
+    try {
       // Then persist on the server
-      await add({ title })
-    })
+      const saved = await addTodo({ title });
+      setError(null);
+      // State updates after an await need their own transition
+      startTransition(() => setTodos((current) => [...current, saved]));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not add todo");
+    }
   }
 
   return (
     <>
       <ul>
-        {optimisticTodos.map(todo => (
-          <li key={todo.id} style={{
-            opacity: todo.id.startsWith('temp-') ? 0.6 : 1,
-          }}>
+        {optimisticTodos.map((todo) => (
+          <li
+            key={todo.id}
+            style={{
+              opacity: todo.id.startsWith("temp-") ? 0.6 : 1,
+            }}
+          >
             {todo.title}
           </li>
         ))}
       </ul>
-      <form action={handleSubmit}>
+      {error && <p role="alert">{error}</p>}
+      <form action={addAction}>
         <input name="title" required />
         <button type="submit">Add</button>
       </form>
     </>
-  )
+  );
 }
 ```
 
-The key: `useOptimistic` is scoped to a transition. If the server function throws, React rolls back the optimistic state automatically — the temporary todo disappears and the UI returns to the last confirmed state.
+The key: `useOptimistic` state lives only as long as the transition. When the action finishes — successfully or not — React drops the optimistic value and renders from the real state again. That's why the success path must update the confirmed state (`setTodos` with the saved row), or the new todo would vanish the moment the request completes. On failure there's nothing to undo: the temporary todo disappears on its own, and the `catch` turns the error into a message instead of letting it reach the nearest error boundary.
+
+This form uses a client-only action (it needs JavaScript). For a no-JS fallback, use `<Form action={addTodo}>`; the progressive-enhancement path and the optimistic path can't share one function, because only the server function has a `.url` to post to.
 
 ### Error rollback
 
-When a server function returns an error, the optimistic state unwinds:
+When a server function fails, the stub throws and the optimistic state unwinds:
 
-```tsx title="src/actions/todos.ts"
-import { createServerFn } from 'eigen/server'
-import { db } from '../lib/database'
+```typescript title="src/actions/todos.ts"
+import { z } from "zod";
+import { createServerFn } from "eigen/server";
+import { db } from "../lib/database";
+
+// A type alias, not an interface: Part 15's handler requires a JsonValue
+// result, and only type aliases get the implicit index signature that needs
+export type Todo = {
+  id: string;
+  title: string;
+  completed: boolean;
+};
 
 export const addTodo = createServerFn()
-  .validator((data: { title: string }) => {
-    if (!data.title.trim()) throw new Error('Title required')
-    return data
-  })
+  .validator(
+    z.object({
+      title: z.string().trim().min(1, "Title required"),
+    }),
+  )
   .handler(async ({ data }) => {
-    const result = await db.query(
-      'INSERT INTO todos (title) VALUES ($1) RETURNING *',
-      [data.title],
-    )
-    return result.rows[0]
-  })
+    const result = await db.query("INSERT INTO todos (title) VALUES ($1) RETURNING id, title, completed", [data.title]);
+    return result.rows[0] as Todo;
+  });
 ```
 
-If the `INSERT` fails (constraint violation, network error, etc.), the transition rejects, and `useOptimistic` reverts to the pre-mutation state. No manual rollback logic needed.
+If validation fails, the endpoint answers 400; if the `INSERT` fails (constraint violation, lost connection), it answers 500. Either way the stub rejects, `addAction`'s `catch` shows a message, and `useOptimistic` reverts to the confirmed list when the transition ends. No manual rollback logic needed.
 
 ---
 
@@ -274,61 +375,63 @@ Validation must run on the server (security) and should run on the client (UX). 
 ### Shared schema with zod
 
 ```typescript title="src/schemas/post.ts"
-import { z } from 'zod'
+import { z } from "zod";
 
 export const createPostSchema = z.object({
-  title: z.string().min(1, 'Title is required').max(200),
-  body: z.string().min(1, 'Body is required').max(10000),
-  tags: z.array(z.string()).max(5, 'Maximum 5 tags').optional(),
-})
+  title: z.string().min(1, "Title is required").max(200),
+  body: z.string().min(1, "Body is required").max(10000),
+  tags: z.array(z.string()).max(5, "Maximum 5 tags").optional(),
+});
 
-export type CreatePostInput = z.infer<typeof createPostSchema>
+export type CreatePostInput = z.infer<typeof createPostSchema>;
 ```
 
 This schema is consumed on both sides:
 
-**Server side** — via the server function's `.validator()`:
+**Server side** — via the server function's `.validator()`, which accepts any object with a `parse()` method:
 
 ```typescript title="src/actions/posts.ts"
-import { createServerFn } from 'eigen/server'
-import { createPostSchema } from '../schemas/post'
-import { db } from '../lib/database'
+import { createServerFn } from "eigen/server";
+import { createPostSchema } from "../schemas/post";
+import { db } from "../lib/database";
 
 export const createPost = createServerFn()
-  .validator(createPostSchema.parse)
+  .validator(createPostSchema)
   .handler(async ({ data }) => {
-    return db.query(
-      'INSERT INTO posts (title, body, tags) VALUES ($1, $2, $3) RETURNING *',
-      [data.title, data.body, data.tags ?? []],
-    )
-  })
+    const result = await db.query("INSERT INTO posts (title, body, tags) VALUES ($1, $2, $3) RETURNING id", [
+      data.title,
+      data.body,
+      data.tags ?? [],
+    ]);
+    return { id: result.rows[0].id as string };
+  });
 ```
 
 **Client side** — for instant feedback before submission:
 
-```tsx title="src/pages/NewPost.tsx"
-import { useState } from 'react'
-import { createPostSchema, type CreatePostInput } from '../schemas/post'
-import { createPost } from '../actions/posts'
+```tsx title="src/pages/posts/new.tsx"
+import { useState } from "react";
+import { createPostSchema } from "../../schemas/post";
+import { createPost } from "../../actions/posts";
 
 export default function NewPost() {
-  const [errors, setErrors] = useState<Record<string, string>>({})
+  const [errors, setErrors] = useState<Record<string, string>>({});
 
   async function handleSubmit(formData: FormData) {
-    const input = Object.fromEntries(formData)
-    const result = createPostSchema.safeParse(input)
+    const input = Object.fromEntries(formData);
+    const result = createPostSchema.safeParse(input);
 
     if (!result.success) {
-      const fieldErrors: Record<string, string> = {}
+      const fieldErrors: Record<string, string> = {};
       for (const issue of result.error.issues) {
-        fieldErrors[issue.path[0] as string] = issue.message
+        fieldErrors[String(issue.path[0])] = issue.message;
       }
-      setErrors(fieldErrors)
-      return
+      setErrors(fieldErrors);
+      return;
     }
 
-    setErrors({})
-    await createPost(result.data)
+    setErrors({});
+    await createPost(result.data);
   }
 
   return (
@@ -345,12 +448,14 @@ export default function NewPost() {
       </label>
       <button type="submit">Create</button>
     </form>
-  )
+  );
 }
 ```
 
 <Callout type="warning" title="Never trust client validation alone">
-Client-side validation is a UX optimization — it gives instant feedback. But the server function's `.validator()` is the security boundary. An attacker can bypass client-side checks entirely. The shared schema means you write the rules once, but they're enforced in both places.
+  Client-side validation is a UX optimization — it gives instant feedback. But the server function's `.validator()` is
+  the security boundary. An attacker can bypass client-side checks entirely (or simply call the endpoint). The shared
+  schema means you write the rules once, but they're enforced in both places.
 </Callout>
 
 ### Returning field-level errors from the server
@@ -359,26 +464,25 @@ When server validation catches something client validation missed (uniqueness co
 
 ```typescript title="src/actions/posts.ts"
 export const createPost = createServerFn()
-  .validator(createPostSchema.parse)
+  .validator(createPostSchema)
   .handler(async ({ data }) => {
-    const existing = await db.query(
-      'SELECT id FROM posts WHERE title = $1',
-      [data.title],
-    )
+    const existing = await db.query("SELECT id FROM posts WHERE title = $1", [data.title]);
     if (existing.rows.length > 0) {
       return {
         error: true,
-        fieldErrors: { title: 'A post with this title already exists' },
-      }
+        fieldErrors: { title: "A post with this title already exists" },
+      };
     }
 
-    const post = await db.query(
-      'INSERT INTO posts (title, body) VALUES ($1, $2) RETURNING *',
-      [data.title, data.body],
-    )
-    return { error: false, post: post.rows[0] }
-  })
+    const post = await db.query("INSERT INTO posts (title, body) VALUES ($1, $2) RETURNING id, title", [
+      data.title,
+      data.body,
+    ]);
+    return { error: false, post: post.rows[0] as { id: string; title: string } };
+  });
 ```
+
+The return type is a discriminated union, so the client narrows on `result.error` before reading `fieldErrors` or `post`.
 
 ---
 
@@ -391,27 +495,27 @@ Multi-step forms introduce state management across steps — the framework provi
 The simplest pattern: accumulate `FormData` across steps, submit everything on the final step.
 
 ```tsx title="src/components/MultiStepForm.tsx"
-import { useState, type FormEvent } from 'react'
-import { createUser } from '../actions/users'
+import { useState } from "react";
+import { createUser } from "../actions/users";
 
 interface StepData {
-  [key: string]: string
+  [key: string]: string;
 }
 
 export function MultiStepForm() {
-  const [step, setStep] = useState(0)
-  const [data, setData] = useState<StepData>({})
+  const [step, setStep] = useState(0);
+  const [data, setData] = useState<StepData>({});
 
-  function handleStep(formData: FormData) {
-    const stepData = Object.fromEntries(formData) as StepData
-    const merged = { ...data, ...stepData }
-    setData(merged)
+  async function handleStep(formData: FormData) {
+    const stepData = Object.fromEntries(formData) as StepData;
+    const merged = { ...data, ...stepData };
+    setData(merged);
 
     if (step < 2) {
-      setStep(step + 1)
+      setStep(step + 1);
     } else {
       // Final step: submit everything
-      createUser(merged)
+      await createUser(merged);
     }
   }
 
@@ -442,12 +546,10 @@ export function MultiStepForm() {
             Back
           </button>
         )}
-        <button type="submit">
-          {step < 2 ? 'Next' : 'Submit'}
-        </button>
+        <button type="submit">{step < 2 ? "Next" : "Submit"}</button>
       </div>
     </form>
-  )
+  );
 }
 ```
 
@@ -455,36 +557,36 @@ export function MultiStepForm() {
 
 For type safety, transform raw `FormData` into typed objects using the shared schema:
 
-```typescript title="packages/eigen/src/form-data.ts"
-import type { ZodSchema } from 'zod'
+```typescript title="packages/eigen/form-data.ts"
+import type { ZodType } from "zod";
 
 export function parseFormData<T>(
   formData: FormData,
-  schema: ZodSchema<T>,
+  schema: ZodType<T>,
 ): { success: true; data: T } | { success: false; errors: Record<string, string> } {
-  const raw: Record<string, unknown> = {}
+  const raw: Record<string, unknown> = {};
 
   for (const [key, value] of formData.entries()) {
     // Handle array fields (name="tags[]")
-    if (key.endsWith('[]')) {
-      const arrayKey = key.slice(0, -2)
-      if (!Array.isArray(raw[arrayKey])) raw[arrayKey] = []
-      ;(raw[arrayKey] as unknown[]).push(value)
+    if (key.endsWith("[]")) {
+      const arrayKey = key.slice(0, -2);
+      if (!Array.isArray(raw[arrayKey])) raw[arrayKey] = [];
+      (raw[arrayKey] as unknown[]).push(value);
     } else {
-      raw[key] = value
+      raw[key] = value;
     }
   }
 
-  const result = schema.safeParse(raw)
+  const result = schema.safeParse(raw);
   if (result.success) {
-    return { success: true, data: result.data }
+    return { success: true, data: result.data };
   }
 
-  const errors: Record<string, string> = {}
+  const errors: Record<string, string> = {};
   for (const issue of result.error.issues) {
-    errors[issue.path[0] as string] = issue.message
+    errors[String(issue.path[0])] = issue.message;
   }
-  return { success: false, errors }
+  return { success: false, errors };
 }
 ```
 
@@ -497,33 +599,33 @@ Mutations change server state — the cached data is now stale. Connecting mutat
 ### `revalidateTag` after write
 
 ```typescript title="src/actions/posts.ts"
-import { createServerFn } from 'eigen/server'
-import { revalidateTag } from 'eigen/cache'
-import { db } from '../lib/database'
+import { z } from "zod";
+import { createServerFn } from "eigen/server";
+import { revalidateTag } from "eigen/cache";
+import { db } from "../lib/database";
 
 export const updatePost = createServerFn()
-  .validator((data: { id: string; title: string; body: string }) => data)
+  .validator(z.object({ id: z.string(), title: z.string(), body: z.string() }))
   .handler(async ({ data }) => {
-    await db.query(
-      'UPDATE posts SET title = $1, body = $2 WHERE id = $3',
-      [data.title, data.body, data.id],
-    )
+    await db.query("UPDATE posts SET title = $1, body = $2 WHERE id = $3", [data.title, data.body, data.id]);
 
     // Invalidate cached data for this post and the posts list
-    revalidateTag(`post:${data.id}`)
-    revalidateTag('posts:list')
+    await revalidateTag(`post-${data.id}`);
+    await revalidateTag("posts-list");
 
-    return { success: true }
-  })
+    return { success: true };
+  });
 ```
+
+`revalidateTag` is async (Part 25's store may live in Redis or a KV store), so await it: the response shouldn't go out before the stale entries are gone, or the next request could still read them.
 
 ### The revalidation flow
 
 ```
 1. User submits form
 2. Server function validates + mutates (database write)
-3. Server function calls revalidateTag('posts:list')
-4. Cache store marks 'posts:list' as stale
+3. Server function awaits revalidateTag('posts-list')
+4. Cache store deletes the entries tagged 'posts-list'
 5. Next request for the posts list loader runs fresh
 6. Client re-renders with new data
 ```
@@ -532,28 +634,29 @@ With optimistic UI, steps 5–6 happen in the background. The user already sees 
 
 ### Stale-while-revalidate
 
-For non-critical updates, you might want to show stale data immediately and refresh in the background:
+For data that may be slightly out of date, `cacheLife` lets a cached function serve stale data while it refreshes in the background:
 
 ```typescript title="src/loaders/posts.ts"
-"use cache"
-
-import { cacheTag, cacheLife } from 'eigen/cache'
-import { db } from '../lib/database'
+import { cacheTag, cacheLife } from "eigen/cache";
+import { db } from "../lib/database";
 
 export async function loadPosts() {
-  cacheTag('posts:list')
-  cacheLife('minutes', 5) // Serve stale for up to 5 minutes
+  "use cache";
+  cacheTag("posts-list");
+  // Fresh for 1 minute; after that, serve the stale copy (for up to
+  // 5 minutes total) while a background refresh runs
+  cacheLife({ revalidate: 60, expire: 300 });
 
-  return db.query('SELECT * FROM posts ORDER BY created_at DESC')
+  return db.query("SELECT * FROM posts ORDER BY created_at DESC");
 }
 ```
 
-After a mutation calls `revalidateTag('posts:list')`, the next request triggers a fresh load. But if a request arrives during the revalidation window, the stale data is served instantly while the fresh data is computed in the background.
+The two mechanisms are complementary. `cacheLife` governs _time_: between `revalidate` and `expire`, a request gets the stale result instantly and triggers a refresh. `revalidateTag` governs _events_: after a mutation, Eigen's `revalidateTag` deletes the tagged entries outright, so the next request waits for fresh data instead of seeing the pre-mutation list.
 
 ---
 
 ## Key insight
 
-Forms are where all the framework layers converge — routing provides the URL, server functions handle the mutation, validation ensures correctness, middleware provides auth context, and the cache system manages staleness. Progressive enhancement isn't a legacy concern — it's the foundation. The no-JS form submission flow defines the data contract (FormData → server function → redirect), and every enhancement (pending states, optimistic updates, client validation) is layered on top without changing that contract.
+Forms are where all the framework layers converge — routing provides the URL, server functions handle the mutation, validation ensures correctness, middleware provides auth context, and the cache system manages staleness. Progressive enhancement isn't a legacy concern — it's the foundation. The no-JS form submission flow defines the data contract (form fields → server function → redirect), and every enhancement (pending states, optimistic updates, client validation) is layered on top without changing that contract.
 
 **What's next:** [Part 39](/39-developer-experience-cli) shifts focus from runtime to tooling — scaffolding CLIs, code generation, ESLint rules, and TypeScript plugins that make the framework a pleasure to use.

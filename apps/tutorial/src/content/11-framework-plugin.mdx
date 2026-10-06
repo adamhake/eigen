@@ -7,119 +7,201 @@ concepts:
   - "public type surface design"
 ---
 
-
-*This is the twelfth installment in a series where we build a toy Next.js on top of Vite. In [Part 10](/10-dev-overlay), we built the dev overlay. Now we'll compose everything into a distributable framework plugin and examine the architecture of the whole system.*
+_This is the twelfth installment in a series where we build a toy Next.js on top of Vite. In [Part 10](/10-dev-overlay), we built the dev overlay. Now we'll compose everything into a distributable framework plugin and examine the architecture of the whole system._
 
 ---
 
 ## From scattered plugins to a single export
 
-Throughout this series, we've built four separate plugins:
+Throughout this series, we've built separate plugins and a growing pile of manual configuration:
 
-- **`eigenRoutes`** — Route discovery, virtual module generation, type declaration generation, file watching
-- **`eigenStripLoaders`** — Strips server-only code from client bundles
-- **`eigenApi`** — API route handling in development
-- **A config plugin** — Sets framework defaults for build configuration
+- **`eigenRoutes`** ([Part 2](/02-route-discovery-plugin), [Part 9](/09-hmr)) — Route discovery, virtual module generation, type declaration generation, file watching, HMR
+- **`eigenStripLoaders`** ([Part 7](/07-transform-hook)) — Strips server-only code from client bundles
+- **`eigenApi`** ([Part 8](/08-dev-middleware)) — API route handling in development
+- **`eigenDevOverlay`** ([Part 10](/10-dev-overlay)) — The dev diagnostics panel
+- **Build configuration** ([Part 6](/06-production-builds)) — The manifest, two output directories, and two separate `vite build` invocations
 
-A framework user shouldn't need to know about these internal pieces. They should add one thing to their config:
+A framework user shouldn't need to know about these internal pieces. They should add one thing to their config. First, move the `plugins/` directory into `packages/eigen/plugins/` so the plugins live with the rest of the framework source. Then:
 
-```typescript
+```typescript title="vite.config.ts"
+import { resolve } from "node:path";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
-import eigen from "eigen/plugin";
+// vite.config.ts is bundled and run by Node before `resolve.alias`
+// exists, so the config imports the plugin by file path. Part 40 turns
+// Eigen into a real package, and this becomes `from "eigen/plugin"`.
+import eigen from "./packages/eigen/plugin";
 
 export default defineConfig({
-	plugins: [eigen(), react()],
+  plugins: [eigen(), react()],
+  resolve: {
+    alias: {
+      // ...the eigen/* aliases from earlier parts, plus the router:
+      "eigen/router": resolve(__dirname, "packages/eigen/router.tsx"),
+    },
+  },
+  // No `build` block: eigen() now owns the build configuration.
 });
 ```
+
+Add the matching `"eigen/router": ["./packages/eigen/router.tsx"]` entry to `paths` in `tsconfig.json`.
 
 ---
 
 ## The unified plugin
 
+`eigenRoutes` and `eigenApi` hard-coded `src/pages` and `src/api`. To make the directories configurable, each factory now accepts an options object:
+
+```typescript title="packages/eigen/plugins/eigen-routes.ts"
+export interface EigenRoutesOptions { // [!code ++]
+	/** Directory containing page components, relative to the root */ // [!code ++]
+	pagesDir?: string; // [!code ++]
+} // [!code ++]
+// [!code ++]
+export default function eigenRoutes(): Plugin { // [!code --]
+export default function eigenRoutes(options: EigenRoutesOptions = {}): Plugin { // [!code ++]
+	// ...
+		configResolved(config: ResolvedConfig) {
+			root = config.root;
+			pagesDir = resolve(config.root, "src/pages"); // [!code --]
+			pagesDir = resolve(config.root, options.pagesDir ?? "src/pages"); // [!code ++]
+			// Root-relative import prefix for generated code, e.g. "/src/pages" // [!code ++]
+			pagesUrl = `/${relative(root, pagesDir).replaceAll("\\", "/")}`; // [!code ++]
+```
+
+`discoverRoutes` built import URLs as `/src/pages/${file}`, so it takes the prefix as a parameter now. Declare `let pagesUrl: string;` next to `pagesDir`, import `relative` from `node:path`, and pass `pagesUrl` everywhere `discoverRoutes(pagesDir)` is called:
+
+```typescript title="packages/eigen/plugins/eigen-routes.ts"
+export function discoverRoutes(pagesDir: string): DiscoveredRoute[] { // [!code --]
+export function discoverRoutes(pagesDir: string, pagesUrl: string): DiscoveredRoute[] { // [!code ++]
+	// ...
+			componentPath: `/src/pages/${file}`, // [!code --]
+			componentPath: `${pagesUrl}/${file}`, // [!code ++]
+```
+
+```typescript title="packages/eigen/plugins/eigen-api.ts"
+export interface EigenApiOptions { // [!code ++]
+	/** Directory containing API route modules, relative to the root */ // [!code ++]
+	apiDir?: string; // [!code ++]
+} // [!code ++]
+// [!code ++]
+export default function eigenApi(): Plugin { // [!code --]
+export default function eigenApi(options: EigenApiOptions = {}): Plugin { // [!code ++]
+	let viteServer: ViteDevServer;
+	const apiDir = `/${options.apiDir ?? "src/api"}`; // [!code ++]
+	// ...
+						const apiPath = `/src/api${urlPath.replace("/api", "")}.ts`; // [!code --]
+						const apiPath = `${apiDir}${urlPath.replace("/api", "")}.ts`; // [!code ++]
+```
+
+With those in place, the framework plugin composes everything:
+
 ```typescript title="packages/eigen/plugin.ts"
-import type { Plugin, UserConfig } from "vite";
+import type { Plugin } from "vite";
 import eigenRoutes from "./plugins/eigen-routes";
 import eigenStripLoaders from "./plugins/eigen-strip-loaders";
 import eigenApi from "./plugins/eigen-api";
+import eigenDevOverlay from "./plugins/eigen-dev-overlay";
 
 export interface EigenOptions {
-	/** Directory containing page components. Default: 'src/pages' */
-	pagesDir?: string;
-	/** Directory containing API routes. Default: 'src/api' */
-	apiDir?: string;
+  /** Directory containing page components. Default: 'src/pages' */
+  pagesDir?: string;
+  /** Directory containing API routes. Default: 'src/api' */
+  apiDir?: string;
 }
 
 export default function eigen(options: EigenOptions = {}): Plugin[] {
-	return [
-		eigenRoutes({ pagesDir: options.pagesDir }),
-		eigenStripLoaders(),
-		eigenApi({ apiDir: options.apiDir }),
+  return [
+    eigenRoutes({ pagesDir: options.pagesDir }),
+    eigenStripLoaders(),
+    eigenApi({ apiDir: options.apiDir }),
+    eigenDevOverlay(),
 
-		{
-			name: "eigen",
+    {
+      name: "eigen",
 
-			config(userConfig: UserConfig) {
-				return {
-					build: {
-						manifest: true,
-						rolldownOptions: {
-							input:
-								userConfig.build?.rolldownOptions?.input ??
-								"src/entry-client.tsx",
-						},
-					},
-					environments: {
-						ssr: {
-							build: {
-								outDir: "dist/server",
-								rolldownOptions: {
-									input: "src/entry-server.tsx",
-								},
-							},
-						},
-					},
-				};
-			},
+      config(userConfig) {
+        const userClient = userConfig.environments?.client?.build;
+        const userSsr = userConfig.environments?.ssr?.build;
+        const userOnwarn = userConfig.build?.rolldownOptions?.onwarn;
 
-			buildApp: {
-				order: "pre" as const,
-				async handler(builder) {
-					await builder.build(builder.environments.client);
-					await builder.build(builder.environments.ssr);
-				},
-			},
-		},
-	];
+        return {
+          // Opt into "app" builds: `vite build` creates every
+          // environment and runs the buildApp hooks below
+          builder: {},
+          build: {
+            rolldownOptions: {
+              // Part 6's filter: `RouteModN.loader` is undefined for
+              // pages without a loader, by design
+              onwarn(warning, defaultHandler) {
+                if (warning.code === "IMPORT_IS_UNDEFINED") return;
+                if (userOnwarn) userOnwarn(warning, defaultHandler);
+                else defaultHandler(warning);
+              },
+            },
+          },
+          environments: {
+            client: {
+              build: {
+                // Input defaults to index.html → dist/client/index.html
+                outDir: userClient?.outDir ?? "dist/client",
+                manifest: userClient?.manifest ?? true,
+              },
+            },
+            ssr: {
+              build: {
+                outDir: userSsr?.outDir ?? "dist/server",
+                rolldownOptions: {
+                  input: userSsr?.rolldownOptions?.input ?? "src/entry-server.tsx",
+                },
+              },
+            },
+          },
+        };
+      },
+
+      buildApp: {
+        order: "pre",
+        async handler(builder) {
+          await builder.build(builder.environments.client);
+          await builder.build(builder.environments.ssr);
+        },
+      },
+    },
+  ];
 }
 ```
 
 ### The [`config`](https://vite.dev/guide/api-plugin#config) hook
 
 The framework's `config` hook sets sensible defaults:
-- **`manifest: true`** — Generate the asset manifest for production SSR
-- **`input: 'src/entry-client.tsx'`** — Set the client entry point (overridable by the user)
-- **`environments.ssr`** — Configure the SSR build with its own output directory and entry point
 
-These defaults can be overridden by the user's config. Vite merges configs with a deep merge strategy, so the user can override `build.rolldownOptions.input` without losing the `manifest: true` setting.
+- **`builder: {}`** — Switches `vite build` into _app_ mode (the same as `vite build --app`). Without it, Vite uses the legacy single-environment builder: only `client` exists, and our `buildApp` handler would crash on `builder.environments.ssr`.
+- **`build.rolldownOptions.onwarn`** — The `IMPORT_IS_UNDEFINED` filter from [Part 6](/06-production-builds#configuring-the-builds), applied to every environment. Because a function is a scalar to the merger, the plugin's `onwarn` would replace one the user wrote — so it delegates to the user's handler for everything else.
+- **`environments.client.build`** — `index.html` stays the input (Vite's default), output goes to `dist/client/`, and the manifest is written to `dist/client/.vite/manifest.json` for the production server.
+- **`environments.ssr.build`** — The SSR build's own output directory and entry point. Environments named `ssr` default to `build.ssr: true`, so no `--ssr` flag is needed.
+
+Each value checks `userConfig` first. That's not decoration. Vite **deep-merges the object a `config` hook returns on top of the existing config**, so for any scalar the plugin sets, the plugin wins. If the hook returned a bare `outDir: "dist/client"`, a user who wrote `environments: { client: { build: { outDir: "out" } } }` would be silently overridden. Reading `userConfig` and falling back is how a framework sets _defaults_ rather than _mandates_.
+
+The `build:client` / `build:server` scripts from Part 6 can go too. A single `vite build` now produces both outputs.
 
 <TypeDeepDive title="Concept: Deep merge vs. shallow merge">
 
-A shallow merge (`Object.assign` or `{ ...a, ...b }`) only merges top-level properties — if both objects have a `build` key, `b.build` completely replaces `a.build`. A deep merge recurses into nested objects, so `a.build.manifest` and `b.build.rolldownOptions` both survive. Vite uses deep merge for plugin configs, which is why a framework can set `manifest: true` and the user can set `rolldownOptions.input` without either overwriting the other. Arrays are typically replaced, not concatenated — so if two plugins both set `build.rolldownOptions.external`, the last one wins.
+A shallow merge (`Object.assign` or `{ ...a, ...b }`) only merges top-level properties — if both objects have a `build` key, `b.build` completely replaces `a.build`. A deep merge recurses into nested objects, so `a.build.manifest` and `b.build.outDir` both survive. Vite's [`mergeConfig`](https://vite.dev/guide/api-javascript#mergeconfig) deep-merges plugin configs this way. Two details matter for framework authors. First, when both sides set the same scalar, the later value (the plugin's return value, merged onto the user config) wins — hence the `userConfig` checks above. Second, arrays are **concatenated**, not replaced: if the user sets `optimizeDeps.include: ['a']` and a plugin returns `optimizeDeps.include: ['b']`, the result is `['a', 'b']`. That makes array-valued options safe to extend from a plugin, but impossible to _remove_ entries from by merging — a plugin that needs that must mutate the config in `configResolved` or document the conflict.
 
 </TypeDeepDive>
 
-### The [`buildApp`](https://vite.dev/guide/api-plugin#buildapp) hook
+### The [`buildApp`](https://vite.dev/guide/api-environment-frameworks#the-buildapp-plugin-hook) hook
 
-`buildApp` is a Vite hook (added as a plugin hook in Vite 7) that gives the framework control over the production build process. It exists because SSR frameworks need to orchestrate *multiple coordinated builds* — a problem that had no clean solution before the Environment API.
+`buildApp` is a Vite hook (added as a plugin hook in Vite 7) that gives the framework control over the production build process. It exists because SSR frameworks need to orchestrate _multiple coordinated builds_ — a problem that had no clean solution before the Environment API.
 
-**Before `buildApp`:** Frameworks either ran separate `vite build` commands via npm scripts (`build:client && build:server`), or used tools like [Vinxi](https://vinxi.vercel.app) that spawned multiple Vite instances. The problem with separate commands: the builds can't share state. The client build might discover routes that the server build doesn't know about. A shared virtual module has to generate its code independently in each build, potentially producing inconsistent results.
+**Before `buildApp`:** Frameworks either ran separate `vite build` commands via npm scripts (`build:client && build:server`, exactly what we did in Part 6), or used tools like [Vinxi](https://vinxi.vercel.app) that spawned multiple Vite instances. The problem with separate commands: the builds can't share state. The client build might discover routes that the server build doesn't know about. A shared virtual module has to generate its code independently in each build, potentially producing inconsistent results.
 
-**With `buildApp`:** A single `vite build` command creates a `ViteBuilder` instance — the build-time equivalent of `ViteDevServer`. The builder has access to *all* configured environments and their shared plugin pipeline. The framework's `buildApp` handler controls the build sequence:
+**With `buildApp`:** In app mode, a single `vite build` command creates a `ViteBuilder` instance — the build-time equivalent of `ViteDevServer`. The builder has access to _all_ configured environments and their shared plugin pipeline. The framework's `buildApp` handler controls the build sequence:
 
 ```typescript
 buildApp: {
-	order: "pre" as const,
+	order: "pre",
 	async handler(builder) {
 		// builder.environments contains all configured environments
 		// Each has its own build config (outDir, rolldownOptions, etc.)
@@ -134,11 +216,11 @@ buildApp: {
 }
 ```
 
-The handler receives a `builder` object with `builder.environments` — a record of all configured environments. Each environment carries its own build configuration (output directory, Rolldown options, resolve conditions). The framework decides the order: client first (generates the manifest), server second (can reference the manifest).
+The handler receives a `builder` object with `builder.environments` — a record of all configured environments. Each environment carries its own build configuration (output directory, Rolldown options, resolve conditions). The framework decides the order: client first (generates the manifest), server second (can reference the manifest). After all `buildApp` hooks run, Vite only builds environments itself if _none_ were built, so there's no double build.
 
-The `order: 'pre'` ensures this handler runs before any other `buildApp` handlers. If a deployment adapter (like `@netlify/vite-plugin-tanstack-start`) also defines a `buildApp` hook with `order: 'post'`, it runs after the framework's builds complete — the adapter can post-process the build output into platform-specific artifacts.
+Hooks run in a defined sequence: handlers with `order: 'pre'` (or no order) first, then the `builder.buildApp` config option, then handlers with `order: 'post'`. A framework builds in `'pre'`; anything that post-processes the output — static pre-rendering ([Part 16](/16-static-site-generation)) or a deployment adapter ([Part 17](/17-deployment-adapters)) — uses `order: 'post'` and finds both builds already on disk.
 
-This is exactly how [TanStack Start](https://tanstack.com/start) orchestrates its builds. When TanStack Start migrated from Vinxi to native Vite at version 1.121.0, Vinxi's `vinxi build` command (which managed multiple Vite instances) was replaced by this `buildApp` hook (which coordinates multiple environments within a single Vite build). The config file moved from `app.config.ts` to `vite.config.ts`, and the build command became plain `vite build`.
+This is how [TanStack Start](https://tanstack.com/start) orchestrates its builds. When TanStack Start migrated from Vinxi to native Vite at version 1.121.0, Vinxi's `vinxi build` command (which managed multiple Vite instances) was replaced by Vite's environment-aware app build, coordinating multiple environments within a single `vite build`. The config file moved from `app.config.ts` to `vite.config.ts`.
 
 In later parts, when we add edge runtimes (Part 19) and RSC (Part 21), the `buildApp` handler will coordinate three or four environments — but the pattern is the same: sequential builds, ordered by dependency, sharing the same plugin pipeline.
 
@@ -147,12 +229,12 @@ In later parts, when we add edge runtimes (Part 19) and RSC (Part 21), the `buil
 ## The framework's type exports
 
 ```typescript title="packages/eigen/index.ts"
-export type { PageProps, LoaderFn, RouteDefinition } from "./types";
+export type { PageProps, LoaderFn, RouteDefinition, RouteParams } from "./types";
 export type { ApiHandler, ApiContext } from "./api-types";
 export { defineLoader } from "./helpers";
 ```
 
-This is the surface area that application developers interact with. Everything else — the plugin internals, the route discovery logic, the code stripping transforms — is implementation detail.
+This barrel is what the package root will export once Part 40 publishes Eigen; until then, app code keeps importing the individual `eigen/*` entries through the aliases. This is the surface area that application developers interact with. Everything else — the plugin internals, the route discovery logic, the code stripping transforms — is implementation detail.
 
 ---
 
@@ -230,9 +312,9 @@ import type { PageProps } from "eigen/types";
 
 // Using all three together:
 function Link<T extends RoutePaths>({ to }: { to: T }) { ... }
-// RoutePaths (Layer 2) constrains the prop
-// which comes from PageProps (Layer 1)
-// and the runtime routes come from eigen/routes (Layer 3)
+// RoutePaths (Layer 2) constrains which paths Link accepts,
+// PageProps (Layer 1) types the props each page receives,
+// and the runtime route table comes from eigen/routes (Layer 3)
 ```
 
 This three-layer pattern is universal across typed frameworks. [TanStack Router](https://tanstack.com/router) has static types (`RouteOptions`, `Link`), generated types (`routeTree.gen.ts`), and virtual modules. Next.js has static types (`GetServerSideProps`, `NextPage`), limited generated types (the `.next/types` directory), and internal virtual modules.
@@ -241,153 +323,183 @@ This three-layer pattern is universal across typed frameworks. [TanStack Router]
 
 ## Comparing to real frameworks
 
-| Aspect | Eigen | [TanStack Start](https://tanstack.com/start) | [Next.js](https://nextjs.org) |
-|---|---|---|---|
-| Plugin entry | `eigen()` returns `Plugin[]` | `tanstackStart()` returns `Plugin[]` | Not Vite-based (webpack/turbopack) |
-| Route discovery | Filesystem scan in `configResolved` | `@tanstack/router-plugin/vite` | Internal filesystem scanner |
-| Virtual modules | `eigen/routes` | Internal virtual modules | Webpack virtual modules |
-| Type generation | `.d.ts` in `node_modules/.eigen/` | `routeTree.gen.ts` (committed) | `.next/types/` (gitignored) |
-| SSR | `ssrLoadModule` + H3 | Nitro server | Built-in Node server |
-| Build | `buildApp` hook | `buildApp` hook | Custom webpack/turbopack pipeline |
-| Deployment | Manual prod server | Netlify/Vercel/Cloudflare adapters | Vercel-optimized, self-hostable |
-| Code stripping | `transform` hook | `.server.ts` convention | RSC compiler + separate compilation |
-| HMR | `handleHotUpdate` + React Fast Refresh | Same | Turbopack HMR |
+| Aspect          | Eigen                                         | [TanStack Start](https://tanstack.com/start) | [Next.js](https://nextjs.org)       |
+| --------------- | --------------------------------------------- | -------------------------------------------- | ----------------------------------- |
+| Plugin entry    | `eigen()` returns `Plugin[]`                  | `tanstackStart()` returns `Plugin[]`         | Not Vite-based (webpack/turbopack)  |
+| Route discovery | Filesystem scan in `configResolved`           | `@tanstack/router-plugin/vite`               | Internal filesystem scanner         |
+| Virtual modules | `eigen/routes`                                | Internal virtual modules                     | Webpack virtual modules             |
+| Type generation | `.d.ts` in `node_modules/.eigen/`             | `routeTree.gen.ts` (committed)               | `.next/types/` (gitignored)         |
+| SSR             | ModuleRunner (`environments.ssr.runner`) + H3 | Nitro server                                 | Built-in Node server                |
+| Build           | `buildApp` hook                               | `buildApp` hook                              | Custom webpack/turbopack pipeline   |
+| Deployment      | Manual prod server                            | Netlify/Vercel/Cloudflare adapters           | Vercel-optimized, self-hostable     |
+| Code stripping  | `transform` hook                              | `.server.ts` convention                      | RSC compiler + separate compilation |
+| HMR             | `hotUpdate` + React Fast Refresh              | Same                                         | Turbopack HMR                       |
 
-The architectural patterns are identical. The differences are in scale (Eigen handles 3 routes; Next.js handles thousands), robustness (Eigen uses regex; Next.js uses SWC), and deployment surface (Eigen has one server file; Next.js supports dozens of platforms).
+The architectural patterns are identical. The differences are in scale (Eigen handles 3 routes; Next.js handles thousands), robustness (Eigen's transforms handle a handful of export shapes; Next.js's SWC/Turbopack pipeline handles the whole language), and deployment surface (Eigen has one server file; Next.js supports dozens of platforms).
 
 ---
 
 ## Extracting the runtime
 
-Since Part 2, `Router`, `Link`, and `matchRoute` have lived inline in the app's entry file. Now that Eigen has a proper package structure, it's time to move them into the framework:
+Since [Part 4](/04-hydration#the-client-entry-point), `Router` and `Link` have lived inline in `src/entry-client.tsx` (with `matchRoute` already in `eigen/match-route`), and [Part 5](/05-typed-loaders#updating-the-client) taught `Router` to fetch fresh data on navigation. Now that Eigen has a proper package structure, it's time to move them into the framework.
+
+One change comes along for the ride. The Part 5 `Router` read `window.location.pathname` and `window.__EIGEN_DATA__` directly, so only the client could render it — the server entry had to hand-write a matching tree (`<nav>`, `<Suspense>`, the page). Two hand-maintained copies of the same tree is how hydration mismatches happen. Instead, `Router` now takes its initial pathname and data as props. The client passes the `window` values; the server passes the request's. Everything else is Part 5's code, unchanged:
 
 ```tsx title="packages/eigen/router.tsx"
-import { useState, useEffect, Suspense } from "react";
+import { useState, useEffect, Suspense, type ReactNode } from "react";
 import { routes } from "eigen/routes";
-import type { RouteDefinition } from "eigen/types";
+import { matchRoute } from "eigen/match-route";
 import type { RoutePaths, RouteParamsMap } from "eigen/route-types";
 
-interface RouteMatch {
-	route: RouteDefinition;
-	params: Record<string, string>;
+interface RouterProps {
+  /** window.location.pathname on the client, the request path on the server */
+  initialPathname: string;
+  /** window.__EIGEN_DATA__ on the client, the loader result on the server */
+  initialData: unknown;
 }
 
-function matchRoute(pathname: string): RouteMatch | null {
-	for (const route of routes) {
-		if (route.path === pathname) return { route, params: {} };
+export function Router({ initialPathname, initialData }: RouterProps) {
+  const [pathname, setPathname] = useState(initialPathname);
+  const [data, setData] = useState<unknown>(initialData);
+  const [loading, setLoading] = useState(false);
 
-		const routeParts = route.path.split("/");
-		const pathParts = pathname.split("/");
-		if (routeParts.length !== pathParts.length) continue;
+  useEffect(() => {
+    const handler = async () => {
+      const newPath = window.location.pathname;
+      setPathname(newPath);
+      setLoading(true);
+      try {
+        const res = await fetch(`/_eigen/data?path=${encodeURIComponent(newPath)}`);
+        setData(await res.json());
+      } finally {
+        setLoading(false);
+      }
+    };
+    window.addEventListener("popstate", handler);
+    return () => window.removeEventListener("popstate", handler);
+  }, []);
 
-		const params: Record<string, string> = {};
-		const match = routeParts.every((part, i) => {
-			if (part.startsWith(":")) {
-				params[part.slice(1)] = pathParts[i];
-				return true;
-			}
-			return part === pathParts[i];
-		});
+  const match = matchRoute(pathname, routes);
+  if (!match) return <h1>404</h1>;
+  const Component = match.route.component;
 
-		if (match) return { route, params };
-	}
-	return null;
+  return (
+    <Suspense fallback={<div>Loading...</div>}>
+      {loading ? <div>Loading...</div> : <Component params={match.params} data={data} />}
+    </Suspense>
+  );
 }
 
-export function Router() {
-	const [pathname, setPathname] = useState(window.location.pathname);
-	const data = window.__EIGEN_DATA__;
+type LinkProps<T extends RoutePaths> = {
+  to: T;
+  children: ReactNode;
+} & (RouteParamsMap[T] extends Record<string, never> ? { params?: never } : { params: RouteParamsMap[T] });
 
-	useEffect(() => {
-		const handler = () => setPathname(window.location.pathname);
-		window.addEventListener("popstate", handler);
-		return () => window.removeEventListener("popstate", handler);
-	}, []);
+export function Link<T extends RoutePaths>({ to, params, children }: LinkProps<T>) {
+  let href: string = to;
+  if (params) {
+    href = to.replace(/:(\w+)/g, (_, key: string) => {
+      return (params as Record<string, string>)[key] ?? `:${key}`;
+    });
+  }
 
-	const match = matchRoute(pathname);
-	if (!match) return <h1>404</h1>;
-
-	const Component = match.route.component;
-	return (
-		<Suspense fallback={<div>Loading...</div>}>
-			<Component params={match.params} data={data} />
-		</Suspense>
-	);
-}
-
-interface LinkProps<T extends RoutePaths> {
-	to: T;
-	params?: RouteParamsMap[T];
-	children: React.ReactNode;
-}
-
-export function Link<T extends RoutePaths>({
-	to,
-	params,
-	children,
-}: LinkProps<T>) {
-	let href: string = to;
-	if (params) {
-		href = to.replace(/:(\w+)/g, (_, key: string) => {
-			return (params as Record<string, string>)[key] ?? `:${key}`;
-		});
-	}
-
-	return (
-		<a
-			href={href}
-			onClick={(e) => {
-				e.preventDefault();
-				window.history.pushState({}, "", href);
-				window.dispatchEvent(new PopStateEvent("popstate"));
-			}}
-		>
-			{children}
-		</a>
-	);
+  return (
+    <a
+      href={href}
+      onClick={(e) => {
+        e.preventDefault();
+        window.history.pushState({}, "", href);
+        window.dispatchEvent(new PopStateEvent("popstate"));
+      }}
+    >
+      {children}
+    </a>
+  );
 }
 ```
 
-This is the same code from Part 2, just moved. `matchRoute` stays private — it's an implementation detail, not a public API. `Router` and `Link` are the framework's public runtime exports.
-
-Update the barrel export:
+Neither component touches `window` during render — only inside effects and event handlers — so both are safe to render on the server. `matchRoute` stays in `eigen/match-route`, an implementation detail rather than a public API. `Router` and `Link` are the framework's public runtime exports:
 
 ```typescript title="packages/eigen/index.ts"
-export type { PageProps, LoaderFn, RouteDefinition } from "./types";
+export type { PageProps, LoaderFn, RouteDefinition, RouteParams } from "./types";
 export type { ApiHandler, ApiContext } from "./api-types";
 export { defineLoader } from "./helpers";
 export { Router, Link } from "./router";
+```
+
+### One app shell for both entries
+
+The navigation bar is application code, not framework code, but it must be rendered identically on the server and the client. Give it one home:
+
+```tsx title="src/app.tsx"
+import { Router, Link } from "eigen/router";
+
+export function App({ pathname, data }: { pathname: string; data: unknown }) {
+  return (
+    <div>
+      <nav>
+        <Link to="/">Home</Link> | <Link to="/about">About</Link> |{" "}
+        <Link to="/posts/:id" params={{ id: "1" }}>
+          Post 1
+        </Link>{" "}
+        |{" "}
+        <Link to="/posts/:id" params={{ id: "2" }}>
+          Post 2
+        </Link>
+      </nav>
+      <Router initialPathname={pathname} initialData={data} />
+    </div>
+  );
+}
 ```
 
 Now `entry-client.tsx` becomes thin:
 
 ```tsx title="src/entry-client.tsx"
 import { hydrateRoot } from "react-dom/client";
-import { Router, Link } from "eigen";
-
-function App() {
-	return (
-		<div>
-			<nav>
-				<Link to="/">Home</Link> | <Link to="/about">About</Link>
-			</nav>
-			<Router />
-		</div>
-	);
-}
+import { App } from "./app";
 
 const root = document.getElementById("root");
 if (!root) throw new Error("Root element not found");
-hydrateRoot(root, <App />);
+hydrateRoot(root, <App pathname={window.location.pathname} data={window.__EIGEN_DATA__} />);
 ```
 
-The entry point does what entry points should do: mount the app, nothing more. The routing logic lives in the framework.
+And the server entry renders the very same component instead of its hand-written copy. `Link` renders a plain `<a href>` on the server (the `onClick` is attached during hydration), and the `<Suspense>` boundary sits in the same place on both sides — which matters, because the client's route components are `React.lazy` and will suspend while hydrating:
+
+```tsx title="src/entry-server.tsx"
+import { renderToString } from "react-dom/server";
+import { matchRoute } from "eigen/match-route";
+import { routes } from "eigen/routes";
+import { App } from "./app";
+
+export interface RenderResult {
+  html: string;
+  status: number;
+  data: unknown;
+}
+
+export async function render(pathname: string): Promise<RenderResult> {
+  const match = matchRoute(pathname, routes);
+
+  let data: unknown = null;
+  if (match?.route.loader) {
+    data = await match.route.loader({ params: match.params });
+  }
+
+  const html = renderToString(<App pathname={pathname} data={data} />);
+  return { html, status: match ? 200 : 404, data };
+}
+
+// loadData (Part 6) is unchanged
+```
+
+The entry points do what entry points should do: mount the app, nothing more. The routing logic lives in the framework, and the shell lives in one file.
 
 ---
 
 ## What to observe
 
-1. **Run `vite build`** with the unified plugin. A single command produces both `dist/client/` and `dist/server/`.
+1. **Run `vite build`** with the unified plugin. A single command builds both environments and produces `dist/client/` (with `index.html`, `assets/`, and `.vite/manifest.json`) and `dist/server/entry-server.js`. Remove `builder: {}` from the `config` hook and run it again: Vite falls back to the legacy single-environment build, and the `buildApp` handler throws because `builder.environments.ssr` doesn't exist.
 
 2. **Inspect the plugin array.** Add `console.log` to the `config` hook and watch how the framework's defaults merge with the user's config.
 
@@ -404,7 +516,7 @@ The entry point does what entry points should do: mount the app, nothing more. T
 
 ## Key insight
 
-A framework is a *coordinated set of Vite plugins* that handles route discovery, code generation, type generation, SSR, code stripping, build orchestration, and dev middleware. These concerns are decomposed into separate plugins but composed into a single export function. The user sees one line of config; the framework manages the complexity.
+A framework is a _coordinated set of Vite plugins_ that handles route discovery, code generation, type generation, SSR, code stripping, build orchestration, and dev middleware. These concerns are decomposed into separate plugins but composed into a single export function. The user sees one line of config; the framework manages the complexity.
 
 The type architecture has three layers — static types in the package, generated types per-project, and virtual module declarations bridging runtime and type system. Each layer serves a different consumer (the compiler, the IDE, the runtime) but all are generated from the same source of truth.
 
@@ -412,13 +524,13 @@ The type architecture has three layers — static types in the package, generate
 
 ## Where to go from here
 
-You've built — in miniature — every core layer that a production framework implements. Parts 0–10 form the foundation. The remaining parts extend Eigen into increasingly sophisticated territory:
+You've built — in miniature — every core layer that a production framework implements. Parts 0–11 form the foundation. The remaining parts extend Eigen into increasingly sophisticated territory:
 
-- **[Part 12: Streaming SSR](/12-streaming-ssr)** — Replace `renderToString` with `renderToPipeableStream` for progressive page rendering powered by Suspense.
+- **[Part 12: Streaming SSR](/12-streaming-ssr)** — Replace `renderToString` with React's streaming renderer for progressive page rendering powered by Suspense.
 - **[Part 13: Nested Layouts](/13-nested-layouts)** — Implement a `layout.tsx` convention with recursive virtual module generation and typed parent-to-child data flow.
 - **[Part 14: Framework Middleware](/14-framework-middleware)** — Typed context accumulation, `defineMiddleware`, `redirect()`, auth guards, the `createMiddlewareChain` builder pattern.
 - **[Part 15: Server Functions](/15-server-functions)** — `createServerFn`, the `transform` hook generating RPC stubs, type preservation across transforms.
-- **[Part 16: Static Site Generation](/16-static-site-generation)** — Pre-render pages at build time using the `closeBundle` hook, with a typed `generateStaticParams` convention.
+- **[Part 16: Static Site Generation](/16-static-site-generation)** — Pre-render pages at build time from a `buildApp` hook with `order: 'post'`, with a typed `generateStaticParams` convention.
 - **[Part 17: Deployment Adapters](/17-deployment-adapters)** — The adapter pattern for hosting providers (Netlify, Cloudflare, Vercel, Node standalone).
 - **[Part 18: Runtime Validation](/18-runtime-validation)** — Integrate [zod](https://zod.dev)/[valibot](https://valibot.dev) schemas to validate serialized data at the hydration boundary.
 - **[Part 19: Edge Runtimes](/19-edge-runtimes)** — Add a third Vite environment targeting [Cloudflare Workers](https://developers.cloudflare.com/workers/) with Web API types.
@@ -428,7 +540,7 @@ You've built — in miniature — every core layer that a production framework i
 
 ## Further reading
 
-- [Vite Plugin API: `buildApp`](https://vite.dev/guide/api-plugin#buildapp) — The hook that gives frameworks control over multi-environment build orchestration.
+- [Vite Environment API for Frameworks: `buildApp`](https://vite.dev/guide/api-environment-frameworks#the-buildapp-plugin-hook) — The hook that gives frameworks control over multi-environment build orchestration.
 - [Vite Plugin API: `config`](https://vite.dev/guide/api-plugin#config) — How plugins set framework defaults that merge with user configuration.
 - [Vite Environment API](https://vite.dev/guide/api-environment) — The system that enables client, SSR, and edge environments within a single Vite instance.
 - [TanStack Start](https://tanstack.com/start) — A production Vite-based framework that uses the same `buildApp` and plugin composition patterns.
@@ -438,4 +550,4 @@ You've built — in miniature — every core layer that a production framework i
 
 ## What's next
 
-In Part 12, we'll tackle **streaming SSR** — replacing `renderToString` with React's `renderToPipeableStream` API to enable progressive page rendering powered by Suspense boundaries. This changes the server's contract from "here's a complete page" to "here's the start of a page, more is coming."
+In Part 12, we'll tackle **streaming SSR** — replacing `renderToString` with React's `renderToReadableStream` API to enable progressive page rendering powered by Suspense boundaries. This changes the server's contract from "here's a complete page" to "here's the start of a page, more is coming."

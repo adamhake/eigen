@@ -3,43 +3,42 @@ title: "Part 21: React Server Components"
 description: "The rsc environment, use client directives, RSC streaming payloads, and three-phase rendering."
 concepts:
   - "React Server Components"
-  - "the \"use client\" boundary"
+  - 'the "use client" boundary'
   - "three-phase rendering"
   - "server component streaming payloads"
 ---
 
-
-*This is the twenty-first installment in a series where we build a toy Next.js on top of Vite. In [Part 20](/20-observability), we added observability. Now we'll implement React Server Components — the feature that brings together everything we've built: multiple environments, streaming, code transformation, and the boundary between server and client code.*
+_This is the twenty-second installment in a series where we build a toy Next.js on top of Vite. In [Part 20](/20-observability), we added observability. Now we'll implement React Server Components — the feature that brings together everything we've built: multiple environments, streaming, code transformation, and the boundary between server and client code._
 
 ---
 
 ## What RSC actually is
 
-React Server Components is a rendering model where some components run *only* on the server and are never included in the client JavaScript bundle. Unlike SSR (where all components run on both server and client), RSC components run on the server, produce a serialized representation (the RSC payload), and the client React runtime consumes that payload without ever loading the component code.
+React Server Components is a rendering model where some components run _only_ on the server and are never included in the client JavaScript bundle. Unlike SSR (where all components run on both server and client), RSC components run on the server, produce a serialized representation (the RSC payload), and the client React runtime consumes that payload without ever loading the component code.
 
 The key distinction from everything we've built so far:
 
-| Feature | SSR (Parts 3–4) | RSC |
-|---|---|---|
-| Server rendering | Components run on server, HTML is produced | Components run on server, RSC payload is produced |
-| Client bundle | All component code ships to browser | Only `"use client"` components ship to browser |
-| Hydration | Client re-runs all components to attach events | Client only runs `"use client"` components |
-| Data fetching | Separate loader convention | Components fetch data directly (async components) |
+| Feature          | SSR (Parts 3–4)                                | RSC                                               |
+| ---------------- | ---------------------------------------------- | ------------------------------------------------- |
+| Server rendering | Components run on server, HTML is produced     | Components run on server, RSC payload is produced |
+| Client bundle    | All component code ships to browser            | Only `"use client"` components ship to browser    |
+| Hydration        | Client re-runs all components to attach events | Client only runs `"use client"` components        |
+| Data fetching    | Separate loader convention                     | Components fetch data directly (async components) |
 
-RSC eliminates the loader pattern entirely. A server component *is* the data fetching layer:
+RSC eliminates the loader pattern entirely. A server component _is_ the data fetching layer:
 
 ```tsx
 // This component runs on the server ONLY.
 // It's never bundled for the browser.
 // No loader needed — the component IS the loader.
 async function PostPage({ params }: { params: { id: string } }) {
-  const post = await db.query('SELECT * FROM posts WHERE id = $1', [params.id])
+  const post = await db.query("SELECT * FROM posts WHERE id = $1", [params.id]);
   return (
     <article>
       <h1>{post.title}</h1>
-      <LikeButton postId={post.id} />  {/* This is a client component */}
+      <LikeButton postId={post.id} /> {/* This is a client component */}
     </article>
-  )
+  );
 }
 ```
 
@@ -60,7 +59,9 @@ flowchart TD
 ```
 
 <Callout type="info" title="The RSC environment">
-The `rsc` environment is the critical addition. It uses the `react-server` export condition, which gives it a version of React that supports async components and server-only APIs but *does not* include hooks like `useState` or `useEffect`.
+  The `rsc` environment is the critical addition. It uses the `react-server` export condition, which gives it a version
+  of React that supports async components and server-only APIs but *does not* include hooks like `useState` or
+  `useEffect`.
 </Callout>
 
 ---
@@ -68,49 +69,84 @@ The `rsc` environment is the critical addition. It uses the `react-server` expor
 ## Configuring the RSC environment in Vite
 
 ```typescript title="vite.config.ts"
-import { defineConfig } from 'vite'
-import react from '@vitejs/plugin-react'
-import rsc from '@vitejs/plugin-rsc'
-import eigen from 'eigen/plugin'
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import rsc from "@vitejs/plugin-rsc";
+import eigen from "./packages/eigen/plugin"; // a package import from Part 40 on
 
 export default defineConfig({
   plugins: [
-    eigen(),
+    // RSC mode: Eigen keeps routing, middleware and adapters, but leaves
+    // environment inputs and build orchestration to plugin-rsc
+    eigen({ rsc: true }),
     rsc({
       entries: {
-        rsc: 'src/entry-rsc.tsx',
-        ssr: 'src/entry-ssr.tsx',
-        client: 'src/entry-client.tsx',
+        rsc: "src/entry-rsc.tsx",
+        ssr: "src/entry-ssr.tsx",
+        client: "src/entry-client.tsx",
       },
     }),
     react(),
   ],
-  environments: {
-    rsc: {
-      resolve: {
-        // The critical condition — React exports server-only APIs
-        conditions: ['react-server'],
-      },
-      build: {
-        outDir: 'dist/rsc',
-        rolldownOptions: {
-          input: 'src/entry-rsc.tsx',
-        },
-      },
-    },
-    ssr: {
-      build: {
-        outDir: 'dist/server',
-        rolldownOptions: {
-          input: 'src/entry-ssr.tsx',
-        },
-      },
-    },
-  },
-})
+  // No environments block needed. plugin-rsc creates the `rsc` environment
+  // with the `react-server` resolve condition, uses `entries` as each
+  // environment's build input, and defaults the outDirs to dist/rsc,
+  // dist/ssr and dist/client (Eigen's config() still sets dist/server and
+  // dist/client, and plugin-rsc respects outDirs that are already set).
+});
 ```
 
-The `@vitejs/plugin-rsc` official plugin (from the Vite team) handles the low-level RSC bundler requirements: tracking `"use client"` boundaries, generating client reference manifests, wiring up `react-server-dom` APIs, and coordinating the module graphs across environments. We build *on top of* it rather than reimplementing the RSC protocol.
+The `@vitejs/plugin-rsc` official plugin (maintained by the Vite team in the `vite-plugin-react` repo) handles the low-level RSC bundler requirements: adding the `react-server` condition to the `rsc` environment, tracking `"use client"` and `"use server"` boundaries, generating client reference manifests, wiring up the `react-server-dom` APIs (it vendors `react-server-dom-webpack`), and coordinating the module graphs across environments. We build _on top of_ it rather than reimplementing the RSC protocol.
+
+`eigen({ rsc: true })` is a new option. It tells the framework plugin from Part 11 to step back from the two jobs plugin-rsc now owns: the SSR entry point and build orchestration.
+
+```typescript title="packages/eigen/plugin.ts"
+export interface EigenOptions {
+	/** Directory containing page components. Default: 'src/pages' */
+	pagesDir?: string;
+	/** Directory containing API routes. Default: 'src/api' */
+	apiDir?: string;
+	/** React Server Components mode: @vitejs/plugin-rsc owns entries and the build */ // [!code ++]
+	rsc?: boolean; // [!code ++]
+}
+
+// ...inside the "eigen" plugin
+			config(userConfig) {
+				// ...
+						ssr: {
+							build: {
+								outDir: userSsr?.outDir ?? "dist/server",
+								rolldownOptions: { // [!code --]
+									input: // [!code --]
+										userSsr?.rolldownOptions?.input ?? // [!code --]
+										"src/entry-server.tsx", // [!code --]
+								}, // [!code --]
+								// In RSC mode the ssr input comes from rsc({ entries }) // [!code ++]
+								...(options.rsc // [!code ++]
+									? {} // [!code ++]
+									: { // [!code ++]
+											rolldownOptions: { // [!code ++]
+												input: // [!code ++]
+													userSsr?.rolldownOptions?.input ?? // [!code ++]
+													"src/entry-server.tsx", // [!code ++]
+											}, // [!code ++]
+										}), // [!code ++]
+							},
+						},
+				// ...
+			},
+
+			buildApp: {
+				order: "pre",
+				async handler(builder) {
+					// plugin-rsc registers its own buildApp (scan → rsc → client → ssr); // [!code ++]
+					// building client-then-ssr here would run before client references are known // [!code ++]
+					if (options.rsc) return; // [!code ++]
+					await builder.build(builder.environments.client);
+					await builder.build(builder.environments.ssr);
+				},
+			},
+```
 
 ---
 
@@ -119,38 +155,36 @@ The `@vitejs/plugin-rsc` official plugin (from the Vite team) handles the low-le
 In RSC, all components are server components by default. To make a component interactive (with hooks, event handlers, browser APIs), you add `"use client"` at the top of the file:
 
 ```tsx title="src/components/LikeButton.tsx"
-"use client"
+"use client";
 
-import { useState } from 'react'
+import { useState } from "react";
 
 export function LikeButton({ postId }: { postId: string }) {
-  const [liked, setLiked] = useState(false)
+  const [liked, setLiked] = useState(false);
 
-  return (
-    <button onClick={() => setLiked(!liked)}>
-      {liked ? '❤️' : '🤍'} Like
-    </button>
-  )
+  return <button onClick={() => setLiked(!liked)}>{liked ? "❤️" : "🤍"} Like</button>;
 }
 ```
 
 ### What `"use client"` means for the plugin pipeline
 
-When the `rsc` environment encounters `"use client"`, the file is *not* bundled into the RSC output. Instead, `@vitejs/plugin-rsc` generates a **client reference** — a small object that says "this component exists, its module ID is X, its export name is Y." The RSC stream includes this reference instead of the component's rendered output.
+When the `rsc` environment encounters `"use client"`, the file is _not_ bundled into the RSC output. Instead, `@vitejs/plugin-rsc` generates a **client reference** — a small object that says "this component exists, its module ID is X, its export name is Y." The RSC stream includes this reference instead of the component's rendered output.
 
 The transform looks roughly like:
 
 ```typescript
-// In the rsc environment, LikeButton.tsx becomes:
-import { registerClientReference } from '@vitejs/plugin-rsc/rsc'
+// In the rsc environment, LikeButton.tsx becomes (simplified):
+import * as $$ReactServer from '/* React's RSC server runtime, via plugin-rsc */'
 
-export const LikeButton = registerClientReference(
-  'src/components/LikeButton.tsx',  // module ID
-  'LikeButton',                      // export name
+export const LikeButton = $$ReactServer.registerClientReference(
+  // A stand-in that throws if server code tries to *call* the component
+  () => { throw new Error("Unexpectedly client reference export 'LikeButton' is called on server") },
+  '/src/components/LikeButton.tsx',  // reference key (module ID; a hash in production)
+  'LikeButton',                       // export name
 )
 ```
 
-The SSR and client environments import the *actual* component code. The RSC environment only sees a reference marker. This is the mechanism that keeps server-only code (database imports, API secrets) out of the client bundle — not through a `transform` hook stripping code (our approach in Part 7), but through entirely separate module graphs that resolve the same import differently.
+The SSR and client environments import the _actual_ component code. The RSC environment only sees a reference marker. This is the mechanism that keeps server-only code (database imports, API secrets) out of the client bundle — not through a `transform` hook stripping code (our approach in Part 7), but through entirely separate module graphs that resolve the same import differently.
 
 ---
 
@@ -160,49 +194,49 @@ Rendering a page with RSC is a three-phase process:
 
 ### Phase 1: RSC rendering (rsc environment)
 
-```typescript title="src/entry-rsc.tsx"
-import { renderToReadableStream } from '@vitejs/plugin-rsc/rsc'
+```tsx title="src/entry-rsc.tsx"
+import { renderToReadableStream } from "@vitejs/plugin-rsc/rsc";
+import { matchRoute } from "eigen/match-route";
+import { routes } from "eigen/routes";
 
 // This is the RSC-specific renderToReadableStream, NOT react-dom/server's.
 // It produces an RSC payload stream, not an HTML stream.
 
 export async function renderRSC(pathname: string): Promise<ReadableStream> {
-  const match = matchRoute(pathname)
-  if (!match) return renderToReadableStream(<h1>404</h1>)
+  const match = matchRoute(pathname, routes);
+  if (!match) return renderToReadableStream(<h1>404</h1>);
 
-  const Component = match.route.component
+  const Component = match.route.component;
   // Server components can be async — they fetch data directly
-  const element = <Component params={match.params} />
+  const element = <Component params={match.params} />;
 
-  return renderToReadableStream(element)
+  return renderToReadableStream(element);
 }
 ```
 
-The output of Phase 1 is an **RSC payload** — a binary stream that encodes the React element tree. Server component output is serialized inline. Client component references are included as markers. Props passed from server to client components are serialized.
+The output of Phase 1 is an **RSC payload** (React's "Flight" format) — a stream of mostly-text rows, each a JSON-like chunk with an ID, that encodes the React element tree (binary data such as typed arrays gets its own rows). Server component output is serialized inline. Client component references are included as markers. Props passed from server to client components are serialized.
 
 ### Phase 2: SSR rendering (ssr environment)
 
-```typescript title="src/entry-ssr.tsx"
-import { createFromReadableStream } from '@vitejs/plugin-rsc/ssr'
-import { renderToPipeableStream } from 'react-dom/server'
+```tsx title="src/entry-ssr.tsx"
+import { createFromReadableStream } from "@vitejs/plugin-rsc/ssr";
+import { renderToPipeableStream } from "react-dom/server";
 
-export async function renderToHTML(
-  rscStream: ReadableStream,
-): Promise<{ pipe: Function }> {
+export async function renderToHTML(rscStream: ReadableStream): Promise<{ pipe: Function }> {
   // Deserialize the RSC payload into a React element tree
   // Client references are resolved to actual component imports
-  const element = await createFromReadableStream(rscStream)
+  const element = await createFromReadableStream(rscStream);
 
   // Render the full tree (server + client components) to HTML
-  return renderToPipeableStream(element)
+  return renderToPipeableStream(element);
 }
 ```
 
-Phase 2 takes the RSC payload, deserializes it into a React tree (resolving client references to actual component code), and renders the whole thing to HTML using the standard `renderToPipeableStream` from Part 12.
+Phase 2 takes the RSC payload, deserializes it into a React tree (resolving client references to actual component code), and renders the whole thing to HTML using the standard `renderToPipeableStream` from Part 12. A stream can only be read once, so the real entry `tee()`s the RSC stream: one branch feeds `createFromReadableStream`, the other is inlined into the HTML as `<script>` chunks (plugin-rsc's examples use the `rsc-html-stream` package) so the client can hydrate without a second request.
 
 ### Phase 3: Client hydration (client environment)
 
-```typescript title="src/entry-client.tsx"
+```tsx title="src/entry-client.tsx"
 import { createFromReadableStream } from '@vitejs/plugin-rsc/browser'
 import { hydrateRoot } from 'react-dom/client'
 
@@ -223,13 +257,18 @@ RSC changes our framework architecture in several ways:
 
 ### Loaders become unnecessary
 
-With server components, data fetching happens *inside* the component:
+With server components, data fetching happens _inside_ the component:
 
 ```tsx
 // Server component — no loader export needed
 async function PostPage({ params }: { params: { id: string } }) {
-  const post = await db.query('SELECT * FROM posts WHERE id = $1', [params.id])
-  return <article><h1>{post.title}</h1><p>{post.body}</p></article>
+  const post = await db.query("SELECT * FROM posts WHERE id = $1", [params.id]);
+  return (
+    <article>
+      <h1>{post.title}</h1>
+      <p>{post.body}</p>
+    </article>
+  );
 }
 ```
 
@@ -237,7 +276,7 @@ The `defineLoader` pattern from Part 5 and `createServerFn` from Part 15 are sti
 
 ### The `transform` hook changes role
 
-In our SSR architecture, the `transform` hook strips loaders from client bundles (Part 7). In RSC, the boundary is enforced by *module graph separation* — the rsc and client environments are distinct graphs with different resolve conditions. The `"use client"` directive tells the RSC environment "stop here, emit a reference." The `transform` hook's role shifts to processing these directives and generating the reference metadata.
+In our SSR architecture, the `transform` hook strips loaders from client bundles (Part 7). In RSC, the boundary is enforced by _module graph separation_ — the rsc and client environments are distinct graphs with different resolve conditions. The `"use client"` directive tells the RSC environment "stop here, emit a reference." The `transform` hook's role shifts to processing these directives and generating the reference metadata.
 
 ### The virtual route module becomes three-way
 
@@ -264,20 +303,21 @@ load(id: string) {
 }
 ```
 
-### Build orchestration becomes four-phase
+### Build orchestration moves to plugin-rsc
+
+Eigen's `buildApp` from Part 11 (client, then server) can't work for RSC: the client build doesn't know which modules are client components until the RSC graph has been walked. So `@vitejs/plugin-rsc` registers its own `buildApp` hook, and in RSC mode Eigen's hook steps aside (the `if (options.rsc) return` added [above](#configuring-the-rsc-environment-in-vite)). The plugin's sequence is five steps:
 
 ```typescript
-buildApp: {
-  async handler(builder) {
-    // 1. Client build (generates manifest + client reference IDs)
-    await builder.build(builder.environments.client)
-    // 2. RSC build (server components, references client manifest)
-    await builder.build(builder.environments.rsc)
-    // 3. SSR build (HTML rendering, consumes RSC output)
-    await builder.build(builder.environments.ssr)
-  },
-}
+// What @vitejs/plugin-rsc's buildApp does (simplified):
+// 1. rsc build, write: false  — scan: discover "use client" references
+// 2. ssr build, write: false  — scan: discover "use server" references
+await builder.build(builder.environments.rsc); // 3. real RSC build
+await builder.build(builder.environments.client); // 4. client build, with the
+//    now-known client references
+await builder.build(builder.environments.ssr); // 5. SSR build
 ```
+
+Post-build work still composes: SSG and adapter hooks registered with `order: 'post'` (Parts 16 and 17) run after the plugin's builds finish. A framework that needs to own the sequence itself can pass `customBuildApp: true` and drive the steps through the plugin's API, but for Eigen the default is exactly right.
 
 ---
 
@@ -304,15 +344,34 @@ async function PostPage({ params }: { params: { id: string } }) {
 You can't pass functions, classes, or other non-serializable values from server to client components. A type-safe framework would enforce this:
 
 ```typescript
-// Hypothetical: constrain props passed across the boundary
+// Hypothetical: what React 19's RSC serializer accepts as a prop value
+type ServerFunction = (...args: any[]) => Promise<unknown>;
+
+type Serializable =
+  | string
+  | number
+  | bigint
+  | boolean
+  | null
+  | undefined
+  | Date
+  | ArrayBuffer
+  | ArrayBufferView
+  | FormData
+  | Map<Serializable, Serializable>
+  | Set<Serializable>
+  | Promise<Serializable> // streamed; unwrap with use()
+  | React.ReactElement // JSX, including server-rendered trees
+  | ServerFunction // a "use server" function reference
+  | Serializable[]
+  | { [key: string]: Serializable }; // plain objects only, no class instances
+
 type SerializableProps<T> = {
-  [K in keyof T]: T[K] extends Function ? never
-    : T[K] extends Date ? never
-    : T[K]
-}
+  [K in keyof T]: T[K] extends Serializable ? T[K] : never;
+};
 ```
 
-In practice, React's own types (with `react-server` conditions) enforce some of these constraints, and `@vitejs/plugin-rsc` adds build-time warnings for common mistakes.
+`Date`, `Map`, `Set` and `BigInt` all survive the RSC wire format — unlike the JSON boundary in Part 18. Functions are the interesting case: an ordinary closure can't cross, but a `"use server"` function can (it's serialized as a reference the client calls back through). TypeScript can't tell those two apart — both are just `(...args) => Promise<T>` — which is why neither React's types nor `@types/react` enforce any of this. The check happens at runtime: the RSC renderer throws `Functions cannot be passed directly to Client Components unless you explicitly expose it by marking it with "use server"` while serializing. What `@vitejs/plugin-rsc` does check at build time is imports: a `server-only` module imported from the client graph (or `client-only` from the server graph) fails the build.
 
 ---
 
@@ -321,28 +380,29 @@ In practice, React's own types (with `react-server` conditions) enforce some of 
 RSC introduces `"use server"` as a way to define server functions that client components can call — this is essentially our `createServerFn` from Part 15, but as a language-level directive:
 
 ```tsx title="src/actions/posts.ts"
-"use server"
+"use server";
 
 export async function likePost(postId: string): Promise<{ likes: number }> {
-  await db.query('UPDATE posts SET likes = likes + 1 WHERE id = $1', [postId])
-  const result = await db.query('SELECT likes FROM posts WHERE id = $1', [postId])
-  return { likes: result.rows[0].likes }
+  await db.query("UPDATE posts SET likes = likes + 1 WHERE id = $1", [postId]);
+  const result = await db.query("SELECT likes FROM posts WHERE id = $1", [postId]);
+  return { likes: result.rows[0].likes };
 }
 ```
 
 ```tsx title="src/components/LikeButton.tsx"
-"use client"
-import { likePost } from '../actions/posts'
+"use client";
+import { useState } from "react";
+import { likePost } from "../actions/posts";
 
 export function LikeButton({ postId }: { postId: string }) {
-  const [likes, setLikes] = useState(0)
+  const [likes, setLikes] = useState(0);
 
   async function handleClick() {
-    const result = await likePost(postId) // Calls the server via RPC
-    setLikes(result.likes)
+    const result = await likePost(postId); // Calls the server via RPC
+    setLikes(result.likes);
   }
 
-  return <button onClick={handleClick}>{likes} Likes</button>
+  return <button onClick={handleClick}>{likes} Likes</button>;
 }
 ```
 
@@ -352,13 +412,13 @@ The mechanism is identical to Part 15: the `rsc` environment keeps the function 
 
 ## What to observe
 
-1. **Check the three build outputs.** `dist/client/` contains only `"use client"` component code. `dist/rsc/` contains server components. `dist/server/` contains the SSR renderer that ties them together.
+1. **Watch the build log.** `vite build` prints plugin-rsc's five steps (two scans, then rsc → client → ssr). Then check the three outputs: `dist/client/` contains only `"use client"` component code, `dist/rsc/` contains server components, and `dist/server/` contains the SSR renderer that ties them together.
 
 2. **Compare bundle sizes.** In the client bundle, server components are completely absent — not even their import paths appear. Only client components and the RSC runtime are bundled.
 
-3. **Inspect the RSC payload.** In development, fetch `/_rsc?pathname=/posts/1` and examine the binary stream. You'll see serialized React elements, client references (module IDs), and serialized props.
+3. **Inspect the RSC payload.** Make the RSC entry return the raw stream (`Content-Type: text/x-component`) for URLs ending in `.rsc` — the convention plugin-rsc's examples use — then fetch `/posts/1.rsc` in development. You'll see rows of serialized React elements, client references (module IDs plus export names), and serialized props.
 
-4. **Try using `useState` in a server component.** React's type definitions under the `react-server` condition don't export `useState`, so TypeScript catches it at compile time — the hook literally doesn't exist in the type system for the RSC environment.
+4. **Try using `useState` in a server component.** TypeScript is happy — `@types/react` has one set of types for every environment — but the request fails: under the `react-server` condition, the `react` package's server build doesn't export `useState`, so in the `rsc` environment the import is `undefined` and the call throws (`useState is not a function`). This is a module-resolution boundary, not a type-level one.
 
 5. **Watch `@vitejs/plugin-rsc`'s transform output** in `vite-plugin-inspect`. The same `LikeButton.tsx` file produces three different outputs: a client reference stub (rsc), the full component (ssr), and the hydration-ready component (client).
 
@@ -371,10 +431,10 @@ React Server Components is the architectural culmination of everything this seri
 The Vite concepts are exactly the ones we've used throughout:
 
 - **Virtual modules** (Part 2) generate route tables per environment
-- **`ssrLoadModule`** (Part 3) becomes multi-environment module loading
+- **The ModuleRunner** (Part 3) becomes multi-environment module loading — the `rsc` and `ssr` environments each run their own graph
 - **Streaming** (Part 12) carries the RSC payload from server to client
 - **Code transformation** (Part 7/15) enforces `"use client"` and `"use server"` boundaries
-- **`buildApp`** (Part 11) orchestrates the three-phase build
+- **`buildApp`** (Part 11) orchestrates the multi-environment build — now plugin-rsc's five-step version
 - **Environment API** (Part 19) provides the multi-runtime foundation
 
 RSC doesn't add new Vite concepts — it pushes the existing ones to their full generality. A framework is a coordinated set of code transformations operating across multiple environments from a single source tree. That's been the thesis of this series from Part 0, and RSC is its most complete expression.

@@ -1,214 +1,359 @@
 ---
 title: "Part 27: AI Streaming"
-description: "Streaming server functions, the AI SDK protocol, typed tool calls, and progressive UI updates."
+description: "Streaming server functions, an SSE wire protocol, typed tool calls, and progressive UI updates."
 concepts:
   - "streaming server functions"
-  - "the AI SDK protocol"
+  - "server-sent events as a transport"
   - "progressive UI updates"
   - "structured object streaming"
 ---
 
-
-*This is the twenty-seventh installment in a series where we build a toy Next.js on top of Vite. In [Part 26](/26-partial-prerendering), we built Partial Prerendering. Now we'll extend server functions to support streaming AI model responses — text, structured data, and tool calls flowing progressively from the server to the client.*
+_This is the twenty-eighth installment in a series where we build a toy Next.js on top of Vite. In [Part 26](/26-partial-prerendering), we built Partial Prerendering. Now we'll extend server functions to support streaming AI model responses — text, structured data, and tool calls flowing progressively from the server to the client._
 
 ---
 
 ## Why AI streaming is a framework concern
 
-When an application calls an LLM, the response arrives as a stream of tokens over seconds. If the server function from Part 15 waits for the full response before returning, the user stares at a loading spinner for 3-10 seconds. Streaming the response token-by-token — showing text as it generates — transforms the UX from "waiting" to "watching it think."
+When an application calls an LLM, the response arrives as a stream of tokens over seconds. If the server function from [Part 15](/15-server-functions) waits for the full response before returning, the user stares at a loading spinner for 3-10 seconds. Streaming the response token-by-token — showing text as it generates — transforms the UX from "waiting" to "watching it think."
 
-This isn't just a `fetch` with `ReadableStream`. AI responses are *structured*: they contain text chunks, tool call invocations (the model wants to run a function), tool results, and metadata. The framework needs to serialize this structure across the server/client boundary and provide typed React hooks to consume it.
+This isn't just a `fetch` with `ReadableStream`. AI responses are _structured_: they contain text chunks, tool call invocations (the model wants to run a function), tool results, and errors. The framework needs to serialize this structure across the server/client boundary and provide typed React hooks to consume it.
 
-[TanStack AI](https://tanstack.com/ai) launched in alpha in late 2025 as a framework-agnostic library for exactly this: typed streaming of AI model responses through server functions, with React hooks for consuming them. It builds on the [Vercel AI SDK](https://sdk.vercel.ai) (`ai` package), which provides the low-level primitives for calling LLMs (`streamText`, `streamObject`) and structuring their responses.
+Two libraries cover this ground today. The [AI SDK](https://ai-sdk.dev) (the `ai` package, from Vercel) provides the primitives for calling models — `streamText`, tools, structured output — plus UI hooks and its own streaming protocol. [TanStack AI](https://tanstack.com/ai), released in alpha in late 2025, is an independent, framework-agnostic alternative with its own provider adapters (OpenAI, Anthropic, Gemini, Ollama, …), per-model type inference, and streaming-first React and Solid bindings. It isn't built on the AI SDK; it competes with it. We'll use the AI SDK's model-calling primitives on the server and build the transport and hooks ourselves, because the transport is the framework's job.
 
 ---
 
 ## Extending server functions for streaming
 
-In Part 15, server functions return `Promise<T>` — a single value. For AI, we need `ReadableStream<T>` — an async iterable of typed chunks:
+In Part 15, a server function's handler returns a single JSON value, and the client stub returns `Promise<T>`. For AI, the handler is an **async generator** that yields chunks, and the client gets a `ReadableStream` of those chunks. We add one method to Part 15's builder, `streamHandler`, next to `handler`:
 
-```typescript title="packages/eigen/server.ts"
-export function createStreamingServerFn<TChunk>(
-  fn: () => AsyncGenerator<TChunk>,
-): () => ReadableStream<TChunk> {
-  return fn as any // Server: runs the generator. Client: transform replaces with SSE fetch.
+```typescript title="packages/eigen/server.ts (addition)"
+/** What .streamHandler() produces: resolves to a stream of the yielded chunks */
+export interface StreamingServerFn<TInput, TChunk> {
+  (input: TInput): Promise<ReadableStream<TChunk>>
+  url: string
 }
+
+export interface ServerFnBuilder<TContext extends EigenContext, TInput> {
+  // ...middleware, validator, handler as in Part 15...
+
+  /** Chunks must be JSON-serializable: each one becomes one SSE event */
+  streamHandler<TChunk>(
+    fn: (opts: { data: TInput; context: TContext }) => AsyncIterable<TChunk>,
+  ): StreamingServerFn<TInput, TChunk>
+}
+
+// In createServerFn's builder object — the server side is identical to
+// handler(): middleware, then validation, then the function. It just
+// returns the async iterator instead of a value.
+streamHandler(fn) {
+  return builder.handler(fn as any) as any
+},
 ```
+
+On the server, nothing else changes: the same middleware and validator run first, so a streaming endpoint gets the same protection as any other server function.
 
 ### The streaming server function convention
 
 ```typescript title="src/server/chat.ts"
-import { createStreamingServerFn } from 'eigen/server'
-import { streamText } from 'ai'  // Vercel AI SDK or similar
+import { createServerFn } from "eigen/server";
+import { streamText, tool, isStepCount, type TypedToolCall } from "ai";
+import { openai } from "@ai-sdk/openai";
+import { z } from "zod";
 
-export const chat = createStreamingServerFn(async function* (
-  messages: Array<{ role: string; content: string }>,
-) {
-  const result = streamText({
-    model: openai('gpt-4o'),
-    messages,
-    tools: {
-      getWeather: {
-        description: 'Get weather for a location',
-        parameters: z.object({ location: z.string() }),
-        execute: async ({ location }) => {
-          const weather = await fetchWeather(location)
-          return weather
-        },
-      },
-    },
-  })
+const tools = {
+  getWeather: tool({
+    description: "Get weather for a location",
+    inputSchema: z.object({ location: z.string() }),
+    execute: async ({ location }) => fetchWeather(location),
+  }),
+  searchProducts: tool({
+    description: "Search the product catalog",
+    inputSchema: z.object({ query: z.string(), maxResults: z.number().int().max(20) }),
+    execute: async ({ query, maxResults }) => searchDB(query, maxResults),
+  }),
+};
 
-  // Yield structured chunks as they arrive
-  for await (const chunk of result.fullStream) {
-    yield chunk  // { type: 'text-delta', textDelta: '...' }
-                 // { type: 'tool-call', toolName: 'getWeather', args: {...} }
-                 // { type: 'tool-result', toolName: 'getWeather', result: {...} }
-  }
-})
+// The wire protocol: a small, JSON-safe subset of the AI SDK's stream parts
+export type ChatChunk =
+  | { type: "text-delta"; text: string }
+  | ToolCallChunk
+  | { type: "tool-result"; toolCallId: string; toolName: keyof typeof tools };
+
+const chatInput = z.object({
+  messages: z.array(
+    z.object({
+      role: z.enum(["user", "assistant"]),
+      content: z.string(),
+    }),
+  ),
+});
+
+export const chat = createServerFn()
+  .validator(chatInput)
+  .streamHandler(async function* ({ data, context }): AsyncGenerator<ChatChunk> {
+    const result = streamText({
+      model: openai("gpt-5-mini"),
+      messages: data.messages,
+      tools,
+      // Let the model answer after a tool result, up to 5 steps
+      // (`stepCountIs` in AI SDK 5 and 6)
+      stopWhen: isStepCount(5),
+      abortSignal: context.request.signal,
+    });
+
+    // Yield structured chunks as they arrive. We map instead of forwarding
+    // the raw parts: they carry provider metadata and Error objects that
+    // don't belong on the wire.
+    for await (const part of result.fullStream) {
+      switch (part.type) {
+        case "text-delta":
+          yield { type: "text-delta", text: part.text };
+          break;
+        case "tool-call":
+          // toolName and input come from the same part, so this pairing is
+          // safe; TypeScript just can't correlate them through a destructure
+          yield {
+            type: "tool-call",
+            toolCallId: part.toolCallId,
+            toolName: part.toolName,
+            input: part.input,
+          } as ToolCallChunk;
+          break;
+        case "tool-result":
+          yield { type: "tool-result", toolCallId: part.toolCallId, toolName: part.toolName };
+          break;
+        case "error":
+          // Errors arrive *inside* the stream; rethrow so the endpoint emits an error event
+          throw part.error;
+      }
+    }
+  });
 ```
+
+`ToolCallChunk` is defined below, in [Typed tool calls](#typed-tool-calls). The model ID is just an example — any AI SDK provider works.
 
 ### The transform: streaming RPC
 
-The `transform` hook from Part 15 generates a different client stub for streaming functions — one that returns a `ReadableStream` from a server-sent events (SSE) connection:
+The `transform` hook from Part 15 already finds `createServerFn()` chains. It needs one more fact per chain: does it end in `.streamHandler(...)`? The outermost call in the chain answers that:
 
-```typescript
-// Client stub generated by the transform hook:
-export const chat = (messages) => {
-  const response = await fetch('/_eigen/fn/stream/b4e2a1', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(messages),
-  })
+```typescript title="plugins/eigen-server-fns.ts (change)"
+// In findServerFns, alongside name/start/end:
+const streaming = decl.init.callee.type === "MemberExpression" && decl.init.callee.property.name === "streamHandler";
 
-  // Return a ReadableStream that decodes SSE events into typed chunks
-  return response.body
-    .pipeThrough(new TextDecoderStream())
-    .pipeThrough(new SSEDecoderStream())
+// In transformForClient:
+const stub = fn.streaming ? "createStreamingServerFnStub" : "createServerFnStub";
+s.overwrite(fn.start, fn.end, `${stub}(${JSON.stringify(generateFnId(rel, fn.name))})`);
+// ...and import both stubs from 'eigen/server-fn-client'
+```
+
+The streaming stub posts to the same `/_eigen/fn/<id>` endpoint with the same JSON body and returns a `ReadableStream` that decodes server-sent events (SSE) into chunks:
+
+```typescript title="packages/eigen/server-fn-client.ts (addition)"
+/** Parses an SSE text stream into the JSON payload of each event */
+function sseDecoder<T>(): TransformStream<string, T> {
+  let buffer = "";
+  return new TransformStream<string, T>({
+    transform(text, controller) {
+      buffer += text;
+      const events = buffer.split("\n\n");
+      buffer = events.pop()!; // the last piece may be an incomplete event
+
+      for (const raw of events) {
+        let event = "message";
+        let data = "";
+        for (const line of raw.split("\n")) {
+          if (line.startsWith("event:")) event = line.slice(6).trim();
+          else if (line.startsWith("data:")) data += line.slice(5).trimStart();
+        }
+        if (event === "done") return controller.terminate();
+        if (event === "error") return controller.error(new Error(JSON.parse(data).error));
+        controller.enqueue(JSON.parse(data) as T);
+      }
+    },
+  });
+}
+
+export function createStreamingServerFnStub(id: string) {
+  const url = `/_eigen/fn/${id}`;
+
+  const call = async (input?: unknown) => {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input ?? null),
+    });
+    if (!res.ok || !res.body) {
+      const body = await res.json().catch(() => null);
+      throw new Error(body?.error ?? `Server function failed (${res.status})`);
+    }
+
+    // Return a ReadableStream that decodes SSE events into typed chunks
+    return res.body.pipeThrough(new TextDecoderStream()).pipeThrough(sseDecoder());
+  };
+
+  return Object.assign(call, { url });
 }
 ```
 
-### The dev server endpoint
+### The endpoint: async iterators become SSE
 
-```typescript
-// In configureServer — streaming function handler
-server.middlewares.use(async (req, res, next) => {
-  if (!req.url?.startsWith('/_eigen/fn/stream/')) return next()
+Part 15's `handleServerFnRequest` runs in dev (through the module runner) and in production (mounted on the H3 server). It gets one branch: if the function returned an async iterable, respond with an event stream instead of JSON. Each chunk becomes a `data:` event; the end of the stream is an explicit `done` event, so the client can tell "finished" from "connection dropped":
 
-  const fnId = req.url.replace('/_eigen/fn/stream/', '').split('?')[0]
-  const registration = fnRegistry.get(fnId)
-  if (!registration) { res.writeHead(404); res.end(); return }
+```typescript title="packages/eigen/server-fn-endpoint.ts (change)"
+const encoder = new TextEncoder();
+const sse = (event: string | null, data: unknown) =>
+  encoder.encode(`${event ? `event: ${event}\n` : ""}data: ${JSON.stringify(data)}\n\n`);
 
-  // Parse request body
-  const chunks: Buffer[] = []
-  for await (const chunk of req) chunks.push(chunk as Buffer)
-  const args = JSON.parse(Buffer.concat(chunks).toString())
+function toEventStream(iterable: AsyncIterable<unknown>): ReadableStream<Uint8Array> {
+  const iterator = iterable[Symbol.asyncIterator]();
+  return new ReadableStream({
+    async pull(controller) {
+      try {
+        const { done, value } = await iterator.next();
+        if (done) {
+          controller.enqueue(sse("done", {}));
+          controller.close();
+        } else {
+          controller.enqueue(sse(null, value)); // JSON.stringify keeps it on one line
+        }
+      } catch (e) {
+        console.error(e);
+        // Same rule as JSON responses: don't leak internals to the caller
+        controller.enqueue(sse("error", { error: "Stream failed" }));
+        controller.close();
+      }
+    },
+    async cancel() {
+      // The client went away: stop the generator, which stops consuming the model's stream
+      await iterator.return?.();
+    },
+  });
+}
 
-  // Set up SSE headers
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive',
-  })
+// In handleServerFnRequest, replacing `return Response.json(result ?? null)`:
+const result = await fn(input, context);
+if (result != null && typeof (result as any)[Symbol.asyncIterator] === "function") {
+  return new Response(toEventStream(result as AsyncIterable<unknown>), {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+    },
+  });
+}
+return Response.json(result ?? null);
+```
 
-  // Load and call the streaming function
-  const mod = await server.ssrLoadModule(registration.file)
-  const fn = mod[registration.exportName]
-  const generator = fn(args)
+Two transport details matter in dev. Part 14's `sendWebResponse` reads the whole body with `arrayBuffer()` before writing it, which would turn a stream into one late blob, so it has to copy chunks as they arrive. It should also cancel the body when the browser disconnects, which triggers the `cancel()` above:
 
-  // Stream each yielded chunk as an SSE event
-  for await (const chunk of generator) {
-    res.write(`data: ${JSON.stringify(chunk)}\n\n`)
+```typescript title="packages/eigen/node-http.ts (change)"
+export async function sendWebResponse(res: ServerResponse, response: Response): Promise<void> {
+  // ...status and headers as before...
+  if (!response.body) return void res.end();
+
+  const reader = response.body.getReader();
+  res.on("close", () => reader.cancel().catch(() => {}));
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      res.write(value);
+    }
+  } finally {
+    res.end();
   }
-
-  res.write('data: [DONE]\n\n')
-  res.end()
-})
+}
 ```
 
 ---
 
 ## Typed React hooks for AI streams
 
-The framework provides hooks that consume the typed stream and manage UI state:
+The framework provides a hook that consumes the typed stream and manages UI state:
 
 ```typescript title="packages/eigen/ai-hooks.ts"
-import { useState, useCallback } from 'react'
+import { useCallback, useRef, useState } from "react";
 
-interface StreamChunk {
-  type: 'text-delta' | 'tool-call' | 'tool-result' | 'finish'
-  textDelta?: string
-  toolName?: string
-  args?: unknown
-  result?: unknown
+export interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
 }
 
-interface UseStreamResult {
-  messages: Array<{ role: string; content: string }>
-  isStreaming: boolean
-  send: (content: string) => void
-  activeToolCalls: Array<{ name: string; args: unknown }>
-}
+type BaseChunk =
+  | { type: "text-delta"; text: string }
+  | { type: "tool-call"; toolCallId: string }
+  | { type: "tool-result"; toolCallId: string };
 
-export function useChat(
-  serverFn: (messages: Array<{ role: string; content: string }>) => ReadableStream<StreamChunk>,
-): UseStreamResult {
-  const [messages, setMessages] = useState<Array<{ role: string; content: string }>>([])
-  const [isStreaming, setIsStreaming] = useState(false)
-  const [activeToolCalls, setActiveToolCalls] = useState<Array<{ name: string; args: unknown }>>([])
+export function useChat<TChunk extends BaseChunk>(
+  serverFn: (input: { messages: ChatMessage[] }) => Promise<ReadableStream<TChunk>>,
+) {
+  type ToolCall = Extract<TChunk, { type: "tool-call" }>;
 
-  const send = useCallback(async (content: string) => {
-    const userMessage = { role: 'user' as const, content }
-    const updatedMessages = [...messages, userMessage]
-    setMessages(updatedMessages)
-    setIsStreaming(true)
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [error, setError] = useState<Error | null>(null);
+  const [activeToolCalls, setActiveToolCalls] = useState<ToolCall[]>([]);
 
-    let assistantContent = ''
+  // The latest history, without making `send` change on every token
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
 
-    try {
-      const stream = await serverFn(updatedMessages)
-      const reader = stream.getReader()
+  const send = useCallback(
+    async (content: string) => {
+      const history: ChatMessage[] = [...messagesRef.current, { role: "user", content }];
+      setMessages(history);
+      setIsStreaming(true);
+      setError(null);
 
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
+      let assistantContent = "";
 
-        const chunk = value as StreamChunk
+      try {
+        const stream = await serverFn({ messages: history });
+        const reader = stream.getReader();
 
-        switch (chunk.type) {
-          case 'text-delta':
-            assistantContent += chunk.textDelta ?? ''
-            setMessages([...updatedMessages, { role: 'assistant', content: assistantContent }])
-            break
+        while (true) {
+          const { done, value: chunk } = await reader.read();
+          if (done) break;
 
-          case 'tool-call':
-            setActiveToolCalls(prev => [...prev, { name: chunk.toolName!, args: chunk.args }])
-            break
+          switch (chunk.type) {
+            case "text-delta":
+              assistantContent += (chunk as Extract<BaseChunk, { type: "text-delta" }>).text;
+              setMessages([...history, { role: "assistant", content: assistantContent }]);
+              break;
 
-          case 'tool-result':
-            setActiveToolCalls(prev => prev.filter(t => t.name !== chunk.toolName))
-            break
+            case "tool-call":
+              setActiveToolCalls((prev) => [...prev, chunk as ToolCall]);
+              break;
+
+            case "tool-result":
+              const { toolCallId } = chunk as Extract<BaseChunk, { type: "tool-result" }>;
+              setActiveToolCalls((prev) => prev.filter((t) => t.toolCallId !== toolCallId));
+              break;
+          }
         }
+      } catch (e) {
+        setError(e as Error);
+      } finally {
+        setIsStreaming(false);
+        setActiveToolCalls([]);
       }
-    } finally {
-      setIsStreaming(false)
-    }
-  }, [messages, serverFn])
+    },
+    [serverFn],
+  );
 
-  return { messages, isStreaming, send, activeToolCalls }
+  return { messages, isStreaming, error, send, activeToolCalls };
 }
 ```
 
 ### Usage in a component
 
 ```tsx title="src/pages/chat.tsx"
-'use client'
+"use client";
 
-import { useChat } from 'eigen/ai-hooks'
-import { chat } from '../server/chat'
+import { useChat } from "eigen/ai-hooks";
+import { chat } from "../server/chat";
 
 export default function ChatPage() {
-  const { messages, isStreaming, send, activeToolCalls } = useChat(chat)
+  const { messages, isStreaming, error, send, activeToolCalls } = useChat(chat);
 
   return (
     <div>
@@ -218,100 +363,110 @@ export default function ChatPage() {
         </div>
       ))}
 
-      {activeToolCalls.map(tc => (
-        <div key={tc.name} className="tool-call">
-          🔧 Calling {tc.name}({JSON.stringify(tc.args)})...
+      {activeToolCalls.map((tc) => (
+        <div key={tc.toolCallId} className="tool-call">
+          Calling {tc.toolName}({JSON.stringify(tc.input)})...
         </div>
       ))}
 
       {isStreaming && <div className="typing-indicator">●●●</div>}
+      {error && <div role="alert">{error.message}</div>}
 
       <input
-        onKeyDown={e => {
-          if (e.key === 'Enter') {
-            send(e.currentTarget.value)
-            e.currentTarget.value = ''
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && !isStreaming) {
+            send(e.currentTarget.value);
+            e.currentTarget.value = "";
           }
         }}
         placeholder="Type a message..."
       />
     </div>
-  )
+  );
 }
 ```
+
+`useChat(chat)` infers `TChunk` as `ChatChunk` from the server function's type, so `tc.toolName` is `'getWeather' | 'searchProducts'` and `tc.input` is narrowed per tool.
 
 ---
 
 ## Typed tool calls
 
-The most interesting type safety challenge: tool calls are defined on the server (in the streaming function), but the client needs to know about them for rendering. The framework can generate types from the tool definitions:
+The most interesting type safety challenge: tool calls are defined on the server (in the streaming function), but the client needs to know about them for rendering. The AI SDK already infers a discriminated union from a tool set — `TypedToolCall<typeof tools>` — and we project it onto our wire format:
 
-```typescript
-// The server defines tools with zod schemas
-const tools = {
-  getWeather: {
-    parameters: z.object({ location: z.string() }),
-    execute: async ({ location }) => fetchWeather(location),
-  },
-  searchProducts: {
-    parameters: z.object({ query: z.string(), maxResults: z.number() }),
-    execute: async ({ query, maxResults }) => searchDB(query, maxResults),
-  },
-} as const
+```typescript title="src/server/chat.ts (continued)"
+// Distributes over the union: one member per tool, with its own input type
+type ToToolCallChunk<C> = C extends { toolCallId: string; toolName: infer N; input: infer I }
+  ? { type: "tool-call"; toolCallId: string; toolName: N; input: I }
+  : never;
 
-// The framework infers:
-type ToolCallEvent =
-  | { type: 'tool-call'; toolName: 'getWeather'; args: { location: string } }
-  | { type: 'tool-call'; toolName: 'searchProducts'; args: { query: string; maxResults: number } }
+type ToolCallChunk = ToToolCallChunk<TypedToolCall<typeof tools>>;
+// → | { type: 'tool-call'; toolCallId: string; toolName: 'getWeather'; input: { location: string } }
+//   | { type: 'tool-call'; toolCallId: string; toolName: 'searchProducts'; input: { query: string; maxResults: number } }
 ```
 
-This is the same pattern as server functions (Part 15): TypeScript checks the source file where tools are defined, the `transform` hook generates the client stub, and the types survive because the type checker operates on source, not transformed output.
+This is the same pattern as server functions (Part 15): TypeScript checks the source file where tools are defined, the `transform` hook generates the client stub, and the types survive because the type checker operates on source, not transformed output. The client page imports `chat` for its _type_; the bundle gets only the stub.
 
 ---
 
 ## Structured object streaming
 
-Beyond chat, AI models can generate structured data (JSON objects) progressively. The Vercel AI SDK's `streamObject` returns partial objects as they're generated:
+Beyond chat, AI models can generate structured data (JSON objects) progressively. In the current AI SDK that's `streamText` with an `output` schema; `partialOutputStream` yields the object as it fills in (older versions had a separate `streamObject` function):
 
-```typescript
-export const generateReport = createStreamingServerFn(async function* (topic: string) {
-  const result = streamObject({
-    model: openai('gpt-4o'),
-    schema: z.object({
-      title: z.string(),
-      sections: z.array(z.object({
-        heading: z.string(),
-        content: z.string(),
-      })),
-      summary: z.string(),
+```typescript title="src/server/report.ts"
+import { createServerFn } from "eigen/server";
+import { streamText, Output } from "ai";
+import { openai } from "@ai-sdk/openai";
+import { z } from "zod";
+
+const reportSchema = z.object({
+  title: z.string(),
+  sections: z.array(
+    z.object({
+      heading: z.string(),
+      content: z.string(),
     }),
-  })
+  ),
+  summary: z.string(),
+});
 
-  for await (const partial of result.partialObjectStream) {
-    yield partial  // Typed as DeepPartial<ReportSchema>
-  }
-})
+export const generateReport = createServerFn()
+  .validator(z.object({ topic: z.string().min(1).max(200) }))
+  .streamHandler(async function* ({ data, context }) {
+    const { partialOutputStream } = streamText({
+      model: openai("gpt-5-mini"),
+      output: Output.object({ schema: reportSchema }),
+      prompt: `Write a short structured report about: ${data.topic}`,
+      abortSignal: context.request.signal,
+    });
+
+    for await (const partial of partialOutputStream) {
+      yield partial; // A deep-partial of z.infer<typeof reportSchema>
+    }
+  });
 ```
 
-The client receives a progressively-completing object — first `{ title: "..." }`, then `{ title: "...", sections: [{ heading: "..." }] }`, and so on. The component renders whatever's available, filling in as more arrives.
+The client receives a progressively-completing object — first `{ title: "..." }`, then `{ title: "...", sections: [{ heading: "..." }] }`, and so on. Each chunk is the whole object so far, so the component renders the latest one and fills in as more arrives. (Sending only the changes would save bandwidth for long objects; the AI SDK's own UI protocol does that.)
 
 ---
 
 ## What to observe
 
-1. **Watch the Network tab** during a chat interaction. You'll see an SSE connection that receives chunks progressively — no full-page requests.
+1. **Watch the Network tab** during a chat interaction. The `/_eigen/fn/<id>` request is an `EventStream` response; open it to see one `data:` event per chunk, ending with `event: done`.
 
-2. **Type a message and watch the response build** character by character. The text streams in via the `text-delta` chunks.
+2. **Type a message and watch the response build** chunk by chunk. The text streams in via the `text-delta` chunks.
 
-3. **Trigger a tool call** (ask about weather). The `tool-call` chunk appears in the stream, the UI shows a "calling tool" indicator, then the `tool-result` chunk arrives with the data.
+3. **Trigger a tool call** (ask about weather). The `tool-call` chunk appears in the stream, the UI shows a "calling tool" indicator, then the `tool-result` chunk arrives and the model's answer streams in after it.
 
-4. **Check the types** — hover over the `activeToolCalls` array. TypeScript knows the possible tool names and argument shapes.
+4. **Check the types** — hover over `tc.toolName` and `tc.input` in the page. TypeScript knows the possible tool names, and inside `if (tc.toolName === 'getWeather')` it knows `tc.input` is `{ location: string }`.
+
+5. **Close the tab mid-response.** The server log shows the generator stopping — the stream's `cancel()` ran and the model call was abandoned instead of running to completion.
 
 ---
 
 ## Key insight
 
-AI streaming extends the server function model from "request/response" to "request/stream." The same `transform` hook generates the client stub, but instead of returning `Promise<T>` it returns `ReadableStream<T>`. The SSE transport replaces the JSON response. The type safety story is unchanged — TypeScript checks the source, the transform generates the stub, and the types survive.
+AI streaming extends the server function model from "request/response" to "request/stream." The same `transform` hook generates the client stub, but instead of returning `Promise<T>` it returns `ReadableStream<T>`. The SSE transport replaces the JSON response, on the same endpoint and behind the same middleware and validation. The type safety story is unchanged — TypeScript checks the source, the transform generates the stub, and the types survive.
 
 This pattern isn't AI-specific. Any use case that produces structured data over time — real-time analytics, file processing progress, multi-step workflows — benefits from the same streaming server function primitive. AI is just the most compelling current application.
 

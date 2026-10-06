@@ -9,8 +9,7 @@ concepts:
   - "framework diagnostics"
 ---
 
-
-*A framework lives or dies by its developer experience. This module builds the tooling layer — scaffolding, code generation, linting, editor intelligence, and diagnostics — that makes Eigen a pleasure to use. Prerequisites: [Part 2](/02-route-discovery-plugin) (route discovery), [Part 10](/10-dev-overlay) (dev overlay), [Part 11](/11-framework-plugin) (framework plugin).*
+_A framework lives or dies by its developer experience. This module builds the tooling layer — scaffolding, code generation, linting, editor intelligence, and diagnostics — that makes Eigen a pleasure to use. Prerequisites: [Part 2](/02-route-discovery-plugin) (route discovery), [Part 10](/10-dev-overlay) (dev overlay), [Part 11](/11-framework-plugin) (framework plugin)._
 
 ---
 
@@ -21,6 +20,7 @@ Every popular framework ships a `create-*` CLI: `create-next-app`, `create-vite`
 ### How `npm create` works
 
 When a user runs `npm create eigen`, npm:
+
 1. Resolves the package `create-eigen`
 2. Downloads and executes its `bin` entry
 3. The CLI runs in the user's terminal
@@ -32,96 +32,112 @@ That's it — `npm create <name>` is shorthand for `npx create-<name>`.
 ```typescript title="packages/create-eigen/src/index.ts"
 #!/usr/bin/env node
 
-import { parseArgs } from 'node:util'
-import { resolve } from 'node:path'
-import { mkdir, writeFile, readFile } from 'node:fs/promises'
-import { downloadTemplate } from 'giget'
-import prompts from 'prompts'
+import { parseArgs } from "node:util";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { cp, readFile, writeFile } from "node:fs/promises";
+import prompts from "prompts";
+import { mergePackageJson } from "./merge.js";
+
+// Templates ship inside the package: dist/index.js → ../templates
+const TEMPLATES = fileURLToPath(new URL("../templates/", import.meta.url));
+const OVERLAYS = fileURLToPath(new URL("../overlays/", import.meta.url));
 
 const { values, positionals } = parseArgs({
   allowPositionals: true,
+  allowNegative: true, // --no-typescript, --no-tailwind
   options: {
-    typescript: { type: 'boolean', default: true },
-    tailwind: { type: 'boolean' },
-    template: { type: 'string', default: 'default' },
+    typescript: { type: "boolean", default: true },
+    tailwind: { type: "boolean" },
+    template: { type: "string", default: "default" },
   },
-})
+});
 
 async function main() {
-  console.log('\n  create-eigen\n')
+  console.log("\n  create-eigen\n");
 
   // Project name from positional arg or prompt
-  let projectName = positionals[0]
+  let projectName = positionals[0];
   if (!projectName) {
     const { name } = await prompts({
-      type: 'text',
-      name: 'name',
-      message: 'Project name:',
-      initial: 'my-eigen-app',
-    })
-    projectName = name
+      type: "text",
+      name: "name",
+      message: "Project name:",
+      initial: "my-eigen-app",
+    });
+    projectName = name;
   }
+  if (!projectName) process.exit(1); // prompt cancelled
 
   // Interactive prompts for options not passed as flags
   const options = await prompts([
     {
-      type: values.tailwind !== undefined ? null : 'confirm',
-      name: 'tailwind',
-      message: 'Add Tailwind CSS?',
+      type: values.tailwind !== undefined ? null : "confirm",
+      name: "tailwind",
+      message: "Add Tailwind CSS?",
       initial: true,
     },
     {
-      type: 'select',
-      name: 'deploy',
-      message: 'Deployment target:',
+      type: "select",
+      name: "deploy",
+      message: "Deployment target:",
       choices: [
-        { title: 'Node.js', value: 'node' },
-        { title: 'Netlify', value: 'netlify' },
-        { title: 'Cloudflare', value: 'cloudflare' },
-        { title: 'None (decide later)', value: 'none' },
+        { title: "Node.js", value: "node" },
+        { title: "Netlify", value: "netlify" },
+        { title: "Cloudflare", value: "cloudflare" },
+        { title: "None (decide later)", value: "none" },
       ],
     },
-  ])
+  ]);
 
   const config = {
     projectName,
     typescript: values.typescript ?? true,
     tailwind: values.tailwind ?? options.tailwind ?? true,
-    deploy: options.deploy ?? 'node',
-  }
+    deploy: options.deploy ?? "node",
+  };
 
-  // Download template
-  const targetDir = resolve(process.cwd(), projectName)
-  await downloadTemplate(`eigen/templates/${config.deploy}`, {
-    dir: targetDir,
-  })
+  // Copy the base template (fails if the directory already exists)
+  const targetDir = resolve(process.cwd(), projectName);
+  const base = config.deploy === "none" ? "node" : config.deploy;
+  await cp(resolve(TEMPLATES, base), targetDir, {
+    recursive: true,
+    errorOnExist: true,
+    force: false,
+  });
 
   // Apply variant overlays
   if (config.tailwind) {
-    await applyOverlay(targetDir, 'tailwind')
+    await applyOverlay(targetDir, "tailwind");
   }
 
   // Post-setup
-  await writeFile(
-    resolve(targetDir, '.eigen.json'),
-    JSON.stringify({ deploy: config.deploy }, null, 2),
-  )
+  await writeFile(resolve(targetDir, ".eigen.json"), JSON.stringify({ deploy: config.deploy }, null, 2));
 
-  console.log(`\n  Done! Created ${projectName} at ${targetDir}`)
-  console.log(`\n  cd ${projectName}`)
-  console.log(`  npm install`)
-  console.log(`  npm run dev\n`)
+  console.log(`\n  Done! Created ${projectName} at ${targetDir}`);
+  console.log(`\n  cd ${projectName}`);
+  console.log(`  npm install`);
+  console.log(`  npm run dev\n`);
 }
 
 async function applyOverlay(targetDir: string, overlay: string) {
-  // Copy overlay files into the project, merging with existing
-  await downloadTemplate(`eigen/overlays/${overlay}`, {
-    dir: targetDir,
-    force: true, // Overwrite existing files
-  })
+  const overlayDir = resolve(OVERLAYS, overlay);
+  const pkgPath = resolve(targetDir, "package.json");
+  const basePkg = JSON.parse(await readFile(pkgPath, "utf-8"));
+
+  // Copy overlay files over the base, replacing files with the same name...
+  await cp(overlayDir, targetDir, {
+    recursive: true,
+    force: true,
+    filter: (src) => !src.endsWith("package.json"),
+  });
+
+  // ...except package.json, which is merged
+  const overlayPkg = JSON.parse(await readFile(resolve(overlayDir, "package.json"), "utf-8"));
+  await writeFile(pkgPath, JSON.stringify(mergePackageJson(basePkg, overlayPkg), null, 2) + "\n");
 }
 
-main().catch(console.error)
+main().catch(console.error);
 ```
 
 ### The `package.json` for `create-eigen`
@@ -134,16 +150,19 @@ main().catch(console.error)
   "bin": {
     "create-eigen": "./dist/index.js"
   },
-  "files": ["dist", "templates"],
+  "files": ["dist", "templates", "overlays"],
   "dependencies": {
-    "giget": "^2.0.0",
     "prompts": "^2.4.2"
   }
 }
 ```
 
-<Callout type="tip" title="Template source with giget">
-`giget` downloads templates from GitHub repos, npm packages, or local directories. During development, point it at a local directory. For published versions, point it at a GitHub release or npm package. This keeps templates version-locked to the CLI release.
+<Callout type="tip" title="Bundled vs. downloaded templates">
+  Shipping templates inside the package (`"files"` includes `templates` and `overlays`) keeps them version-locked to the
+  CLI release and works offline. The alternative is downloading them at run time with
+  [`giget`](https://github.com/unjs/giget) — e.g.
+  `downloadTemplate('gh:your-org/eigen/packages/create-eigen/templates/node', {dir})`. Note the `gh:owner/repo/subdir`
+  source format: a bare `eigen/templates/node` would mean GitHub user `eigen`, repo `templates`.
 </Callout>
 
 ---
@@ -156,6 +175,9 @@ Templates are complete, runnable projects that serve as starting points. The key
 
 ```
 packages/create-eigen/
+  src/
+    index.ts
+    merge.ts
   templates/
     node/                    # Node.js deployment target
       src/
@@ -175,7 +197,7 @@ packages/create-eigen/
     cloudflare/              # Cloudflare deployment target
       ...same structure...
       wrangler.toml
-  overlays/
+  overlays/                  # Sibling of templates/, also shipped in "files"
     tailwind/                # Adds Tailwind to any template
       src/
         app.css              # Replaces base app.css with Tailwind imports
@@ -203,18 +225,18 @@ export function mergePackageJson(
   return {
     ...base,
     dependencies: {
-      ...(base.dependencies as Record<string, string> ?? {}),
-      ...(overlay.dependencies as Record<string, string> ?? {}),
+      ...((base.dependencies as Record<string, string>) ?? {}),
+      ...((overlay.dependencies as Record<string, string>) ?? {}),
     },
     devDependencies: {
-      ...(base.devDependencies as Record<string, string> ?? {}),
-      ...(overlay.devDependencies as Record<string, string> ?? {}),
+      ...((base.devDependencies as Record<string, string>) ?? {}),
+      ...((overlay.devDependencies as Record<string, string>) ?? {}),
     },
     scripts: {
-      ...(base.scripts as Record<string, string> ?? {}),
-      ...(overlay.scripts as Record<string, string> ?? {}),
+      ...((base.scripts as Record<string, string>) ?? {}),
+      ...((overlay.scripts as Record<string, string>) ?? {}),
     },
-  }
+  };
 }
 ```
 
@@ -236,98 +258,125 @@ This creates:
 src/pages/dashboard/settings.tsx    # Page component with loader
 ```
 
-### AST-based code generation with `magicast`
+### Creating a new file: a template is fine
 
-Rather than string templates (fragile, no formatting), use `magicast` for AST-level code manipulation:
+A brand-new file has nothing to preserve, so a template string is the simplest correct tool:
 
-```typescript title="packages/eigen/src/cli/generate.ts"
-import { parseModule, generateCode, builders } from 'magicast'
-import { writeFile, mkdir } from 'node:fs/promises'
-import { dirname, resolve } from 'node:path'
+```typescript title="packages/eigen/cli/generate.ts"
+import { writeFile, mkdir } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
+import { existsSync } from "node:fs";
 
 export async function generateRoute(routePath: string) {
   // Parse routePath: "dashboard/settings" → file + component name
-  const segments = routePath.split('/')
-  const componentName = segments
-    .map(s => s[0].toUpperCase() + s.slice(1))
-    .join('')
-    + 'Page'
-  const filePath = `src/pages/${routePath}.tsx`
+  const segments = routePath.split("/");
+  const componentName = segments.map((s) => s[0].toUpperCase() + s.slice(1)).join("") + "Page";
+  const filePath = `src/pages/${routePath}.tsx`;
+  const fullPath = resolve(process.cwd(), filePath);
+  if (existsSync(fullPath)) throw new Error(`${filePath} already exists`);
 
-  // Build the AST
-  const mod = parseModule(`
-    import { defineLoader } from 'eigen/helpers'
+  const code = `import { defineLoader } from 'eigen/helpers'
+import type { PageProps } from 'eigen/types'
 
-    export const loader = defineLoader('/${routePath}', async ({ params }) => {
-      return {}
-    })
+export const loader = defineLoader('/${routePath}', async ({ params }) => {
+  return {}
+})
 
-    export default function ${componentName}({ data }) {
-      return (
-        <div>
-          <h1>${segments[segments.length - 1]}</h1>
-        </div>
-      )
-    }
-  `)
+type LoaderData = Awaited<ReturnType<typeof loader>>
 
-  const { code } = generateCode(mod)
-  const fullPath = resolve(process.cwd(), filePath)
-  await mkdir(dirname(fullPath), { recursive: true })
-  await writeFile(fullPath, code)
+export default function ${componentName}({ data }: PageProps<'/${routePath}', LoaderData>) {
+  return (
+    <div>
+      <h1>${segments[segments.length - 1]}</h1>
+    </div>
+  )
+}
+`;
 
-  console.log(`  Created ${filePath}`)
+  await mkdir(dirname(fullPath), { recursive: true });
+  await writeFile(fullPath, code);
+  console.log(`  Created ${filePath}`);
 }
 ```
 
-### `eigen generate loader`
+### Editing an existing file: AST-based with `magicast`
 
-`eigen generate loader src/pages/dashboard.tsx` adds a loader export to an existing page. It reads the file with `magicast`, checks if a loader already exists, adds the `defineLoader` import if missing, and inserts the loader export before the default export. Same AST-based approach — no fragile string templates.
+`eigen generate loader src/pages/dashboard.tsx` adds a loader to a page the developer has already written. String concatenation would have to guess where imports end and exports begin; [`magicast`](https://github.com/unjs/magicast) parses the file, lets you edit it through a proxy, and prints it back with the original formatting preserved everywhere you didn't touch:
+
+```typescript title="packages/eigen/cli/generate.ts (continued)"
+import { builders, loadFile, writeFile as writeModule } from "magicast";
+import { relative, resolve } from "node:path";
+import { fileToRoute } from "../plugins/eigen-routes";
+
+export async function generateLoader(file: string) {
+  const mod = await loadFile(file);
+
+  if (mod.exports.loader) {
+    console.log(`  ${file} already exports a loader`);
+    return;
+  }
+
+  // Add `import { defineLoader } from 'eigen/helpers'` unless it's there
+  if (!mod.imports.defineLoader) {
+    mod.imports.$append({ imported: "defineLoader", from: "eigen/helpers" });
+  }
+
+  // export const loader = defineLoader('/dashboard', async ({ params }) => ({}))
+  const pagesDir = resolve(process.cwd(), "src/pages");
+  const { path } = fileToRoute(relative(pagesDir, resolve(file)));
+  mod.exports.loader = builders.functionCall("defineLoader", path, builders.raw("async ({ params }) => ({})"));
+
+  await writeModule(mod, file);
+  console.log(`  Added a loader to ${file}`);
+}
+```
 
 ### The CLI entry point
 
-```typescript title="packages/eigen/src/cli/index.ts"
+```typescript title="packages/eigen/cli/index.ts"
 #!/usr/bin/env node
 
-import { parseArgs } from 'node:util'
-import { generateRoute, generateLoader } from './generate.js'
+import { parseArgs } from "node:util";
+import { generateRoute, generateLoader } from "./generate.js";
 
 const { positionals } = parseArgs({
   allowPositionals: true,
   strict: false,
-})
+});
 
-const [command, subcommand, ...args] = positionals
+const [command, subcommand, ...args] = positionals;
 
-if (command === 'generate' || command === 'g') {
+if (command === "generate" || command === "g") {
   switch (subcommand) {
-    case 'route':
-      await generateRoute(args[0])
-      break
-    case 'loader':
-      await generateLoader(args[0])
-      break
+    case "route":
+      await generateRoute(args[0]);
+      break;
+    case "loader":
+      await generateLoader(args[0]);
+      break;
     default:
-      console.log('Unknown generator:', subcommand)
-      console.log('Available: route, loader')
+      console.log("Unknown generator:", subcommand);
+      console.log("Available: route, loader");
   }
 } else {
-  console.log('eigen CLI')
-  console.log('  eigen generate route <path>')
-  console.log('  eigen generate loader <file>')
+  console.log("eigen CLI");
+  console.log("  eigen generate route <path>");
+  console.log("  eigen generate loader <file>");
 }
 ```
+
+For `npx eigen generate ...` to find this file, the `eigen` package needs a `"bin": { "eigen": "./dist/cli/index.js" }` entry pointing at the built CLI — [Part 40](/40-monorepo-publishing) adds it along with the build that produces `dist/cli/index.js`.
 
 ---
 
 ## Custom ESLint rules
 
-Framework-specific linting catches mistakes that generic ESLint rules can't detect — like calling `db.query()` in a client component, or forgetting to add `"use client"` to a component that uses hooks.
+Framework-specific linting catches mistakes that generic ESLint rules can't detect — like a synchronous loader, or a server function the compiler won't recognize.
 
 ### `eslint-plugin-eigen`
 
 ```typescript title="packages/eslint-plugin-eigen/src/rules/no-sync-loader.ts"
-import type { Rule } from 'eslint'
+import type { Rule } from "eslint";
 
 /**
  * Disallows synchronous loader exports.
@@ -335,12 +384,12 @@ import type { Rule } from 'eslint'
  */
 export const noSyncLoader: Rule.RuleModule = {
   meta: {
-    type: 'problem',
+    type: "problem",
     docs: {
-      description: 'Loaders must be async functions',
+      description: "Loaders must be async functions",
     },
     messages: {
-      syncLoader: 'Loader must be an async function. Add `async` keyword.',
+      syncLoader: "Loader must be an async function. Add `async` keyword.",
     },
   },
 
@@ -349,70 +398,73 @@ export const noSyncLoader: Rule.RuleModule = {
       ExportNamedDeclaration(node) {
         // Check: export const loader = (non-async function)
         if (
-          node.declaration?.type === 'VariableDeclaration' &&
-          node.declaration.declarations[0]?.id.type === 'Identifier' &&
-          node.declaration.declarations[0].id.name === 'loader'
+          node.declaration?.type === "VariableDeclaration" &&
+          node.declaration.declarations[0]?.id.type === "Identifier" &&
+          node.declaration.declarations[0].id.name === "loader"
         ) {
-          const init = node.declaration.declarations[0].init
-          if (
-            init?.type === 'ArrowFunctionExpression' &&
-            !init.async
-          ) {
-            context.report({ node: init, messageId: 'syncLoader' })
+          const init = node.declaration.declarations[0].init;
+          if (init?.type === "ArrowFunctionExpression" && !init.async) {
+            context.report({ node: init, messageId: "syncLoader" });
           }
         }
 
         // Check: export function loader() (non-async)
         if (
-          node.declaration?.type === 'FunctionDeclaration' &&
-          node.declaration.id?.name === 'loader' &&
+          node.declaration?.type === "FunctionDeclaration" &&
+          node.declaration.id?.name === "loader" &&
           !node.declaration.async
         ) {
           context.report({
             node: node.declaration,
-            messageId: 'syncLoader',
-          })
+            messageId: "syncLoader",
+          });
         }
       },
-    }
+    };
   },
-}
+};
 ```
 
 ### Server-only boundary detection
 
-A second rule (`server-fn-boundary`) tracks imports from `/actions/` or `.server` files, then flags direct calls in `"use client"` files — the developer should use `useServerFn()` instead. The pattern is the same: `ImportDeclaration` collects names into a `Set`, `CallExpression` checks the file directive and reports violations.
+A second rule (`server-fn-boundary`) protects the server/client split from [Part 15](/15-server-functions). That transform only rewrites `createServerFn(...)` chains that initialize an **exported** `const`; a chain anywhere else — a non-exported `const`, inline in a component, inside a function — would be left as-is, shipping the handler (and its `db` import) to the browser. The rule visits every `CallExpression` whose callee is `createServerFn`, walks up through the builder's member calls to the outermost chain, and reports unless that chain's parent is a `VariableDeclarator` inside an `ExportNamedDeclaration`. Same shape as `no-sync-loader`: a visitor, a structural check, a `context.report`.
 
 ### Plugin entry point
 
 ```typescript title="packages/eslint-plugin-eigen/src/index.ts"
-import { noSyncLoader } from './rules/no-sync-loader'
-import { serverFnBoundary } from './rules/server-fn-boundary'
+import type { ESLint, Linter } from "eslint";
+import { noSyncLoader } from "./rules/no-sync-loader";
+import { serverFnBoundary } from "./rules/server-fn-boundary";
 
-export const rules = {
-  'no-sync-loader': noSyncLoader,
-  'server-fn-boundary': serverFnBoundary,
-}
-
-export const configs = {
-  recommended: {
-    plugins: ['eigen'],
-    rules: {
-      'eigen/no-sync-loader': 'error',
-      'eigen/server-fn-boundary': 'warn',
-    },
+const plugin = {
+  meta: { name: "eslint-plugin-eigen", version: "0.1.0" },
+  rules: {
+    "no-sync-loader": noSyncLoader,
+    "server-fn-boundary": serverFnBoundary,
   },
-}
+  configs: {} as Record<string, Linter.Config>,
+} satisfies ESLint.Plugin;
+
+// Flat config: `plugins` is an object mapping a namespace to the plugin
+// itself (not an array of names, as in the legacy .eslintrc format)
+plugin.configs.recommended = {
+  name: "eigen/recommended",
+  plugins: { eigen: plugin },
+  rules: {
+    "eigen/no-sync-loader": "error",
+    "eigen/server-fn-boundary": "error",
+  },
+};
+
+export default plugin;
 ```
 
-Users enable it with a single line in their ESLint config:
+The plugin is the module's **default** export, and its recommended config references the plugin object directly — that's the flat-config shape ESLint 9 and 10 expect. Users enable it with a single line in their ESLint config:
 
 ```javascript title="eslint.config.js"
-import eigen from 'eslint-plugin-eigen'
+import eigen from "eslint-plugin-eigen";
 
-export default [
-  eigen.configs.recommended,
-]
+export default [eigen.configs.recommended];
 ```
 
 ---
@@ -423,85 +475,76 @@ A TypeScript language service plugin runs inside the editor — it can provide a
 
 ### What it does
 
-| Feature | Example |
-|---|---|
-| **Route autocomplete** | `<Link to="/` → suggests all known routes |
-| **Virtual module types** | `import { routes } from 'eigen/routes'` → shows generated types |
-| **Loader return type checking** | Red squiggly if `data` prop doesn't match loader return type |
+| Feature                         | Example                                                         |
+| ------------------------------- | --------------------------------------------------------------- |
+| **Route autocomplete**          | `<Link to="/` → suggests all known routes                       |
+| **Virtual module types**        | `import { routes } from 'eigen/routes'` → shows generated types |
+| **Loader return type checking** | Red squiggly if `data` prop doesn't match loader return type    |
 
 ### Plugin structure
 
-```typescript title="packages/eigen/src/typescript-plugin/index.ts"
-import type ts from 'typescript/lib/tsserverlibrary'
+```typescript title="packages/eigen/typescript-plugin.ts"
+import type ts from "typescript/lib/tsserverlibrary";
 
 function init(modules: { typescript: typeof ts }) {
-  const ts = modules.typescript
+  const ts = modules.typescript;
 
   function create(info: ts.server.PluginCreateInfo) {
-    const proxy = Object.create(null) as ts.LanguageService
-    const ls = info.languageService
+    const proxy = Object.create(null) as ts.LanguageService;
+    const ls = info.languageService;
 
     // Forward all methods to the original language service
     for (const k of Object.keys(ls) as Array<keyof ts.LanguageService>) {
-      const x = ls[k]
-      if (typeof x === 'function') {
-        (proxy as any)[k] = (...args: any[]) => (x as any).apply(ls, args)
+      const x = ls[k];
+      if (typeof x === "function") {
+        (proxy as any)[k] = (...args: any[]) => (x as any).apply(ls, args);
       }
     }
 
     // Override getCompletionsAtPosition for route autocomplete
     proxy.getCompletionsAtPosition = (fileName, position, options) => {
-      const original = ls.getCompletionsAtPosition(
-        fileName,
-        position,
-        options,
-      )
+      const original = ls.getCompletionsAtPosition(fileName, position, options);
 
       // Check if we're inside a <Link to="..." /> prop
-      const sourceFile = ls.getProgram()?.getSourceFile(fileName)
-      if (!sourceFile) return original
+      const sourceFile = ls.getProgram()?.getSourceFile(fileName);
+      if (!sourceFile) return original;
 
-      const token = findTokenAtPosition(sourceFile, position, ts)
+      const token = findTokenAtPosition(sourceFile, position, ts);
       if (isLinkToProp(token, ts)) {
         // Read the generated route types to suggest completions
         const routeEntries = getKnownRoutes(info.project).map(
           (route): ts.CompletionEntry => ({
             name: route,
             kind: ts.ScriptElementKind.string,
-            sortText: '0', // Sort before other completions
+            sortText: "0", // Sort before other completions
           }),
-        )
+        );
 
         return {
           isGlobalCompletion: false,
           isMemberCompletion: false,
           isNewIdentifierLocation: false,
-          entries: [
-            ...routeEntries,
-            ...(original?.entries ?? []),
-          ],
-        }
+          entries: [...routeEntries, ...(original?.entries ?? [])],
+        };
       }
 
-      return original
-    }
+      return original;
+    };
 
-    return proxy
+    return proxy;
   }
 
-  return { create }
+  return { create };
 }
 
 // Helper: read route paths from .eigen/routes.d.ts
 function getKnownRoutes(project: ts.server.Project): string[] {
-  const routesDts = project.getCurrentDirectory() + '/.eigen/routes.d.ts'
-  const sourceFile = project.getLanguageService()
-    .getProgram()
-    ?.getSourceFile(routesDts)
-  if (!sourceFile) return []
-  const text = sourceFile.getFullText()
-  const matches = text.matchAll(/['"](\/.+?)['"]/g)
-  return [...matches].map(m => m[1])
+  const routesDts = project.getCurrentDirectory() + "/.eigen/routes.d.ts";
+  const sourceFile = project.getLanguageService().getProgram()?.getSourceFile(routesDts);
+  if (!sourceFile) return [];
+  const text = sourceFile.getFullText();
+  const matches = text.matchAll(/['"](\/.+?)['"]/g);
+  return [...matches].map((m) => m[1]);
 }
 
 // Helper: walk the AST to find the token at cursor position,
@@ -509,8 +552,10 @@ function getKnownRoutes(project: ts.server.Project): string[] {
 // Implementation uses ts.forEachChild for the downward walk
 // and parent references for the upward check.
 
-export = init
+export default init;
 ```
+
+`tsserver` loads plugins with `require()`, so this file has to reach users as **CommonJS** even though the rest of `eigen` is ESM. [Part 40](/40-monorepo-publishing) builds it separately as `typescript-plugin.cjs` (tsdown turns the single `export default` into `module.exports = init`) and exposes it with a `require` condition at `eigen/typescript-plugin`.
 
 ### Registering the plugin
 
@@ -519,15 +564,14 @@ Users add it to their `tsconfig.json`:
 ```json title="tsconfig.json"
 {
   "compilerOptions": {
-    "plugins": [
-      { "name": "eigen/typescript-plugin" }
-    ]
+    "plugins": [{ "name": "eigen/typescript-plugin" }]
   }
 }
 ```
 
 <Callout type="info" title="IDE support">
-TypeScript plugins work in VS Code (with the "Use Workspace Version" TypeScript setting), WebStorm, and any editor that delegates to `tsserver`. They don't affect `tsc` on the command line — they're purely for editor intelligence.
+  TypeScript plugins work in VS Code (with the "Use Workspace Version" TypeScript setting), WebStorm, and any editor
+  that delegates to `tsserver`. They don't affect `tsc` on the command line — they're purely for editor intelligence.
 </Callout>
 
 ---
@@ -538,27 +582,30 @@ The dev overlay from [Part 10](/10-dev-overlay) shows runtime information. Frame
 
 ### Health checks
 
-```typescript title="packages/eigen/src/diagnostics/health.ts"
+```typescript title="packages/eigen/diagnostics/health.ts"
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
+
 export interface Diagnostic {
-  level: 'info' | 'warning' | 'error'
-  title: string
-  message: string
-  fix?: string
+  level: "info" | "warning" | "error";
+  title: string;
+  message: string;
+  fix?: string;
 }
 
-export async function runHealthChecks(): Promise<Diagnostic[]> {
-  const diagnostics: Diagnostic[] = []
+export async function runHealthChecks(root: string): Promise<Diagnostic[]> {
+  const diagnostics: Diagnostic[] = [];
 
   // Check: TypeScript config
-  diagnostics.push(...await checkTsConfig())
+  diagnostics.push(...(await checkTsConfig(root)));
 
   // Check: Required dependencies
-  diagnostics.push(...await checkDependencies())
+  diagnostics.push(...(await checkDependencies(root)));
 
   // Check: Route directory exists
-  diagnostics.push(...await checkRouteDirectory())
+  diagnostics.push(...(await checkRouteDirectory(root)));
 
-  return diagnostics
+  return diagnostics;
 }
 
 // Each check function reads a config file and returns diagnostics.
@@ -566,70 +613,82 @@ export async function runHealthChecks(): Promise<Diagnostic[]> {
 // checkDependencies: ensures react, react-dom, and vite are installed
 // checkRouteDirectory: confirms src/pages/ exists
 
-async function checkTsConfig(): Promise<Diagnostic[]> {
-  // Import tsconfig.json, check compilerOptions.jsx and strict
-  // Return error if missing, warning if strict mode is off
-  // ...
+async function checkTsConfig(root: string): Promise<Diagnostic[]> {
+  const diagnostics: Diagnostic[] = [];
+  // Read tsconfig.json, check compilerOptions.jsx and strict
+  // Push an error if missing, a warning if strict mode is off
+  return diagnostics;
 }
 
-async function checkDependencies(): Promise<Diagnostic[]> {
-  // Import package.json, check dependencies for react and vite
-  // Return errors for missing required packages
-  // ...
+async function checkDependencies(root: string): Promise<Diagnostic[]> {
+  const diagnostics: Diagnostic[] = [];
+  // Read package.json, check dependencies for react and vite
+  // Push an error for each missing required package
+  return diagnostics;
 }
 
-async function checkRouteDirectory(): Promise<Diagnostic[]> {
-  // Check if src/pages/ exists — warn if missing
-  // ...
+async function checkRouteDirectory(root: string): Promise<Diagnostic[]> {
+  if (existsSync(resolve(root, "src/pages"))) return [];
+  return [
+    {
+      level: "warning",
+      title: "No pages directory",
+      message: "Eigen discovers routes in src/pages/, which does not exist.",
+      fix: "mkdir -p src/pages && touch src/pages/index.tsx",
+    },
+  ];
 }
 ```
 
 ### Integrating with the dev overlay
 
-Send diagnostics to the dev overlay via the WebSocket channel established in [Part 10](/10-dev-overlay):
+Send diagnostics through the overlay's collector from [Part 10](/10-dev-overlay). Two details matter. Eigen's dev server runs in middleware mode ([Part 3](/03-server-side-rendering)), so `server.httpServer` is `null` and there's no `'listening'` event to wait for. And the checks finish long before any browser connects — a broadcast at startup would reach nobody. Part 10's collector solves the second problem already: it buffers events and replays them to each overlay that connects to `/_eigen/dev-ws`.
 
-```typescript title="packages/eigen/src/plugins/diagnostics.ts"
-import type { Plugin } from 'vite'
-import { runHealthChecks } from '../diagnostics/health'
+```typescript title="packages/eigen/plugins/diagnostics.ts"
+import type { Plugin } from "vite";
+import { runHealthChecks } from "../diagnostics/health";
 
 export function eigenDiagnosticsPlugin(): Plugin {
   return {
-    name: 'eigen:diagnostics',
+    name: "eigen:diagnostics",
+    apply: "serve",
 
-    configureServer(server) {
-      // Run health checks on server start
-      server.httpServer?.once('listening', async () => {
-        const diagnostics = await runHealthChecks()
+    async configureServer(server) {
+      const diagnostics = await runHealthChecks(server.config.root);
+      if (diagnostics.length === 0) return; // Buffered by Part 10's collector and replayed when the overlay connects.
+      // (Plugin code runs in Node without Vite's transforms, so call the
+      // collector directly rather than devEmit, which relies on import.meta.env.)
+      (globalThis as any).__eigenDevCollector?.emit({
+        type: "diagnostics",
+        timestamp: Date.now(),
+        data: { diagnostics },
+      });
 
-        if (diagnostics.length > 0) {
-          // Send to dev overlay via WebSocket
-          server.ws.send('eigen:diagnostics', { diagnostics })
-
-          // Also log to terminal
-          for (const d of diagnostics) {
-            const prefix =
-              d.level === 'error' ? '✗' :
-              d.level === 'warning' ? '⚠' : 'ℹ'
-            console.log(`  ${prefix} ${d.title}: ${d.message}`)
-            if (d.fix) console.log(`    Fix: ${d.fix}`)
-          }
-        }
-      })
+      // Also log to terminal
+      for (const d of diagnostics) {
+        const prefix = d.level === "error" ? "✗" : d.level === "warning" ? "⚠" : "ℹ";
+        server.config.logger.warn(`  ${prefix} ${d.title}: ${d.message}`);
+        if (d.fix) server.config.logger.warn(`    Fix: ${d.fix}`);
+      }
     },
-  }
+  };
 }
 ```
 
+Part 10's buffer holds the most recent 200 events, so on a busy dev server a diagnostics event can scroll out before an overlay connects; a production-quality version would keep the latest diagnostics in a separate slot that's always replayed.
+
 The dev overlay renders diagnostics in a panel:
 
-```tsx title="packages/eigen/src/overlay/DiagnosticsPanel.tsx"
+```tsx title="packages/eigen/overlay/DiagnosticsPanel.tsx"
+import type { Diagnostic } from "../diagnostics/health";
+
 interface DiagnosticsPanelProps {
-  diagnostics: Diagnostic[]
+  diagnostics: Diagnostic[];
 }
 
 export function DiagnosticsPanel({ diagnostics }: DiagnosticsPanelProps) {
   if (diagnostics.length === 0) {
-    return <div className="eigen-diagnostics-ok">All checks passed</div>
+    return <div className="eigen-diagnostics-ok">All checks passed</div>;
   }
 
   return (
@@ -638,13 +697,11 @@ export function DiagnosticsPanel({ diagnostics }: DiagnosticsPanelProps) {
         <div key={i} className={`eigen-diagnostic eigen-diagnostic-${d.level}`}>
           <strong>{d.title}</strong>
           <p>{d.message}</p>
-          {d.fix && (
-            <code className="eigen-diagnostic-fix">{d.fix}</code>
-          )}
+          {d.fix && <code className="eigen-diagnostic-fix">{d.fix}</code>}
         </div>
       ))}
     </div>
-  )
+  );
 }
 ```
 
@@ -676,6 +733,6 @@ None of these tools change the runtime behavior. They exist to make the develope
 
 A framework's developer experience is a force multiplier — it doesn't change what's possible, but it dramatically changes what's practical. The scaffolding CLI removes the "blank page" problem. Code generation enforces conventions without documentation. ESLint rules catch mistakes before they become bugs. The TypeScript plugin makes the type system work harder for the developer. And diagnostics surface problems before the developer even knows to look.
 
-The common thread: every DX tool is built from the same information the framework already has — the route tree, the module graph, the type definitions. The runtime framework *knows* your routes, your loaders, your server functions. The DX layer just makes that knowledge accessible to the developer in the right place at the right time.
+The common thread: every DX tool is built from the same information the framework already has — the route tree, the module graph, the type definitions. The runtime framework _knows_ your routes, your loaders, your server functions. The DX layer just makes that knowledge accessible to the developer in the right place at the right time.
 
 **What's next:** [Part 40](/40-monorepo-publishing) formalizes the `packages/eigen/` directory into a real monorepo and walks through publishing to npm — closing the loop from "build a framework" to "anyone can `npm install` it."
