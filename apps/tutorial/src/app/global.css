@@ -2,6 +2,12 @@
 @import "fumadocs-ui/css/neutral.css";
 @import "fumadocs-ui/css/preset.css";
 
+/* Nebula Sans for prose and UI, Lilex for code (both loaded in app/layout.tsx). */
+@theme inline {
+  --font-sans: var(--font-nebula-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-lilex), ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
 /* Custom brand theme: Dark Ash, White, Chartreuse, Ivory, Steel */
 @theme {
   --color-fd-background: #f4f4f1;
