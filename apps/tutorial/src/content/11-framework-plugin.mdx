@@ -172,9 +172,9 @@ export default function eigen(options: EigenOptions = {}): Plugin[] {
 }
 ```
 
-### The [`config`](https://vite.dev/guide/api-plugin#config) hook
+### The `config` hook
 
-The framework's `config` hook sets sensible defaults:
+The framework's [`config`](https://vite.dev/guide/api-plugin#config) hook sets sensible defaults:
 
 - **`builder: {}`** — Switches `vite build` into _app_ mode (the same as `vite build --app`). Without it, Vite uses the legacy single-environment builder: only `client` exists, and our `buildApp` handler would crash on `builder.environments.ssr`.
 - **`build.rolldownOptions.onwarn`** — The `IMPORT_IS_UNDEFINED` filter from [Part 6](/06-production-builds#configuring-the-builds), applied to every environment. Because a function is a scalar to the merger, the plugin's `onwarn` would replace one the user wrote — so it delegates to the user's handler for everything else.
@@ -191,9 +191,9 @@ A shallow merge (`Object.assign` or `{ ...a, ...b }`) only merges top-level prop
 
 </TypeDeepDive>
 
-### The [`buildApp`](https://vite.dev/guide/api-environment-frameworks#the-buildapp-plugin-hook) hook
+### The `buildApp` hook
 
-`buildApp` is a Vite hook (added as a plugin hook in Vite 7) that gives the framework control over the production build process. It exists because SSR frameworks need to orchestrate _multiple coordinated builds_ — a problem that had no clean solution before the Environment API.
+[`buildApp`](https://vite.dev/guide/api-environment-frameworks#the-buildapp-plugin-hook) is a Vite hook (added as a plugin hook in Vite 7) that gives the framework control over the production build process. It exists because SSR frameworks need to orchestrate _multiple coordinated builds_ — a problem that had no clean solution before the Environment API.
 
 **Before `buildApp`:** Frameworks either ran separate `vite build` commands via npm scripts (`build:client && build:server`, exactly what we did in Part 6), or used tools like [Vinxi](https://vinxi.vercel.app) that spawned multiple Vite instances. The problem with separate commands: the builds can't share state. The client build might discover routes that the server build doesn't know about. A shared virtual module has to generate its code independently in each build, potentially producing inconsistent results.
 

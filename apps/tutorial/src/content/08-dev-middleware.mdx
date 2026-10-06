@@ -11,9 +11,9 @@ _This is the ninth installment in a series where we build a toy Next.js on top o
 
 ---
 
-## What [`configureServer`](https://vite.dev/guide/api-plugin#configureserver) does
+## What `configureServer` does
 
-`configureServer` gives your plugin access to the Vite dev server instance. Through it, you can add custom HTTP middleware — handlers that run for incoming requests before or after Vite's built-in middleware.
+[`configureServer`](https://vite.dev/guide/api-plugin#configureserver) gives your plugin access to the Vite dev server instance. Through it, you can add custom HTTP middleware — handlers that run for incoming requests before or after Vite's built-in middleware.
 
 A framework uses this hook for everything that isn't a static file or a client module: SSR, API routes, redirects, authentication checks, data fetching endpoints, and health checks. (WebSocket servers are the exception: they attach to the HTTP server's `upgrade` event rather than the middleware stack; see [Part 28](/28-realtime-websockets).)
 

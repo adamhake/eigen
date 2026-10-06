@@ -103,9 +103,9 @@ Each graph is populated lazily. A module only appears in the client graph after 
 
 ---
 
-## [`hotUpdate`](https://vite.dev/guide/api-environment-plugins#the-hotupdate-hook) — Custom HMR behavior
+## `hotUpdate` — Custom HMR behavior
 
-When a file changes, Vite calls each plugin's `hotUpdate` hook once **per environment** — first for `client`, then for `ssr` — with `this.environment` set to the environment being updated. The hook receives:
+When a file changes, Vite calls each plugin's [`hotUpdate`](https://vite.dev/guide/api-environment-plugins#the-hotupdate-hook) hook once **per environment** — first for `client`, then for `ssr` — with `this.environment` set to the environment being updated. The hook receives:
 
 - **`type`** — `'create'`, `'update'`, or `'delete'`
 - **`file`** — The absolute path of the changed file
