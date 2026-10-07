@@ -1,4 +1,4 @@
-import { Arrow, bottom, Box, Diagram, left, Region, right, top } from "./kit";
+import { Arrow, At, bottom, Box, Diagram, left, Region, right, top } from "./kit";
 
 /* ------------------------------------------------------------ buildApp order */
 
@@ -18,37 +18,54 @@ export function BuildAppOrderDiagram() {
       width={720}
       height={300}
       caption="A single vite build runs the buildApp hooks in order: Eigen's 'pre' hook builds the client and then the server, so 'post' hooks such as SSG and adapters find both outputs on disk."
+      steps={[
+        "With builder: {} set, a single vite build runs in app mode: it creates a ViteBuilder and runs the buildApp hooks, starting with order: 'pre'.",
+        "Eigen's 'pre' handler builds the client environment first, which writes the assets and manifest.json to dist/client/.",
+        "Then it builds the ssr environment into dist/server/. The server build can reference the client manifest because it's already on disk.",
+        "Next comes the builder.buildApp config option, if the project sets one.",
+        "Handlers with order: 'post' run last. Static pre-rendering and deployment adapters live here, so they find both builds already on disk.",
+      ]}
     >
       <Region x={140} y={8} w={576} h={280} label="buildApp hooks, in order" />
 
-      <Box {...viteBuild} label="vite build" sub="builder: {}" mono />
-      <Box {...pre} label="order: 'pre'" sub="eigen() plugin" mono tone="accent" />
-      <Box {...configHook} label="builder.buildApp" sub="config option" mono tone="muted" />
-      <Box {...post} label="order: 'post'" sub="SSG, adapters" mono tone="ghost" />
+      <At step={1}>
+        <Box {...viteBuild} label="vite build" sub="builder: {}" mono />
+        <Box {...pre} label="order: 'pre'" sub="eigen() plugin" mono tone="accent" />
+        <Arrow from={right(viteBuild)} to={left(pre)} />
+      </At>
 
-      <Arrow from={right(viteBuild)} to={left(pre)} />
-      <Arrow from={right(pre)} to={left(configHook)} />
-      <Arrow from={right(configHook)} to={left(post)} />
+      <At step={2}>
+        <Box {...buildClient} label="build(client)" sub="first" mono tone="accent" />
+        <Box {...distClient} label="dist/client/" sub="assets + manifest" mono />
+        <Arrow from={bottom(pre)} to={top(buildClient)} />
+        <Arrow from={right(buildClient)} to={left(distClient)} />
+      </At>
 
-      <Box {...buildClient} label="build(client)" sub="first" mono tone="accent" />
-      <Box {...buildSsr} label="build(ssr)" sub="second" mono tone="accent" />
-      <Box {...distClient} label="dist/client/" sub="assets + manifest" mono />
-      <Box {...distServer} label="dist/server/" sub="entry-server.js" mono />
+      <At step={3}>
+        <Box {...buildSsr} label="build(ssr)" sub="second" mono tone="accent" />
+        <Box {...distServer} label="dist/server/" sub="entry-server.js" mono />
+        <Arrow from={bottom(buildClient)} to={top(buildSsr)} />
+        <Arrow from={right(buildSsr)} to={left(distServer)} />
+      </At>
 
-      <Arrow from={bottom(pre)} to={top(buildClient)} />
-      <Arrow from={bottom(buildClient)} to={top(buildSsr)} />
-      <Arrow from={right(buildClient)} to={left(distClient)} />
-      <Arrow from={right(buildSsr)} to={left(distServer)} />
+      <At step={4}>
+        <Box {...configHook} label="builder.buildApp" sub="config option" mono tone="muted" />
+        <Arrow from={right(pre)} to={left(configHook)} />
+      </At>
 
-      <Arrow from={right(distClient)} via={[[611, 164]]} to={bottom(post, -20)} dashed />
-      <Arrow
-        from={right(distServer)}
-        via={[[651, 244]]}
-        to={bottom(post, 20)}
-        label="reads output"
-        labelAt={0}
-        dashed
-      />
+      <At step={5}>
+        <Box {...post} label="order: 'post'" sub="SSG, adapters" mono tone="ghost" />
+        <Arrow from={right(configHook)} to={left(post)} />
+        <Arrow from={right(distClient)} via={[[611, 164]]} to={bottom(post, -20)} dashed />
+        <Arrow
+          from={right(distServer)}
+          via={[[651, 244]]}
+          to={bottom(post, 20)}
+          label="reads output"
+          labelAt={0}
+          dashed
+        />
+      </At>
     </Diagram>
   );
 }

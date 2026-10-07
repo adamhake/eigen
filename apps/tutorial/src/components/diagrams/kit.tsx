@@ -16,6 +16,8 @@ import type { ReactNode } from "react";
 
 import { cn } from "@/lib/cn";
 
+import { StepperFrame } from "./stepper";
+
 export type Tone = "default" | "accent" | "muted" | "ghost";
 export type Point = readonly [number, number];
 export interface Rect {
@@ -47,6 +49,7 @@ export function Diagram({
   height,
   caption,
   minWidth = 560,
+  steps,
   children,
 }: {
   width: number;
@@ -55,25 +58,48 @@ export function Diagram({
   caption: string;
   /** Below this rendered width the figure scrolls horizontally instead of shrinking. */
   minWidth?: number;
+  /**
+   * Narration for a stepped diagram, one sentence per step. Wrap the parts of
+   * the figure that belong to step n in `<At step={n}>`.
+   */
+  steps?: string[];
   children: ReactNode;
 }) {
+  const svg = (
+    <div className="overflow-x-auto">
+      <svg
+        viewBox={`0 0 ${width} ${height}`}
+        role="img"
+        aria-label={caption}
+        className="mx-auto block h-auto w-full text-fd-foreground"
+        style={{ minWidth: Math.min(minWidth, width), maxWidth: width * 1.15 }}
+        fontFamily="inherit"
+        fontSize={FONT}
+      >
+        {children}
+      </svg>
+    </div>
+  );
   return (
     <figure className="not-prose my-8">
-      <div className="overflow-x-auto rounded-xl border border-fd-border bg-fd-card/60 p-4 sm:p-6">
-        <svg
-          viewBox={`0 0 ${width} ${height}`}
-          role="img"
-          aria-label={caption}
-          className="mx-auto block h-auto w-full text-fd-foreground"
-          style={{ minWidth: Math.min(minWidth, width), maxWidth: width * 1.15 }}
-          fontFamily="inherit"
-          fontSize={FONT}
-        >
-          {children}
-        </svg>
+      <div className="rounded-xl border border-fd-border bg-fd-card/60 p-4 sm:p-6">
+        {steps ? <StepperFrame steps={steps}>{svg}</StepperFrame> : svg}
       </div>
       <figcaption className="mt-3 text-center text-sm text-fd-muted-foreground">{caption}</figcaption>
     </figure>
+  );
+}
+
+/**
+ * Marks part of a stepped diagram: hidden before `step`, highlighted at it,
+ * dimmed after it. With `until`, it disappears once that step has passed
+ * (for transient states such as a fallback that gets replaced).
+ */
+export function At({ step, until, children }: { step: number; until?: number; children: ReactNode }) {
+  return (
+    <g data-from={step} data-until={until}>
+      {children}
+    </g>
   );
 }
 
