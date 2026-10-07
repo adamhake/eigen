@@ -161,6 +161,8 @@ async function executeLoaders(
 
 A three-level layout stack with 200ms loaders now takes ~200ms total instead of ~600ms. This is the Remix approach — all loaders for matched routes run concurrently. And because they share `ctx.fetch`, two of them asking for the same URL still cost one request.
 
+<LoaderTimingPlayground />
+
 ---
 
 ## Client-side data management with TanStack Query

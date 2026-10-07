@@ -226,6 +226,8 @@ function DashboardAnalyticsRoute(props) {
 
 <BoundaryNestingDiagram />
 
+<ErrorBoundaryPlayground />
+
 An error boundary only catches errors in its _children_, so a segment's `error.tsx` can never catch an error thrown by the layout of that same segment — `DashboardLayout` failing is handled by `RootErrorBoundary`, and `RootLayout` failing can only be handled by a boundary outside it. That's why the framework adds a last-resort `GlobalErrorBoundary` (Next.js exposes the same slot as `global-error.tsx`); since it replaces the root layout, its fallback must render a complete page shell on its own.
 
 ---

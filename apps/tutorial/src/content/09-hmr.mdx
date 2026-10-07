@@ -249,6 +249,8 @@ That's why our `hotUpdate` hook splits the cases: content edits go through norma
 ---
 
 ## What to observe
+<HmrPropagationPlayground />
+
 
 1. **Edit a page component's markup** — just the JSX. The browser updates without a full reload, and component state survives. React Fast Refresh handles it; our `hotUpdate` hook returns early for `type: 'update'`.
 

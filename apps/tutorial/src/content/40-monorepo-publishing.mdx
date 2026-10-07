@@ -114,6 +114,8 @@ A few details in that `exports` map matter:
 - **`bin`** makes `npx eigen generate ...` from Part 39 work.
 - **Virtual modules aren't exported.** `eigen/routes`, `eigen/server-fns`, and `eigen/styles` are resolved by the `eigen()` plugin's `resolveId` before package resolution happens, so they never reach the `exports` map.
 
+<ExportsResolverPlayground />
+
 ### Step 3: Replace aliases with the workspace protocol
 
 Update the app's `package.json` to reference the workspace package:

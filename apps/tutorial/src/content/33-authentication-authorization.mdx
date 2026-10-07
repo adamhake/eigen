@@ -122,6 +122,8 @@ The cookie only holds an opaque, random session ID (at least 128 bits from `cryp
 
 ```typescript title="src/auth.config.ts"
 import { anonymousSession, SESSION_COOKIE, type AuthConfig } from "eigen/auth";
+<CookieAttributesPlayground />
+
 import { getCookie } from "eigen/cookies";
 import { findSession } from "./lib/sessions"; // server-side session store
 

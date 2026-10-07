@@ -760,6 +760,8 @@ describe("executeMiddleware", () => {
     };
     const mw2: MiddlewareFn = () => {
       order.push("second");
+<MiddlewareOnionPlayground />
+
     };
 
     await executeMiddleware([mw1, mw2], makeCtx());

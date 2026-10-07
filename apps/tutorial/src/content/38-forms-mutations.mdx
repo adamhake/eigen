@@ -368,6 +368,8 @@ export const addTodo = createServerFn()
 
 If validation fails, the endpoint answers 400; if the `INSERT` fails (constraint violation, lost connection), it answers 500. Either way the stub rejects, `addAction`'s `catch` shows a message, and `useOptimistic` reverts to the confirmed list when the transition ends. No manual rollback logic needed.
 
+<OptimisticFormPlayground />
+
 ---
 
 ## Validation on both sides

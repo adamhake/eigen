@@ -76,6 +76,8 @@ export function matchRoute(pathname: string, routes: RouteDefinition[]): RouteMa
 }
 ```
 
+<RouteMatcherPlayground mode="basic" />
+
 ## Safe data serialization
 
 The server will also embed each page's loader data in the HTML as an inline `<script>`, so the client can pick it up during hydration. Dropping raw `JSON.stringify` output into a `<script>` is a classic injection bug: if any string in the data contains `</script>`, the browser ends the script element right there and parses whatever follows as HTML. Loader data routinely contains user-generated text, so this has to be handled once, in the framework:
@@ -113,6 +115,8 @@ The output is still valid JSON _and_ a valid JavaScript expression — `\u003c` 
   "compilerOptions": {
     "paths": {
       "eigen/types": ["./packages/eigen/types.ts"],
+<ScriptEscapingPlayground />
+
       "eigen/match-route": ["./packages/eigen/match-route.ts"], // [!code ++]
       "eigen/serialize": ["./packages/eigen/serialize.ts"] // [!code ++]
     }

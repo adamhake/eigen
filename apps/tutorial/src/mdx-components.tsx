@@ -6,6 +6,7 @@ import type { MDXComponents } from "mdx/types";
 
 import * as diagrams from "@/components/diagrams";
 import { Callout } from "@/components/mdx/callout";
+import * as interactive from "@/components/interactive";
 import { TestSection } from "@/components/test-section";
 import { TypeDeepDive } from "@/components/type-deep-dive";
 
@@ -25,4 +26,5 @@ export function getMDXComponents(components?: MDXComponents): MDXComponents {
     ...diagrams,
     ...components,
   };
+    ...interactive,
 }

@@ -560,3 +560,5 @@ This is caching without ceremony. The mental model is simple: "this function is 
 ## What's next
 
 In Part 26, we'll implement **Partial Prerendering** — the convergence of SSG and SSR where a single route has a static shell (rendered at build time) and dynamic holes (filled at request time via Suspense). This is the architecture that `"use cache"` enables: cached components become the static shell, uncached components become the dynamic content.
+<UseCachePlayground />
+
