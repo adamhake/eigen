@@ -69,7 +69,25 @@ But the developer wrote two type annotations the framework could in principle de
 
 TypeScript's [`satisfies`](https://www.typescriptlang.org/docs/handbook/release-notes/typescript-4-9.html#the-satisfies-operator) operator (introduced in 4.9) solves the "constrain without widening" problem. We can constrain the loader's shape — it must accept the right params and return a value or Promise — without losing the narrow return type:
 
-```tsx title="src/pages/posts/[id].tsx"
+```tsx title="src/pages/posts/[id].tsx" twoslash
+// @filename: node_modules/eigen/types.ts
+type ExtractParams<T extends string> = T extends `${string}:${infer Param}/${infer Rest}`
+  ? { [K in Param]: string } & ExtractParams<`/${Rest}`>
+  : T extends `${string}:${infer Param}`
+    ? { [K in Param]: string }
+    : {};
+export type RouteParams<T extends string> = keyof ExtractParams<T> extends never
+  ? Record<string, never>
+  : ExtractParams<T>;
+export interface PageProps<TPath extends string = string, TData = unknown> {
+  params: RouteParams<TPath>;
+  data: TData;
+}
+export type LoaderFn<TPath extends string = string, TData = unknown> = (context: {
+  params: RouteParams<TPath>;
+}) => Promise<TData> | TData;
+// @filename: index.tsx
+// ---cut---
 import type { LoaderFn, PageProps } from "eigen/types";
 
 export const loader = (async ({ params }) => {
@@ -79,6 +97,7 @@ export const loader = (async ({ params }) => {
 
 // Extract the return type automatically
 type LoaderData = Awaited<ReturnType<typeof loader>>;
+//   ^?
 
 export default function PostPage({ params, data }: PageProps<"/posts/:id", LoaderData>) {
   // data.id: number       ← inferred from the loader
@@ -184,11 +203,45 @@ resolve: {
 
 Usage:
 
-```tsx title="src/pages/posts/[id].tsx"
+```tsx title="src/pages/posts/[id].tsx" twoslash
+// @filename: node_modules/eigen/types.ts
+type ExtractParams<T extends string> = T extends `${string}:${infer Param}/${infer Rest}`
+  ? { [K in Param]: string } & ExtractParams<`/${Rest}`>
+  : T extends `${string}:${infer Param}`
+    ? { [K in Param]: string }
+    : {};
+export type RouteParams<T extends string> = keyof ExtractParams<T> extends never
+  ? Record<string, never>
+  : ExtractParams<T>;
+export interface PageProps<TPath extends string = string, TData = unknown> {
+  params: RouteParams<TPath>;
+  data: TData;
+}
+export type LoaderFn<TPath extends string = string, TData = unknown> = (context: {
+  params: RouteParams<TPath>;
+}) => Promise<TData> | TData;
+// @filename: node_modules/eigen/route-types.ts
+export type RoutePaths = "/" | "/about" | "/posts/:id";
+export interface RouteParamsMap {
+  "/": Record<string, never>;
+  "/about": Record<string, never>;
+  "/posts/:id": { id: string };
+}
+// @filename: node_modules/eigen/helpers.ts
+import type { RouteParamsMap } from "eigen/route-types";
+export function defineLoader<TPath extends keyof RouteParamsMap, TData>(
+  _path: TPath,
+  fn: (ctx: { params: RouteParamsMap[TPath] }) => Promise<TData> | TData,
+): (ctx: { params: RouteParamsMap[TPath] }) => Promise<TData> | TData {
+  return fn;
+}
+// @filename: index.tsx
+// ---cut---
 import { defineLoader } from "eigen/helpers";
 import type { PageProps } from "eigen/types";
 
 export const loader = defineLoader("/posts/:id", async ({ params }) => {
+//                                                        ^?
   // params.id is typed as string — guaranteed by the route path
   const res = await fetch(`https://jsonplaceholder.typicode.com/posts/${params.id}`);
   return (await res.json()) as { id: number; title: string; body: string };

@@ -1,6 +1,7 @@
 @import "tailwindcss";
 @import "fumadocs-ui/css/neutral.css";
 @import "fumadocs-ui/css/preset.css";
+@import "fumadocs-twoslash/twoslash.css";
 
 /* Nebula Sans for prose and UI, Lilex for code (both loaded in app/layout.tsx). */
 @theme inline {
@@ -78,4 +79,33 @@ samp {
 /* Flat cards: code blocks sit on a border, not a drop shadow (matching callouts and diagrams). */
 figure.shiki {
   box-shadow: none;
+}
+
+/* Twoslash type popups: the type is rendered as a nested code block. Drop its card chrome and
+   copy button so the popup reads as one surface, and wrap long types instead of scrolling. */
+.twoslash-popup-container figure.shiki,
+.fd-twoslash-popover figure.shiki {
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+.twoslash-popup-container figure.shiki > div:has(> button),
+.fd-twoslash-popover figure.shiki > div:has(> button) {
+  display: none;
+}
+.twoslash-popup-container figure.shiki > div,
+.fd-twoslash-popover figure.shiki > div {
+  padding-block: 0;
+}
+.twoslash-popup-container pre,
+.fd-twoslash-popover pre {
+  width: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.twoslash-popup-container {
+  --twoslash-query-width: min(32rem, calc(100vw - 6rem));
+  width: var(--twoslash-query-width);
+  margin-right: calc(-1 * var(--twoslash-query-width));
 }

@@ -1,3 +1,4 @@
+import * as Twoslash from "fumadocs-twoslash/ui";
 import { File, Files, Folder } from "fumadocs-ui/components/files";
 import { Step, Steps } from "fumadocs-ui/components/steps";
 import { Tab, Tabs } from "fumadocs-ui/components/tabs";
@@ -5,14 +6,15 @@ import defaultMdxComponents from "fumadocs-ui/mdx";
 import type { MDXComponents } from "mdx/types";
 
 import * as diagrams from "@/components/diagrams";
-import { Callout } from "@/components/mdx/callout";
 import * as interactive from "@/components/interactive";
+import { Callout } from "@/components/mdx/callout";
 import { TestSection } from "@/components/test-section";
 import { TypeDeepDive } from "@/components/type-deep-dive";
 
 export function getMDXComponents(components?: MDXComponents): MDXComponents {
   return {
     ...defaultMdxComponents,
+    ...Twoslash,
     Callout,
     Step,
     Steps,
@@ -24,7 +26,7 @@ export function getMDXComponents(components?: MDXComponents): MDXComponents {
     TestSection,
     TypeDeepDive,
     ...diagrams,
+    ...interactive,
     ...components,
   };
-    ...interactive,
 }

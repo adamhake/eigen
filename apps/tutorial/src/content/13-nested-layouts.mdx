@@ -523,12 +523,41 @@ export function useLayoutData<P extends keyof LayoutDataMap>(path: P): LayoutDat
 
 The file contains JSX, so it's a `.tsx` file; add `eigen/layout-context` to the aliases. Usage in a page component:
 
-```tsx title="src/pages/dashboard/analytics/index.tsx"
+```tsx title="src/pages/dashboard/analytics/index.tsx" twoslash
+// @filename: src/lib/db.ts
+export declare function getUser(): Promise<{ id: string; name: string; email: string }>;
+export declare function getNotificationCount(userId: string): Promise<number>;
+// @filename: node_modules/eigen/helpers.ts
+export function defineLoader<TPath extends string, TData>(
+  _path: TPath,
+  fn: (ctx: { params: Record<string, string> }) => Promise<TData> | TData,
+) {
+  return fn;
+}
+// @filename: src/pages/dashboard/layout.tsx
+import { defineLoader } from "eigen/helpers";
+import { getUser, getNotificationCount } from "../../lib/db";
+export const loader = defineLoader("/dashboard", async () => {
+  const user = await getUser();
+  return { user, notifications: await getNotificationCount(user.id) };
+});
+// @filename: node_modules/eigen/route-types.ts
+type LoaderData<M> = M extends { loader: (...args: any[]) => infer R } ? Awaited<R> : undefined;
+export interface LayoutDataMap {
+  "/": undefined;
+  "/dashboard": LoaderData<typeof import("../../src/pages/dashboard/layout")>;
+}
+// @filename: node_modules/eigen/layout-context.ts
+import type { LayoutDataMap } from "eigen/route-types";
+export declare function useLayoutData<P extends keyof LayoutDataMap>(path: P): LayoutDataMap[P];
+// @filename: src/pages/dashboard/analytics/index.tsx
+// ---cut---
 import { useLayoutData } from "eigen/layout-context";
 
 export default function AnalyticsPage() {
   // Typed from the dashboard layout's loader — no annotation needed
   const { user } = useLayoutData("/dashboard");
+  //      ^?
   return <h1>Analytics for {user.name}</h1>;
 }
 ```

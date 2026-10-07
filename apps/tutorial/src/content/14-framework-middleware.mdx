@@ -614,7 +614,62 @@ export function createMiddlewareChain(): ChainedMiddleware<BaseContext> {
 
 Using it for the global middleware file:
 
-```typescript title="src/middleware.ts"
+```typescript title="src/middleware.ts" twoslash
+// @filename: src/lib/auth.ts
+export interface User { id: string; name: string }
+export declare function verifySession(token: string): Promise<User | null>;
+// @filename: node_modules/eigen/types.ts
+import type { User } from "../../src/lib/auth";
+export interface BaseContext {
+  request: Request;
+  params: Record<string, string>;
+  pathname: string;
+}
+export interface EigenContext extends BaseContext {
+  user: User | null;
+}
+// @filename: node_modules/eigen/middleware.ts
+import type { BaseContext } from "./types";
+export type MiddlewareFn<
+  TIn extends BaseContext = BaseContext,
+  TOut extends Record<string, unknown> = Record<string, unknown>,
+> = (ctx: TIn) => Promise<TOut | Response | void> | TOut | Response | void;
+export declare function defineMiddleware<TOut extends Record<string, unknown> = {}, TIn extends BaseContext = BaseContext>(
+  handler: MiddlewareFn<TIn, TOut>,
+): MiddlewareFn<TIn, TOut>;
+export type Added<T> = string extends keyof T ? {} : T;
+export type ChainedMiddleware<TContext extends BaseContext> = {
+  use<TOutput extends Record<string, unknown> = {}>(
+    mw: MiddlewareFn<TContext, TOutput>,
+  ): ChainedMiddleware<TContext & Added<TOutput>>;
+  build(): MiddlewareFn<any, any>[];
+};
+export type ContextOf<T> = T extends ChainedMiddleware<infer C> ? C : never;
+export declare function createMiddlewareChain(): ChainedMiddleware<BaseContext>;
+// @filename: src/middleware/rate-limit.ts
+import { defineMiddleware } from "eigen/middleware";
+const requestCounts = new Map<string, { count: number; resetAt: number }>();
+export const rateLimitMiddleware = defineMiddleware((ctx) => {
+  const ip = ctx.request.headers.get("x-forwarded-for")?.split(",")[0].trim() ?? "unknown";
+  const now = Date.now();
+  const entry = requestCounts.get(ip);
+  if (!entry || entry.resetAt <= now) {
+    requestCounts.set(ip, { count: 1, resetAt: now + 60_000 });
+    return;
+  }
+  entry.count++;
+  if (entry.count > 100) return new Response("Too Many Requests", { status: 429 });
+});
+// @filename: src/middleware/session.ts
+import { defineMiddleware } from "eigen/middleware";
+import { verifySession } from "../lib/auth";
+export const sessionMiddleware = defineMiddleware(async (ctx) => {
+  const token = ctx.request.headers.get("cookie");
+  const user = token ? await verifySession(token) : null;
+  return { user };
+});
+// @filename: src/middleware.ts
+// ---cut---
 import { createMiddlewareChain, type ContextOf } from "eigen/middleware";
 import type { EigenContext } from "eigen/types";
 import { rateLimitMiddleware } from "./middleware/rate-limit";
@@ -624,6 +679,7 @@ const chain = createMiddlewareChain()
   .use(rateLimitMiddleware) // Context: BaseContext
   .use(sessionMiddleware) // Context: BaseContext & { user: User | null }
   .use((ctx) => {
+  //    ^?
     // TypeScript knows ctx has: request, params, pathname, user
     console.log(`${ctx.user?.name ?? "anonymous"} requested ${ctx.pathname}`);
   });
@@ -690,6 +746,7 @@ The type accumulation pattern (each middleware extends the context type for down
 `executeMiddleware` and `getCookie` are pure functions over web-standard objects, with no HTTP server or Vite dependency — test them directly:
 
 ```typescript title="packages/eigen/__tests__/middleware.test.ts"
+  //    ^?
 import { describe, it, expect, vi } from "vitest";
 import { executeMiddleware, redirect, type MiddlewareFn } from "eigen/middleware";
 import { getCookie } from "eigen/cookies";

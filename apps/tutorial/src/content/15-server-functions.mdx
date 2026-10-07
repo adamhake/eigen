@@ -16,7 +16,33 @@ _This is the sixteenth installment in a series where we build a toy Next.js on t
 
 The developer experience we're targeting looks like this:
 
-```tsx title="src/pages/Dashboard.tsx"
+```tsx title="src/pages/users.tsx" twoslash
+// @filename: src/lib/database.ts
+export declare const db: {
+  query(sql: string, params: unknown[]): Promise<{ rows: unknown[] }>;
+};
+// @filename: node_modules/eigen/server.ts
+type JsonPrimitive = string | number | boolean | null;
+export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
+export type Validator<T> = { parse(input: unknown): T } | ((input: unknown) => T);
+export interface ServerFn<TInput, TResult> {
+  (input: TInput): Promise<TResult>;
+  url: string;
+}
+interface EigenContext {
+  request: Request;
+  params: Record<string, string>;
+  pathname: string;
+}
+export interface ServerFnBuilder<TContext extends EigenContext, TInput> {
+  validator<T>(validator: Validator<T>): ServerFnBuilder<TContext, T>;
+  handler<TResult extends JsonValue | void>(
+    fn: (opts: { data: TInput; context: TContext }) => Promise<TResult> | TResult,
+  ): ServerFn<TInput, TResult>;
+}
+export declare function createServerFn(_options?: { method?: "GET" | "POST" }): ServerFnBuilder<EigenContext, void>;
+// @filename: src/pages/users.tsx
+// ---cut---
 import { useEffect, useState } from "react";
 import { createServerFn } from "eigen/server";
 import { db } from "../lib/database"; // Node-only import
@@ -24,6 +50,7 @@ import { db } from "../lib/database"; // Node-only import
 type User = { id: string; name: string; role: string };
 
 export const getUsers = createServerFn()
+//           ^?
   .validator((input: unknown) => {
     const { role } = input as { role?: unknown };
     if (typeof role !== "string") throw new Error("role must be a string");
@@ -36,7 +63,7 @@ export const getUsers = createServerFn()
     return users.rows as User[];
   });
 
-export default function Dashboard() {
+export default function UsersPage() {
   const [users, setUsers] = useState<User[]>([]);
 
   useEffect(() => {

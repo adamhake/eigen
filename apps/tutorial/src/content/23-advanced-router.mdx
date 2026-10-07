@@ -164,7 +164,34 @@ TanStack Router's standout feature is type-safe search params — URL query stri
 
 ### Defining search param schemas per route
 
-```tsx title="src/pages/products.tsx"
+```tsx title="src/pages/products.tsx" twoslash
+// @filename: src/lib/db.ts
+export declare const db: {
+  query(sql: string, params: unknown[]): Promise<{ rows: Array<Record<string, any>> }>;
+};
+// @filename: node_modules/eigen/route-types.ts
+export type RoutePaths = "/" | "/products";
+export interface RouteParamsMap {
+  "/": Record<string, never>;
+  "/products": Record<string, never>;
+}
+export interface SearchParamsMap {
+  "/": Record<string, never>;
+  "/products": import("zod").output<typeof import("../../src/pages/products").searchParams>;
+}
+// @filename: node_modules/eigen/types.ts
+export interface PageProps<TPath extends string = string, TData = unknown> {
+  params: Record<string, string>;
+  data: TData;
+}
+// @filename: node_modules/eigen/helpers.ts
+import type { RoutePaths, RouteParamsMap, SearchParamsMap } from "eigen/route-types";
+export declare function defineLoader<TPath extends RoutePaths, TData>(
+  _path: TPath,
+  fn: (args: { params: RouteParamsMap[TPath]; search: SearchParamsMap[TPath] }) => Promise<TData> | TData,
+): typeof fn;
+// @filename: src/pages/products.tsx
+// ---cut---
 import { z } from "zod";
 import { defineLoader } from "eigen/helpers";
 import type { PageProps } from "eigen/types";
@@ -181,6 +208,7 @@ export const searchParams = z.object({
 });
 
 export type SearchParams = z.infer<typeof searchParams>;
+//          ^?
 
 // SQL can't bind identifiers, so ORDER BY comes from a whitelist, never from a parameter
 const ORDER_BY = { price: "price", name: "name", rating: "rating DESC" } as const;

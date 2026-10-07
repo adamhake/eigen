@@ -96,7 +96,27 @@ export function defineParse<TSchema extends StandardSchemaV1>(
 
 Usage in a page component:
 
-```tsx title="src/pages/posts/[id].tsx"
+```tsx title="src/pages/posts/[id].tsx" twoslash
+// @filename: node_modules/eigen/validated-loader.ts
+interface StandardSchemaV1<Input = unknown, Output = Input> {
+  readonly "~standard": { readonly types?: { readonly input: Input; readonly output: Output } };
+}
+type InferInput<S extends StandardSchemaV1> = NonNullable<S["~standard"]["types"]>["input"];
+type InferOutput<S extends StandardSchemaV1> = NonNullable<S["~standard"]["types"]>["output"];
+interface RouteParamsMap {
+  "/": Record<string, never>;
+  "/posts/:id": { id: string };
+}
+export declare function defineValidatedLoader<TPath extends keyof RouteParamsMap, TSchema extends StandardSchemaV1>(
+  _path: TPath,
+  schema: TSchema,
+  fn: (args: { params: RouteParamsMap[TPath] }) => Promise<InferInput<TSchema>>,
+): (args: { params: RouteParamsMap[TPath] }) => Promise<InferOutput<TSchema>>;
+export declare function defineParse<TSchema extends StandardSchemaV1>(
+  schema: TSchema,
+): (data: unknown) => InferOutput<TSchema>;
+// @filename: index.tsx
+// ---cut---
 import { z } from "zod";
 import { defineValidatedLoader, defineParse } from "eigen/validated-loader";
 
@@ -118,6 +138,7 @@ export const parse = defineParse(PostSchema);
 
 // The type is INFERRED from the schema — not manually written
 type PostData = z.infer<typeof PostSchema>;
+//   ^?
 // PostData = { id: number; title: string; body: string; createdAt: Date }
 
 export default function PostPage({ params, data }: { params: { id: string }; data: PostData }) {

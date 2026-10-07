@@ -287,7 +287,30 @@ A `.d.ts` file contains only type information — no runtime code. TypeScript us
 
 Application code references all three layers:
 
-```tsx
+```tsx twoslash
+// @filename: node_modules/eigen/types.ts
+export interface PageProps<TPath extends string = string, TData = unknown> {
+  params: Record<string, string>;
+  data: TData;
+}
+export interface RouteDefinition {
+  path: string;
+  component: (props: Record<string, unknown>) => unknown;
+}
+// @filename: node_modules/eigen/route-types.ts
+export type RoutePaths = "/" | "/about" | "/posts/:id";
+export interface RouteParamsMap {
+  "/": Record<string, never>;
+  "/about": Record<string, never>;
+  "/posts/:id": { id: string };
+}
+// @filename: node_modules/eigen/routes.ts
+import type { RouteDefinition } from "eigen/types";
+export declare const routes: RouteDefinition[];
+// @filename: index.tsx
+// The `{ ... }` body is elided prose, not code
+// @noErrors: 1128
+// ---cut---
 // Layer 3: import from virtual module
 import { routes } from "eigen/routes";
 

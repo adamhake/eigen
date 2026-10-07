@@ -84,7 +84,16 @@ export interface RouteDefinition {
 
 The `RouteParams` type deserves close attention. The real work happens in `ExtractParams`, a **recursive conditional type** that uses template literal inference to extract parameter names from a route path string:
 
-```typescript
+```typescript twoslash
+type ExtractParams<T extends string> = T extends `${string}:${infer Param}/${infer Rest}`
+  ? { [K in Param]: string } & ExtractParams<`/${Rest}`>
+  : T extends `${string}:${infer Param}`
+    ? { [K in Param]: string }
+    : {};
+type RouteParams<T extends string> = keyof ExtractParams<T> extends never
+  ? Record<string, never>
+  : ExtractParams<T>;
+// ---cut---
 // Step through ExtractParams<'/posts/:id/:slug'>:
 
 // First: T extends `${string}:${infer Param}/${infer Rest}`
@@ -99,8 +108,10 @@ type Step2 = ExtractParams<"/:slug">;
 
 // Final result:
 type Result = RouteParams<"/posts/:id/:slug">;
+//   ^?
 //   → { id: string; slug: string }
 ```
+//   ^?
 
 When there are no more `:param` segments, the recursion bottoms out at `{}`. That base case matters: for `'/users/:userId/posts'`, the result is `{ userId: string } & {}`, which is just `{ userId: string }`. (Had the base case been `Record<string, never>`, the intersection would have forced `userId` to `string & never` — that is, `never`.)
 
@@ -520,7 +531,22 @@ Once `T` is inferred, a conditional type picks the shape of the rest of the prop
 
 This page won't fully work yet — we haven't introduced SSR or wired up loaders (that's [Parts 3](/03-server-side-rendering)–[5](/05-typed-loaders)). But it shows what a type-safe page component looks like and how the types we've built connect:
 
-```tsx title="src/pages/posts/[id].tsx"
+```tsx title="src/pages/posts/[id].tsx" twoslash
+// @filename: node_modules/eigen/types.ts
+type ExtractParams<T extends string> = T extends `${string}:${infer Param}/${infer Rest}`
+  ? { [K in Param]: string } & ExtractParams<`/${Rest}`>
+  : T extends `${string}:${infer Param}`
+    ? { [K in Param]: string }
+    : {};
+export type RouteParams<T extends string> = keyof ExtractParams<T> extends never
+  ? Record<string, never>
+  : ExtractParams<T>;
+export interface PageProps<TPath extends string = string, TData = unknown> {
+  params: RouteParams<TPath>;
+  data: TData;
+}
+// @filename: index.tsx
+// ---cut---
 import type { PageProps } from "eigen/types";
 
 type Props = PageProps<"/posts/:id", { title: string; body: string }>;
