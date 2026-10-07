@@ -18,7 +18,7 @@ When an application calls an LLM, the response arrives as a stream of tokens ove
 
 This isn't just a `fetch` with `ReadableStream`. AI responses are _structured_: they contain text chunks, tool call invocations (the model wants to run a function), tool results, and errors. The framework needs to serialize this structure across the server/client boundary and provide typed React hooks to consume it.
 
-Two libraries cover this ground today. The [AI SDK](https://ai-sdk.dev) (the `ai` package, from Vercel) provides the primitives for calling models — `streamText`, tools, structured output — plus UI hooks and its own streaming protocol. [TanStack AI](https://tanstack.com/ai), released in alpha in late 2025, is an independent, framework-agnostic alternative with its own provider adapters (OpenAI, Anthropic, Gemini, Ollama, …), per-model type inference, and streaming-first React and Solid bindings. It isn't built on the AI SDK; it competes with it. We'll use the AI SDK's model-calling primitives on the server and build the transport and hooks ourselves, because the transport is the framework's job.
+Two libraries cover this ground today. The [AI SDK](https://ai-sdk.dev) (the `ai` package, from Vercel) provides the primitives for calling models — `streamText`, tools, structured output — plus UI hooks and its own streaming protocol. [TanStack AI](https://tanstack.com/ai), released in alpha in late 2025 and [in release candidate](https://tanstack.com/blog/tanstack-ai-rc) since August 2026, is an independent, framework-agnostic alternative with its own provider adapters (OpenAI, Anthropic, Gemini, Ollama, …), per-model type inference, and streaming-first React and Solid bindings. It isn't built on the AI SDK; it competes with it. We'll use the AI SDK's model-calling primitives on the server and build the transport and hooks ourselves, because the transport is the framework's job.
 
 ---
 
@@ -56,7 +56,7 @@ On the server, nothing else changes: the same middleware and validator run first
 
 ```typescript title="src/server/chat.ts"
 import { createServerFn } from "eigen/server";
-import { streamText, tool, isStepCount, type TypedToolCall } from "ai";
+import { streamText, tool, isStepCount, type StaticToolCall } from "ai";
 import { openai } from "@ai-sdk/openai";
 import { z } from "zod";
 
@@ -77,7 +77,8 @@ const tools = {
 export type ChatChunk =
   | { type: "text-delta"; text: string }
   | ToolCallChunk
-  | { type: "tool-result"; toolCallId: string; toolName: keyof typeof tools };
+  // failed: the tool threw. The model sees the error and can still answer.
+  | { type: "tool-result"; toolCallId: string; toolName: keyof typeof tools; failed?: true };
 
 const chatInput = z.object({
   messages: z.array(
@@ -96,20 +97,24 @@ export const chat = createServerFn()
       messages: data.messages,
       tools,
       // Let the model answer after a tool result, up to 5 steps
-      // (`stepCountIs` in AI SDK 5 and 6)
+      // (`stepCountIs` in AI SDK 5 and 6, still exported as an alias)
       stopWhen: isStepCount(5),
       abortSignal: context.request.signal,
     });
 
     // Yield structured chunks as they arrive. We map instead of forwarding
     // the raw parts: they carry provider metadata and Error objects that
-    // don't belong on the wire.
-    for await (const part of result.fullStream) {
+    // don't belong on the wire. (`stream` was `fullStream` before AI SDK 7,
+    // which keeps the old name as a deprecated alias.)
+    for await (const part of result.stream) {
       switch (part.type) {
         case "text-delta":
           yield { type: "text-delta", text: part.text };
           break;
         case "tool-call":
+          // Dynamic calls (unknown or unparsable tool names) aren't in our
+          // tool set and have untyped input; we don't forward them
+          if (part.dynamic) break;
           // toolName and input come from the same part, so this pairing is
           // safe; TypeScript just can't correlate them through a destructure
           yield {
@@ -120,7 +125,14 @@ export const chat = createServerFn()
           } as ToolCallChunk;
           break;
         case "tool-result":
+          if (part.dynamic) break;
           yield { type: "tool-result", toolCallId: part.toolCallId, toolName: part.toolName };
+          break;
+        case "tool-error":
+          // A throwing execute() emits tool-error, not tool-result. Forward it
+          // so the client clears its "Calling getWeather…" indicator.
+          if (part.dynamic) break;
+          yield { type: "tool-result", toolCallId: part.toolCallId, toolName: part.toolName, failed: true };
           break;
         case "error":
           // Errors arrive *inside* the stream; rethrow so the endpoint emits an error event
@@ -136,7 +148,7 @@ export const chat = createServerFn()
 
 The `transform` hook from Part 15 already finds `createServerFn()` chains. It needs one more fact per chain: does it end in `.streamHandler(...)`? The outermost call in the chain answers that:
 
-```typescript title="plugins/eigen-server-fns.ts (change)"
+```typescript title="packages/eigen/plugins/eigen-server-fns.ts (change)"
 // In findServerFns, alongside name/start/end:
 const streaming = decl.init.callee.type === "MemberExpression" && decl.init.callee.property.name === "streamHandler";
 
@@ -152,6 +164,7 @@ The streaming stub posts to the same `/_eigen/fn/<id>` endpoint with the same JS
 /** Parses an SSE text stream into the JSON payload of each event */
 function sseDecoder<T>(): TransformStream<string, T> {
   let buffer = "";
+  let finished = false;
   return new TransformStream<string, T>({
     transform(text, controller) {
       buffer += text;
@@ -165,10 +178,18 @@ function sseDecoder<T>(): TransformStream<string, T> {
           if (line.startsWith("event:")) event = line.slice(6).trim();
           else if (line.startsWith("data:")) data += line.slice(5).trimStart();
         }
-        if (event === "done") return controller.terminate();
+        if (event === "done") {
+          finished = true;
+          return controller.terminate();
+        }
         if (event === "error") return controller.error(new Error(JSON.parse(data).error));
         controller.enqueue(JSON.parse(data) as T);
       }
+    },
+    // The body ended. Without a `done` event first, the connection dropped
+    // mid-answer: fail the stream instead of passing off a truncated answer
+    flush(controller) {
+      if (!finished) controller.error(new Error("Stream ended unexpectedly"));
     },
   });
 }
@@ -235,7 +256,7 @@ function toEventStream(iterable: AsyncIterable<unknown>): ReadableStream<Uint8Ar
 }
 
 // In handleServerFnRequest, replacing `return Response.json(result ?? null)`:
-const result = await fn(input, context);
+const result = await registration.fn(input, context);
 if (result != null && typeof (result as any)[Symbol.asyncIterator] === "function") {
   return new Response(toEventStream(result as AsyncIterable<unknown>), {
     headers: {
@@ -247,26 +268,7 @@ if (result != null && typeof (result as any)[Symbol.asyncIterator] === "function
 return Response.json(result ?? null);
 ```
 
-Two transport details matter in dev. Part 14's `sendWebResponse` reads the whole body with `arrayBuffer()` before writing it, which would turn a stream into one late blob, so it has to copy chunks as they arrive. It should also cancel the body when the browser disconnects, which triggers the `cancel()` above:
-
-```typescript title="packages/eigen/node-http.ts (change)"
-export async function sendWebResponse(res: ServerResponse, response: Response): Promise<void> {
-  // ...status and headers as before...
-  if (!response.body) return void res.end();
-
-  const reader = response.body.getReader();
-  res.on("close", () => reader.cancel().catch(() => {}));
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      res.write(value);
-    }
-  } finally {
-    res.end();
-  }
-}
-```
+Nothing changes in dev. Part 14's `sendWebResponse` already streams: it flushes the headers right away (an SSE client shouldn't wait for the first event), copies chunks as they arrive with backpressure, and cancels the body when the browser disconnects, which triggers the `cancel()` above.
 
 ---
 
@@ -390,13 +392,13 @@ export default function ChatPage() {
 }
 ```
 
-`useChat(chat)` infers `TChunk` as `ChatChunk` from the server function's type, so `tc.toolName` is `'getWeather' | 'searchProducts'` and `tc.input` is narrowed per tool.
+`useChat(chat)` infers `TChunk` as `ChatChunk` from the server function's type, so `tc.toolName` is `'getWeather' | 'searchProducts'` and checking it narrows `tc.input` to that tool's input type.
 
 ---
 
 ## Typed tool calls
 
-The most interesting type safety challenge: tool calls are defined on the server (in the streaming function), but the client needs to know about them for rendering. The AI SDK already infers a discriminated union from a tool set — `TypedToolCall<typeof tools>` — and we project it onto our wire format:
+The most interesting type safety challenge: tool calls are defined on the server (in the streaming function), but the client needs to know about them for rendering. The AI SDK already infers a discriminated union from a tool set. `TypedToolCall<typeof tools>` is the type of the stream's `tool-call` parts, but it also includes `DynamicToolCall` (`toolName: string`, `input: unknown`), which would widen every member and defeat the narrowing. We project the static half, `StaticToolCall<typeof tools>`, onto our wire format, matching the `if (part.dynamic) break` above:
 
 ```typescript title="src/server/chat.ts (continued)"
 // Distributes over the union: one member per tool, with its own input type
@@ -404,7 +406,7 @@ type ToToolCallChunk<C> = C extends { toolCallId: string; toolName: infer N; inp
   ? { type: "tool-call"; toolCallId: string; toolName: N; input: I }
   : never;
 
-type ToolCallChunk = ToToolCallChunk<TypedToolCall<typeof tools>>;
+type ToolCallChunk = ToToolCallChunk<StaticToolCall<typeof tools>>;
 // → | { type: 'tool-call'; toolCallId: string; toolName: 'getWeather'; input: { location: string } }
 //   | { type: 'tool-call'; toolCallId: string; toolName: 'searchProducts'; input: { query: string; maxResults: number } }
 ```
@@ -460,7 +462,7 @@ The client receives a progressively-completing object — first `{ title: "..." 
 
 2. **Type a message and watch the response build** chunk by chunk. The text streams in via the `text-delta` chunks.
 
-3. **Trigger a tool call** (ask about weather). The `tool-call` chunk appears in the stream, the UI shows a "calling tool" indicator, then the `tool-result` chunk arrives and the model's answer streams in after it.
+3. **Trigger a tool call** (ask about weather). The `tool-call` chunk appears in the stream, the UI shows a "calling tool" indicator, then the `tool-result` chunk arrives and the model's answer streams in after it. Make `fetchWeather` throw: the chunk arrives with `failed: true`, the indicator still clears, and the model answers around the error.
 
 4. **Check the types** — hover over `tc.toolName` and `tc.input` in the page. TypeScript knows the possible tool names, and inside `if (tc.toolName === 'getWeather')` it knows `tc.input` is `{ location: string }`.
 

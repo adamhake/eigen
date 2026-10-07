@@ -9,7 +9,9 @@ concepts:
   - "auth provider abstraction"
 ---
 
-## _In this installment, we build the authentication and authorization primitives that Eigen provides to application developers. The framework doesn't implement a specific auth strategy — it provides the hooks, middleware patterns, session management, and typed context that make any strategy (session cookies, JWTs, OAuth, SAML, passkeys) plug in cleanly._
+_In this installment, we build the authentication and authorization primitives that Eigen provides to application developers. The framework doesn't implement a specific auth strategy — it provides the hooks, middleware patterns, session management, and typed context that make any strategy (session cookies, JWTs, OAuth, SAML, passkeys) plug in cleanly._
+
+---
 
 ## What the framework provides vs. what the application provides
 
@@ -25,7 +27,7 @@ The framework is responsible for _plumbing_ — getting auth state from the requ
 | Make user available in loaders    | `ctx.user` via middleware context                            | —                                           |
 | Make user available in components | `useSession()` hook                                          | —                                           |
 | Serialize session to client       | `window.__EIGEN_SESSION__` (safe subset)                     | —                                           |
-| CSRF protection                   | Origin check + HMAC token generation and validation          | —                                           |
+| CSRF protection                   | Origin and Fetch Metadata checks, HMAC tokens                | —                                           |
 | Role/permission checks            | `requireAccess()` helper                                     | Define role hierarchy                       |
 
 ---
@@ -104,7 +106,7 @@ export function sessionCookie(sessionId: string, expiresAt: number): string {
     `${SESSION_COOKIE}=${encodeURIComponent(sessionId)}`,
     "Path=/", // required by the __Host- prefix
     "HttpOnly", // invisible to document.cookie — an XSS bug can't read it
-    "Secure", // HTTPS only (Chrome and Firefox accept it on http://localhost)
+    "Secure", // HTTPS only (Chrome and Firefox exempt http://localhost; Safari doesn't)
     "SameSite=Lax", // not sent on cross-site POSTs or subresource requests
     `Max-Age=${maxAge}`,
   ].join("; ");
@@ -116,14 +118,16 @@ export function clearSessionCookie(): string {
 }
 ```
 
+Safari doesn't make the `localhost` exception, so over plain `http://localhost` it drops the cookie and login silently fails. Test in Chrome or Firefox, or serve the dev server over HTTPS (for example with a locally trusted [mkcert](https://github.com/FiloSottile/mkcert) certificate).
+
 The cookie only holds an opaque, random session ID (at least 128 bits from `crypto.getRandomValues`); the user record and expiry live in a server-side store, so a session can be revoked by deleting it.
+
+<CookieAttributesPlayground />
 
 ### Application-side: defining the user type
 
 ```typescript title="src/auth.config.ts"
 import { anonymousSession, SESSION_COOKIE, type AuthConfig } from "eigen/auth";
-<CookieAttributesPlayground />
-
 import { getCookie } from "eigen/cookies";
 import { findSession } from "./lib/sessions"; // server-side session store
 
@@ -175,7 +179,7 @@ export const authConfig: AuthConfig<User> = {
 
 ## The auth middleware
 
-Auth is runtime code, so it doesn't need a virtual module: the framework exports a factory that turns an `AuthConfig` into a Part 14 middleware. It runs first in the global chain, which means it runs for page renders, for `/_eigen/data` requests, _and_ for server function calls — one code path in dev and production.
+Auth is runtime code, so it doesn't need a virtual module: the framework exports a factory that turns an `AuthConfig` into a Part 14 middleware. It runs early in the global chain (right after rate limiting), which means it runs for page renders, for `/_eigen/data` requests, _and_ for server function calls — one code path in dev and production.
 
 <AuthMiddlewareFlowDiagram />
 
@@ -242,7 +246,7 @@ function normalizePath(pathname: string): string {
 }
 ```
 
-Register the middleware first in the global list from Part 14. It replaces Part 14's simple `sessionMiddleware`:
+Register the middleware in the global list from Part 14, right after the rate limiter. It replaces Part 14's simple `sessionMiddleware`:
 
 ```typescript title="src/middleware.ts"
 import { createAuthMiddleware } from "eigen/auth-middleware";
@@ -336,7 +340,7 @@ export const updateProfile = createServerFn({ method: "POST" })
 
 ## Logging in and out
 
-Login and logout set and clear the cookie, so they are plain `Request → Response` handlers mounted on the H3 app — the same app serves dev ([Part 3](/03-server-side-rendering)) and production ([Part 6](/06-production-builds)), so there's one implementation:
+Login and logout set and clear the cookie, so they are plain `Request → Response` handlers mounted on the H3 app. The handlers are one implementation; mount them in both the dev server ([Part 3](/03-server-side-rendering)) and the production server ([Part 6](/06-production-builds)), and in the [Part 17](/17-deployment-adapters) adapter template, before the catch-all:
 
 <SessionCookieLifecycleDiagram />
 
@@ -345,8 +349,29 @@ The handlers:
 ```typescript title="src/server/auth-routes.ts"
 import { clearSessionCookie, sessionCookie } from "eigen/auth";
 import { checkCSRF, safeReturnTo } from "eigen/csrf";
+import { executeMiddleware } from "eigen/middleware";
 import { authConfig } from "../auth.config";
 import { createSession, deleteSession, verifyPassword } from "../lib/sessions";
+import { rateLimitMiddleware } from "../middleware/rate-limit";
+
+// Failed logins per account. Counting against the account, not only the IP,
+// means credential stuffing spread across many IPs still hits the limit.
+// In-memory and per-process like Part 14's limiter; production uses a shared store.
+const failures = new Map<string, { count: number; resetAt: number }>();
+const MAX_FAILURES = 5;
+const WINDOW_MS = 15 * 60_000;
+
+function isLockedOut(email: string): boolean {
+  const entry = failures.get(email);
+  return !!entry && entry.resetAt > Date.now() && entry.count >= MAX_FAILURES;
+}
+
+function recordFailure(email: string): void {
+  const now = Date.now();
+  const entry = failures.get(email);
+  if (!entry || entry.resetAt <= now) failures.set(email, { count: 1, resetAt: now + WINDOW_MS });
+  else entry.count++;
+}
 
 export async function handleLogin(request: Request): Promise<Response> {
   // "Login CSRF": a cross-site form could otherwise log the victim into the
@@ -354,14 +379,35 @@ export async function handleLogin(request: Request): Promise<Response> {
   const denied = await checkCSRF(request, null, authConfig.secret);
   if (denied) return denied;
 
+  // This route is mounted on H3, outside Eigen's middleware chain, so the
+  // per-IP limiter from Part 14 has to be run explicitly
+  const { response: limited } = await executeMiddleware([rateLimitMiddleware], {
+    request,
+    params: {},
+    pathname: "/api/login",
+  });
+  if (limited) return limited;
+
   const form = await request.formData();
   const returnTo = safeReturnTo(form.get("returnTo"));
-  const user = await verifyPassword(String(form.get("email") ?? ""), String(form.get("password") ?? ""));
+  const email = String(form.get("email") ?? "").trim().toLowerCase();
+  const loginError = (code: string) =>
+    new Response(null, {
+      status: 303,
+      headers: { Location: `/login?error=${code}&returnTo=${encodeURIComponent(returnTo)}` },
+    });
 
+  // Counted per submitted email whether or not the account exists, so the
+  // lockout itself reveals nothing about which emails are registered
+  if (isLockedOut(email)) return loginError("too-many-attempts");
+
+  const user = await verifyPassword(email, String(form.get("password") ?? ""));
   if (!user) {
-    const location = `/login?error=invalid&returnTo=${encodeURIComponent(returnTo)}`;
-    return new Response(null, { status: 303, headers: { Location: location } });
+    recordFailure(email);
+    // One generic error for unknown email and wrong password alike
+    return loginError("invalid");
   }
+  failures.delete(email);
 
   // Always issue a NEW random session ID at login — reusing one that existed
   // before authentication enables session fixation
@@ -387,11 +433,58 @@ export async function handleLogout(request: Request): Promise<Response> {
 }
 ```
 
-```typescript title="server.ts"
-// Before the catch-all page handler
+```typescript title="server.ts and server.prod.ts"
+import { handleLogin, handleLogout } from "./src/server/auth-routes";
+
+// In both servers, before the catch-all page handler
 app.post("/api/login", (event) => handleLogin(event.req));
 app.post("/api/logout", (event) => handleLogout(event.req));
 ```
+
+`verifyPassword` is where most login code goes wrong. Following OWASP's [Password Storage](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html) and [Authentication](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html) cheat sheets, it hashes with Argon2id (19 MiB of memory, 2 passes, parallelism 1) and a random per-password salt, and it does the same expensive work whether or not the email exists. Without that, an unknown email returns in microseconds and a known one in tens of milliseconds, and the response time tells an attacker which accounts exist:
+
+```typescript title="src/lib/sessions.ts (password verification)"
+import { argon2, randomBytes, timingSafeEqual } from "node:crypto"; // Node 24.7+
+import { promisify } from "node:util";
+import { findUserByEmail } from "./users";
+
+const argon2id = promisify(argon2);
+
+// OWASP's minimum Argon2id configuration: m=19 MiB, t=2, p=1
+const PARAMS = { memory: 19_456 /* KiB */, passes: 2, parallelism: 1, tagLength: 32 };
+
+/** For signup and password changes: "salt$hash", both base64 */
+export async function hashPassword(password: string): Promise<string> {
+  const salt = randomBytes(16);
+  const hash = await argon2id("argon2id", { ...PARAMS, message: password, nonce: salt });
+  return `${salt.toString("base64")}$${hash.toString("base64")}`;
+}
+
+async function matches(password: string, stored: string): Promise<boolean> {
+  const [salt, expected] = stored.split("$").map((part) => Buffer.from(part, "base64"));
+  const hash = await argon2id("argon2id", { ...PARAMS, message: password, nonce: salt });
+  return hash.length === expected.length && timingSafeEqual(hash, expected);
+}
+
+// A real hash of a random password: unknown emails are checked against it,
+// so they cost the same Argon2id run as known ones
+const dummyHash = hashPassword(randomBytes(16).toString("hex"));
+
+export async function verifyPassword(email: string, password: string) {
+  const user = await findUserByEmail(email);
+  const ok = await matches(password, user?.passwordHash ?? (await dummyHash));
+  return user && ok ? user : null;
+}
+```
+
+On older runtimes, a maintained Argon2 package (such as `@node-rs/argon2`) does the same job. A production store also records the parameters next to each hash (the PHC string format, `$argon2id$v=19$m=19456,t=2,p=1$…`, does this), so they can be raised later and old hashes upgraded at the next successful login.
+
+<Callout type="warn" title="Login is outside the middleware chain">
+  `/api/login` is an H3 route, not an Eigen page, so nothing in `src/middleware.ts` runs for it. That's why `handleLogin`
+  calls the rate limiter itself and keeps its own per-account failure count: a login form is the endpoint brute-force
+  and credential-stuffing attacks aim at. The lockout is temporary (15 minutes), so an attacker can't lock a user out
+  for good, and the error page says "invalid email or password" for every failure.
+</Callout>
 
 ### Validating `returnTo`
 
@@ -480,18 +573,18 @@ function serializeSessionForClient(ctx: EigenContext): ClientSession {
   };
 }
 
-// Inside render(), after runRoute() and the Part 30 metadata step:
+// Inside render(), after runRoute(), resolveRouteData() and the Part 30 metadata step:
 const clientSession = serializeSessionForClient(result.context);
 
 const html = renderToString(
   <SessionProvider initialSession={clientSession}>
-    <App match={match} data={result.data} />
+    <App pathname={pathname} data={data} />
   </SessionProvider>,
 );
 const head =
   renderMetadataToHTML(meta) + `\n    <script>window.__EIGEN_SESSION__=${serializeForScript(clientSession)}</script>`;
 
-return { html, status: 200, data: result.data, head };
+return { html, status: 200, data, head };
 ```
 
 A page that embeds a session is personalized, so it must not be stored in a shared cache: send `Cache-Control: private, no-store` whenever `clientSession.isAuthenticated` is true.
@@ -501,6 +594,7 @@ In the client entry, the `SessionProvider` wraps the app with the same value:
 ```tsx title="src/entry-client.tsx"
 import { hydrateRoot } from "react-dom/client";
 import { SessionProvider } from "eigen/auth/session";
+// ...plus the imports from Part 18's entry-client
 
 const initialSession = window.__EIGEN_SESSION__ ?? {
   user: null,
@@ -509,10 +603,13 @@ const initialSession = window.__EIGEN_SESSION__ ?? {
   csrfToken: null,
 };
 
+const pathname = window.location.pathname;
+const data = await parseRouteData(matchRoute(pathname, routes), window.__EIGEN_DATA__ as RouteData | null);
+
 hydrateRoot(
   document.getElementById("root")!,
   <SessionProvider initialSession={initialSession}>
-    <App />
+    <App pathname={pathname} data={data} />
   </SessionProvider>,
 );
 ```
@@ -580,7 +677,7 @@ The types and the middleware factory:
 
 ```typescript title="packages/eigen/auth.ts"
 import type { BaseContext } from "./types";
-import { defineMiddleware, redirect } from "./middleware";
+import { defineMiddleware } from "./middleware";
 
 export interface RouteAccess<TUser> {
   /** Required roles (any match grants access) */
@@ -593,8 +690,9 @@ export interface RouteAccess<TUser> {
 
 export function requireAccess<TUser extends { role?: string; permissions?: string[] }>(access: RouteAccess<TUser>) {
   return defineMiddleware(async (ctx: BaseContext & { user: TUser | null }) => {
-    // Not logged in → login page (authentication problem)
-    const user = ctx.user ?? redirect(`/login?returnTo=${encodeURIComponent(ctx.pathname)}`);
+    // Not logged in → login page (authentication problem). requireUser (above)
+    // won't send the user back to a server function URL afterwards.
+    const user = requireUser(ctx);
 
     // Logged in but not allowed → 403 (authorization problem)
     const forbidden = new Response("Forbidden", { status: 403 });
@@ -618,8 +716,8 @@ Server functions ([Part 15](/15-server-functions)) accept POST requests from the
 
 The framework layers two defenses on top of `SameSite=Lax`:
 
-1. **Origin check.** Browsers send an `Origin` header on every POST (same-origin included). A state-changing request whose `Origin` doesn't match our host is rejected.
-2. **Session-bound token.** The token is `HMAC-SHA256(secret, sessionId)`. It's stateless (nothing to store), can't be forged without the server's secret, and only works for the session it was issued to.
+1. **Origin and Fetch Metadata checks.** Browsers send an `Origin` header on every POST (same-origin included), and a `Sec-Fetch-Site` header that says whether the request is `same-origin`, `same-site` or `cross-site`. A state-changing request marked `cross-site`, or whose `Origin` doesn't match our host, is rejected. (This follows OWASP's [CSRF Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html), which treats `SameSite` as defense in depth, not as the defense.)
+2. **Session-bound token.** The token is `HMAC-SHA256(secret, sessionId)`. It's stateless (nothing to store), can't be forged without the server's secret, only works for the session it was issued to, and changes at every login because the session ID does. It travels in a custom header, which a cross-site page can't attach without a CORS preflight our server never grants.
 
 ```typescript title="packages/eigen/csrf.ts"
 const encoder = new TextEncoder();
@@ -652,6 +750,8 @@ export async function validateCSRFToken(token: string, sessionId: string, secret
 }
 
 function originAllowed(request: Request): boolean {
+  // Fetch Metadata: the browser itself labels a request from another site
+  if (request.headers.get("sec-fetch-site") === "cross-site") return false;
   const origin = request.headers.get("origin");
   // No Origin: not a modern browser. Allow only if the request carries no
   // cookies (e.g. an API client with a bearer token — nothing ambient to abuse).
@@ -698,22 +798,29 @@ export async function checkCSRF(request: Request, sessionId: string | null, secr
 }
 ```
 
-`checkCSRF` runs inside the auth middleware, and the server function endpoint from Part 15 runs the global middleware chain before every handler — in the dev server and in the production server alike. The token reaches the browser in `window.__EIGEN_SESSION__.csrfToken`, and the client stub generated by Part 15's `transform` hook sends it back:
+`checkCSRF` runs inside the auth middleware, and the server function endpoint from Part 15 runs the global middleware chain before every handler — in the dev server and in the production server alike. The token reaches the browser in `window.__EIGEN_SESSION__.csrfToken`. Part 15's client runtime has to send it back: without the header, every server function call from a logged-in user fails with "Invalid CSRF token". Both stubs in `server-fn-client.ts` — `createServerFnStub` from Part 15 and `createStreamingServerFnStub` from [Part 27](/27-ai-streaming) — read it at call time:
 
-```typescript
-// Generated client stub
-export const updateProfile = async (args) => {
-  const res = await fetch("/_eigen/fn/b4e2a1", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Eigen-CSRF": window.__EIGEN_SESSION__?.csrfToken ?? "",
-    },
-    body: JSON.stringify(args),
-  });
-  // ...
-};
+```typescript title="packages/eigen/server-fn-client.ts"
+/** The session's CSRF token, if the page was rendered for a logged-in user */ // [!code ++]
+function csrfHeaders(): Record<string, string> { // [!code ++]
+  const token = window.__EIGEN_SESSION__?.csrfToken; // [!code ++]
+  return token ? { "X-Eigen-CSRF": token } : {}; // [!code ++]
+} // [!code ++]
+
+export function createServerFnStub(id: string) {
+  const url = `/_eigen/fn/${id}`;
+
+  const call = async (input?: unknown) => {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" }, // [!code --]
+      headers: { "Content-Type": "application/json", ...csrfHeaders() }, // [!code ++]
+      body: JSON.stringify(input ?? null),
+    });
+    // ...unchanged from Part 15
 ```
+
+Make the same one-line change to the `fetch` in `createStreamingServerFnStub`. The `Window.__EIGEN_SESSION__` declaration comes from `auth-session.tsx`, which is part of the same program. Plain HTML forms can't set headers, so they send the token in a `_csrf` field instead (as `UserMenu` above and [Part 38](/38-forms-mutations)'s `<Form>` do), and `readToken` accepts either.
 
 Developers never think about CSRF — the framework handles token generation, injection, and validation transparently. The `EIGEN_AUTH_SECRET` must be long, random, and server-only; rotating it invalidates every outstanding token (users just reload the page).
 
@@ -723,7 +830,7 @@ Developers never think about CSRF — the framework handles token generation, in
 
 The `AuthConfig.getSession` function is the integration point. Any auth library that can resolve a session from a `Request` object works:
 
-<Tabs items={["Better Auth", "Auth.js", "Custom JWT"]}>
+<Tabs items={["Better Auth", "Auth.js", "API clients (bearer tokens)"]}>
 <Tab value="Better Auth">
 
 ```typescript title="src/auth.config.ts"
@@ -799,21 +906,36 @@ export const authConfig: AuthConfig<User> = {
     if (!user) return anonymousSession;
 
     // Auth.js doesn't expose a session ID; bind CSRF tokens to its session cookie
-    const sessionToken =
-      getCookie(request, "__Secure-authjs.session-token") ?? getCookie(request, "authjs.session-token");
-
     return {
       user,
-      sessionId: sessionToken ?? null,
+      sessionId: readSessionToken(request),
       isAuthenticated: true,
       expiresAt: Date.parse(data.expires),
     };
   },
 };
+
+/** Auth.js splits a large session cookie into name.0, name.1, ... */
+function readSessionToken(request: Request): string | null {
+  for (const name of ["__Secure-authjs.session-token", "authjs.session-token"]) {
+    const whole = getCookie(request, name);
+    if (whole) return whole;
+    let joined = "";
+    for (let i = 0; ; i++) {
+      const part = getCookie(request, `${name}.${i}`);
+      if (part === undefined) break;
+      joined += part;
+    }
+    if (joined) return joined;
+  }
+  return null;
+}
 ```
 
+With the default JWT strategy, Auth.js re-issues the session cookie when it extends the session (at most once per `updateAge`, a day by default), and the new value invalidates CSRF tokens bound to the old one. A page left open across that moment gets a 403 on its next server function call and recovers on reload. With the database strategy, the cookie holds a stable session token and this doesn't happen.
+
 </Tab>
-<Tab value="Custom JWT">
+<Tab value="API clients (bearer tokens)">
 
 ```typescript title="src/auth.config.ts"
 // User and requireEnv: as defined in the cookie-session version above
@@ -850,6 +972,8 @@ export const authConfig: AuthConfig<User> = {
 };
 ```
 
+This tab serves API clients (mobile apps, scripts, other services) that send the token themselves. Browsers never attach an `Authorization` header to page loads, `/_eigen/data` requests or the server function stub, so a browser user authenticated this way would look anonymous to SSR and to every route guard. Patching `fetch` to add the header means keeping the JWT where JavaScript can read it, such as `localStorage`, where any XSS bug can steal it. For browsers, put the JWT in the `__Host-session` cookie with `sessionCookie(jwt, exp * 1000)`, read it with `getCookie(request, SESSION_COOKIE)` instead of the header, and return `sessionId: payload.jti` (issue every token with a random `jti`), so CSRF protection applies as it does to cookie sessions.
+
 </Tab>
 </Tabs>
 
@@ -877,6 +1001,6 @@ The framework doesn't care which strategy you use. It provides the typed pipelin
 
 The framework's auth contribution is _plumbing, not policy_. It provides the pipeline that carries auth state from the HTTP request through middleware, into loaders and server functions, across the SSR/client serialization boundary, and into React components via context hooks. The application plugs in a `getSession` function and a `User` type — everything else is handled.
 
-This separation means the framework works with any auth provider (Better Auth, Auth.js, Lucia, custom JWT, Salesforce SSO, SAML) without coupling to any of them. The middleware context accumulation pattern from Part 14 is the foundation — auth is its most important application.
+This separation means the framework works with any auth provider (Better Auth, Auth.js, custom JWT, Salesforce SSO, SAML) without coupling to any of them. The middleware context accumulation pattern from Part 14 is the foundation — auth is its most important application.
 
 The CSRF protection is an example of something the framework _should_ handle because it's tied to the server function transport mechanism (Part 15). The framework generates the RPC endpoints, so it's responsible for securing them. If it didn't, every application would need to implement CSRF protection independently, and most would get it wrong.

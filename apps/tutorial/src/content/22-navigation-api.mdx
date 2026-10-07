@@ -14,7 +14,7 @@ _This is the twenty-third installment in a series where we build a toy Next.js o
 
 ## What's wrong with `pushState`/`popstate`
 
-Since Part 2, our client-side router has used this pattern:
+Since Part 4, our client-side router has used this pattern (in `packages/eigen/router.tsx` since Part 11):
 
 ```typescript
 window.history.pushState({}, "", href);
@@ -50,10 +50,11 @@ navigation.addEventListener("navigate", (event: NavigateEvent) => {
     async handler() {
       // Fetch data, update React state, etc.
       const data = await fetchLoaderData(url.pathname);
-      renderRoute(match, data);
+      await renderRoute(match, data); // resolves once the new page is in the DOM
     },
 
-    // Move focus and restore/reset scroll once the handler settles
+    // Move focus and restore/reset scroll once the handler settles, so the
+    // handler must not resolve before the new page has rendered
     focusReset: "after-transition",
     scroll: "after-transition",
   });
@@ -77,29 +78,56 @@ The fundamental shift: instead of the framework _performing_ navigations (`pushS
 
 ## Rewriting Eigen's router
 
-In Part 11, we extracted `Router` and `Link` into `packages/eigen/router.tsx` using the `pushState`/`popstate` pattern. Now we'll rewrite both to use the Navigation API. The `matchRoute` helper stays the same — only the navigation handling changes:
+In Part 11, we extracted `Router` and `Link` into `packages/eigen/router.tsx` using the `pushState`/`popstate` pattern, and Part 13 reshaped `Router` around a single `{ pathname, data }` state and `RouteTree`, so layouts persist across navigations. Now we'll swap the `popstate` effect for a `navigate` listener. Everything else stays: the props (the server still renders `Router` through `<App>`, so nothing may touch `window` during render), the combined state, `RouteTree`, and Part 18's `parseRouteData`.
 
 ```tsx title="packages/eigen/router.tsx"
-import { useState, useEffect, useTransition, Suspense } from "react";
+import { useState, useEffect, useLayoutEffect, useRef, startTransition, Suspense } from "react";
 import { matchRoute } from "eigen/match-route";
 import { routes } from "eigen/routes";
-import type { RoutePaths, RouteParamsMap } from "eigen/route-types";
+import type { RouteData } from "eigen/route-data";
 
-export function Router() {
-  const [pathname, setPathname] = useState(window.location.pathname);
-  const [data, setData] = useState<unknown>(window.__EIGEN_DATA__);
-  const [isNavigating, setIsNavigating] = useState(false);
-  const [isPending, startTransition] = useTransition();
+interface RouterProps {
+  initialPathname: string;
+  initialData: unknown;
+}
+
+interface RouterState {
+  pathname: string;
+  data: RouteData | null;
+}
+
+async function fetchRouteData(href: string, signal: AbortSignal): Promise<unknown> {
+  const res = await fetch(`/_eigen/data?path=${encodeURIComponent(href)}`, { signal });
+  // A 404/500 becomes a failed navigation (navigateerror), not a confusing parse error
+  if (!res.ok) throw new Error(`Loading ${href} failed: ${res.status}`);
+  return res.json();
+}
+
+export function Router({ initialPathname, initialData }: RouterProps) {
+  const [state, setState] = useState<RouterState>({
+    pathname: initialPathname,
+    data: initialData as RouteData | null,
+  });
+
+  // Resolves the in-flight navigation once React has committed its state
+  const onCommit = useRef<(() => void) | null>(null);
+  useLayoutEffect(() => {
+    onCommit.current?.();
+    onCommit.current = null;
+  }, [state]);
+
+  /** Render `next` in a transition; resolves when it's in the DOM */
+  const commit = (next: RouterState) =>
+    new Promise<void>((resolve) => {
+      onCommit.current = resolve;
+      startTransition(() => setState(next));
+    });
 
   useEffect(() => {
-    // Feature detection — without the Navigation API, Link renders a plain
-    // <a>, so clicks become full page loads (still correct, just not SPA).
-    // popstate only matters for entries an older Eigen pushed.
-    if (!("navigation" in window)) {
-      const handler = () => setPathname(window.location.pathname);
-      window.addEventListener("popstate", handler);
-      return () => window.removeEventListener("popstate", handler);
-    }
+    // Feature detection: without the Navigation API, Link renders a plain
+    // <a> and nothing intercepts it, so every click is a full page load
+    // (still correct, just not SPA).
+    if (!("navigation" in window)) return;
 
     const handleNavigate = (event: NavigateEvent) => {
       // Only intercept same-origin page navigations: not fragment jumps,
@@ -114,26 +142,15 @@ export function Router() {
 
       event.intercept({
         async handler() {
-          setIsNavigating(true);
+          // event.signal aborts the fetch when a newer navigation starts
+          const json = await fetchRouteData(url.pathname, event.signal);
+          const data = parseRouteData(match, json) as RouteData | null; // Part 18
+          event.signal.throwIfAborted(); // Superseded while parsing? Don't render it.
 
-          try {
-            // Fetch loader data from the server
-            const res = await fetch(
-              `/_eigen/data?path=${encodeURIComponent(url.pathname)}`,
-              { signal: event.signal }, // ← Automatic abort on new navigation!
-            );
-            const json = await res.json();
-            // Validate with the route's schema, if it has one (Part 18)
-            const newData = match.route.parse ? match.route.parse(json) : json;
-
-            // Use React transition to avoid blocking the UI
-            startTransition(() => {
-              setPathname(url.pathname);
-              setData(newData);
-            });
-          } finally {
-            setIsNavigating(false);
-          }
+          // Don't settle before React has committed the new page: focusReset
+          // and scroll run when this promise resolves, and startTransition
+          // only schedules the render (a React.lazy page may still be loading)
+          await commit({ pathname: url.pathname, data });
         },
         focusReset: "after-transition",
         scroll: "after-transition",
@@ -144,21 +161,18 @@ export function Router() {
     return () => navigation.removeEventListener("navigate", handleNavigate);
   }, []);
 
-  const match = matchRoute(pathname, routes);
+  const match = matchRoute(state.pathname, routes);
   if (!match) return <h1>404</h1>;
-  const Component = match.route.component;
 
   return (
-    <>
-      {/* Native navigation-aware loading indicator */}
-      {isNavigating && <div className="nav-progress-bar" />}
-      <Suspense fallback={<div>Loading...</div>}>
-        <Component params={match.params} data={data} />
-      </Suspense>
-    </>
+    <Suspense fallback={<div>Loading...</div>}>
+      <RouteTree match={match} data={state.data} />
+    </Suspense>
   );
 }
 ```
+
+Two things changed besides the event source. The handler resolves only after the commit: the `useLayoutEffect` keyed on `state` resolves the pending promise once React has applied the new route to the DOM, so the browser restores scroll on back/forward against the _new_ page, not the old one. (It's a layout effect so the promise resolves before the browser paints; Part 24's `<ViewTransition>` depends on that too.) And Part 13's `loading` flag is gone. A boolean set in the handler and cleared in `finally` can flicker off when a newer navigation aborts an older one, and the browser already tracks the in-flight navigation for us, as `navigation.transition` (below).
 
 ### The `Link` component simplifies dramatically
 
@@ -283,8 +297,9 @@ export function setupRouter(renderFn) {
       event.intercept({
         async handler() {
           const res = await fetch(`/_eigen/data?path=${encodeURIComponent(url.pathname)}`, { signal: event.signal });
-          const data = await res.json();
-          renderFn(url.pathname, data);
+          if (!res.ok) throw new Error(`Loading ${url.pathname} failed: ${res.status}`);
+          // renderFn returns a promise that resolves after the commit, as above
+          await renderFn(url.pathname, await res.json());
         },
       });
     });

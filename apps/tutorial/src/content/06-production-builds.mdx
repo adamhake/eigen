@@ -52,17 +52,15 @@ export default defineConfig({
     alias: {
       "eigen/types": resolve(__dirname, "packages/eigen/types.ts"),
       "eigen/match-route": resolve(__dirname, "packages/eigen/match-route.ts"),
+      "eigen/serialize": resolve(__dirname, "packages/eigen/serialize.ts"),
       "eigen/helpers": resolve(__dirname, "packages/eigen/helpers.ts"),
       "eigen/run-loader": resolve(__dirname, "packages/eigen/run-loader.ts"),
     },
   },
-  build: {
-    // [!code ++]
+  build: { // [!code ++]
     manifest: true, // [!code ++]
-    rolldownOptions: {
-      // [!code ++]
-      onwarn(warning, defaultHandler) {
-        // [!code ++]
+    rolldownOptions: { // [!code ++]
+      onwarn(warning, defaultHandler) { // [!code ++]
         // `RouteModN.loader` on a page without a loader is expected (see below) // [!code ++]
         if (warning.code === "IMPORT_IS_UNDEFINED") return; // [!code ++]
         defaultHandler(warning); // [!code ++]
@@ -99,7 +97,7 @@ The **`--ssr` flag** changes the build fundamentally:
 - **Entry**: `src/entry-server.tsx` (the `--ssr` argument) replaces `index.html` as the input.
 - **External dependencies**: `node_modules` packages are _not_ bundled by default — they're available at runtime in Node, so bundling them would just bloat the output.
 - **Module format**: ESM by default.
-- **File names**: The entry is written as `entry-server.js` with no hash, so the production server can import it by a fixed name. Code splitting still works as usual. A dynamic `import()` in server code would produce extra (hashed) chunks. Our server build ends up as one file only because the SSR branch of `eigen/routes` uses static imports.
+- **File names**: The entry is written as `entry-server.js` with no hash, so the production server can import it by a fixed name. Code splitting still works as usual. A dynamic `import()` in server code would produce extra (hashed) chunks. Our server build ends up as one file only because the SSR branch of `eigen/routes` uses static imports (and stays that way as long as nothing in the server graph uses a dynamic `import()` or a non-eager `import.meta.glob`).
 - **Plugins**: Both builds run our `eigen-routes` plugin and produce a virtual module — the client gets `React.lazy(...)` references, the server gets route objects with loaders, just like in dev. ([Part 7](/07-transform-hook) introduces `applyToEnvironment` for plugins that should only run in one of the two.)
 
 ---
@@ -142,7 +140,7 @@ After `vite build --outDir dist/client`, the manifest at `dist/client/.vite/mani
 - Shared code (React, the router) lives in the entry chunk. Each page chunk's `imports: ["index.html"]` says "load the entry chunk first". If several pages shared a large dependency that the entry didn't use, Rolldown would split it into its own chunk, with a `_`-prefixed key such as `_shared-x1y2z3.js` (the file itself is `assets/shared-x1y2z3.js`).
 - The CSS was extracted to `assets/index-e5f6g7h8.css`.
 
-The built `dist/client/index.html` already contains the entry's `<script type="module" crossorigin src="/assets/index-a1b2c3d4.js">` and the CSS `<link>`, so for the entry itself the production server needs nothing from the manifest. The manifest earns its keep for anything the HTML can't know in advance. The main example is per-route preloading: when the server renders `/posts/1`, it can look up `src/pages/posts/[id].tsx` and emit `<link rel="modulepreload" href="/assets/_id_-q7r8s9t0.js">` so the browser fetches the page chunk in parallel with the entry instead of after it. Doing that requires knowing which source file the matched route came from, which our route objects don't carry yet. Per-route CSS in [Part 37](/37-css-styling-pipeline) is where the framework starts reading the manifest at request time.
+The built `dist/client/index.html` already contains the entry's `<script type="module" crossorigin src="/assets/index-a1b2c3d4.js">` and the CSS `<link>`, so for the entry itself the production server needs nothing from the manifest. The manifest earns its keep for anything the HTML can't know in advance. The main example is per-route preloading: when the server renders `/posts/1`, it can look up `src/pages/posts/[id].tsx` and emit `<link rel="modulepreload" href="/assets/_id_-q7r8s9t0.js">` so the browser fetches the page chunk in parallel with the entry instead of after it. Doing that requires knowing which source file the matched route came from, which our route objects don't carry yet. Per-route CSS in [Part 37](/37-css-styling-pipeline) is where the framework starts using it: the server build inlines the manifest and walks it for each request.
 
 The hex suffix in each filename (`a1b2c3d4`) is a hash of the file's _content_. Change the source, the hash changes, the filename changes, and the browser is forced to fetch the new version — even if the server set `Cache-Control: max-age=31536000`. This is content-addressed caching, and it's the reason production servers can ship aggressive cache headers without ever serving stale code.
 
@@ -164,8 +162,7 @@ function App({ match, data }: { match: RouteMatch; data: unknown }) {
   return (
     <div>
       <nav>
-        <a href="/">Home</a> | <a href="/about">About</a> | <a href="/posts/1">Post 1</a> |{" "}
-        <a href="/posts/2">Post 2</a>
+        <a href="/">Home</a> | <a href="/about">About</a> | <a href="/posts/1">Post 1</a> | <a href="/posts/2">Post 2</a>
       </nav>
       <Suspense fallback={<div>Loading...</div>}>
         <Component params={match.params} data={data} />
@@ -193,8 +190,7 @@ export async function render(pathname: string): Promise<RenderResult> {
   return { html, status: 200, data };
 }
 
-export async function loadData(pathname: string): Promise<unknown> {
-  // [!code ++]
+export async function loadData(pathname: string): Promise<unknown> { // [!code ++]
   return runLoader(pathname, routes); // [!code ++]
 } // [!code ++]
 ```
@@ -223,14 +219,25 @@ import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { H3, serve, serveStatic } from "h3";
 import { composeHtml } from "./packages/eigen/compose-html";
-import type { RenderResult } from "./src/entry-server";
+
+// The same shape Part 3's server.ts declares. Importing it from
+// src/entry-server.tsx would pull JSX and eigen/* imports into
+// tsconfig.node.json, which has neither `jsx` nor those paths.
+interface RenderResult {
+  html: string;
+  status: number;
+  data: unknown;
+}
 
 // The built template: Vite already rewrote its <script> and <link> tags
 // to the hashed files in dist/client/assets. Read it once at startup.
 const template = readFileSync("dist/client/index.html", "utf-8");
 
-// Top-level await: load the pre-built server bundle once at startup
-const { render, loadData } = (await import("./dist/server/entry-server.js")) as {
+// Top-level await: load the pre-built server bundle once at startup.
+// The path is in a variable so TypeScript doesn't try to resolve build
+// output that has no type declarations (or doesn't exist before a build).
+const serverEntry = "./dist/server/entry-server.js";
+const { render, loadData } = (await import(serverEntry)) as {
   render: (pathname: string) => Promise<RenderResult>;
   loadData: (pathname: string) => Promise<unknown>;
 };
@@ -281,7 +288,7 @@ serve(app, { port: 3000 });
 console.log("Production server: http://localhost:3000");
 ```
 
-Like `server.ts`, this file runs under `tsx` and is type-checked as tooling code, so add it to `tsconfig.node.json` from [Part 1](/01-bare-vite-spa):
+Like `server.ts`, this file runs under `tsx` and is type-checked as tooling code, so add it to `tsconfig.node.json` from [Part 1](/01-bare-vite-spa). That's why it declares `RenderResult` itself and loads the bundle through a variable: everything it imports must type-check under the tooling config, and `dist/server/entry-server.js` is untyped build output, so the `as { … }` assertion is the only type information the server has about it.
 
 ```json title="tsconfig.node.json"
 {

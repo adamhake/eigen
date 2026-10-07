@@ -173,7 +173,7 @@ This is a common source of confusion. Some hooks run in both dev and build. Othe
 
 The key insight: `resolveId`, `load`, and `transform` work identically in both modes. This is why your virtual module generates the same route table whether Vite is serving it on-demand to a browser or bundling it with Rolldown. The plugin code doesn't need to know which mode it's running in (though it can check `config.command === 'serve'` or `config.command === 'build'` if needed).
 
-The hooks that only run in build — `renderChunk`, `generateBundle`, `writeBundle` — are output generation hooks. We'll use `generateBundle` for emitting additional assets. For work that needs _every_ environment's output — like pre-rendering pages after both builds finish for SSG in [Part 16](/16-static-site-generation) — we'll use a `buildApp` hook with `order: 'post'`, which runs once after all environments are built. (`closeBundle` is a poor fit there: it fires once per environment, and environment builds can run in parallel.)
+The hooks that only run in build — `renderChunk`, `generateBundle`, `writeBundle` — are output generation hooks. We'll use `generateBundle` for emitting additional assets. For work that needs _every_ environment's output — like pre-rendering pages after both builds finish for SSG in [Part 16](/16-static-site-generation) — we'll use a `buildApp` hook with `order: 'post'`, which runs once after all environments are built. (`closeBundle` is a poor fit there: it fires once per environment, so it runs before the other environment's build has finished, and a custom `buildApp` may even build environments in parallel.)
 
 ---
 
@@ -199,7 +199,7 @@ load(id) {
 import { routes } from 'eigen/routes'
 ```
 
-The `moduleType: 'js'` property tells Rolldown to treat the returned code as JavaScript. This is important for virtual modules (which have no file extension for Rolldown to infer the type from) and any `load`/`transform` hook that converts non-JS content into JavaScript.
+The `moduleType: 'js'` property tells Rolldown to treat the returned code as JavaScript. It's harmless here (an extensionless `\0` ID is already treated as JavaScript), and required whenever a `load` or `transform` hook turns non-JS content (a `.txt` or `.md` file, say) into JavaScript.
 
 The `\0` prefix on the _resolved_ ID is a Rollup/Rolldown convention. It signals to other plugins that this is a virtual module and shouldn't be resolved to a path on disk. Developers never see it — it's internal to the plugin pipeline.
 
@@ -253,7 +253,7 @@ This "same plugin, different output" pattern is central to everything we'll buil
 
 ### The Environment API
 
-Until Vite 5, these two environments were implicit. The `ssr` boolean was threaded through various hook parameters, and plugins had to check it manually — often with awkward patterns like checking `options?.ssr` or `this.environment?.name === 'ssr'`.
+Until Vite 5, these two environments were implicit. The `ssr` boolean was threaded through various hook parameters, and plugins had to check it manually — `transform(code, id, options)` reading `options?.ssr`, and similar flags on `resolveId` and `load`.
 
 Vite 6 formalized the concept with the [**Environment API**](https://vite.dev/guide/api-environment). Environments are now first-class configuration objects. The default setup creates two — `client` and `ssr` — but framework authors can define additional environments. An `edge` environment targeting Cloudflare Workers, for instance, or an `rsc` environment for React Server Components. Each environment has its own module graph, resolve conditions, and build configuration.
 
@@ -279,9 +279,12 @@ For a server-rendered framework, you need **two builds**:
 
 The built HTML is the bridge between the two builds. The production server reads `dist/client/index.html` as its template — the hashed asset tags are already in it — injects the SSR markup and serialized data, and serves the result. The manifest is there for finer-grained work, such as adding preload hints for the chunks a specific route needs.
 
-The `buildApp` hook (available as a plugin hook since Vite 7) lets a framework plugin orchestrate both builds in a single `vite build` command:
+The `buildApp` hook (available as a plugin hook since Vite 7) lets a framework plugin orchestrate both builds in a single `vite build` command. It needs one piece of config alongside it: `builder: {}`, which opts into _app_ builds (the same as `vite build --app`):
 
 ```typescript
+config() {
+  return { builder: {} }  // create every environment, not just client
+},
 buildApp: {
   order: 'pre',
   async handler(builder) {
@@ -290,6 +293,8 @@ buildApp: {
   },
 }
 ```
+
+Without `builder` (or `--app`), `vite build` uses the legacy single-environment builder: it only creates the `client` environment, so `builder.environments.ssr` is `undefined` and the handler above throws.
 
 The order matters — building the client first generates the manifest that the server build may need to reference.
 
@@ -315,7 +320,7 @@ Putting it all together, a Vite-based framework plugin is responsible for:
 
 8. **HTML injection** — Using `transformIndexHtml` to inject SSR-rendered markup, serialized data, and asset preload hints.
 
-In practice, frameworks decompose this into multiple coordinated plugins returned as an array from a single factory function — `eigen()` returns `[routePlugin, stripPlugin, apiPlugin, configPlugin]`. But from the user's perspective, it's one line:
+In practice, frameworks decompose this into multiple coordinated plugins returned as an array from a single factory function — `eigen()` returns an array like `[routes, stripLoaders, api, devOverlay, config]`. But from the user's perspective, it's one line:
 
 ```typescript title="vite.config.ts"
 import { defineConfig } from "vite";
@@ -327,7 +332,7 @@ export default defineConfig({
 });
 ```
 
-Compare this to [TanStack Start](https://tanstack.com/start)'s `tanstackStart()` or [Remix](https://remix.run)'s `remix()` — the shape is identical. A single function call that returns an array of coordinated plugins. The framework hides the complexity.
+Compare this to [TanStack Start](https://tanstack.com/start)'s `tanstackStart()` or [React Router](https://reactrouter.com)'s `reactRouter()` (formerly Remix's `vitePlugin`) — the shape is identical. A single function call that returns an array of coordinated plugins. The framework hides the complexity.
 
 ---
 

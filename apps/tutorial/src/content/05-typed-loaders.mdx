@@ -167,7 +167,7 @@ The first generic parameter `TPath` is constrained to `keyof RouteParamsMap` —
 
 <LoaderTypeFlowDiagram />
 
-`defineLoader` does nothing at runtime — it returns `fn` unchanged. The `_path` argument is consumed only by the type system, hence the underscore prefix (a [TypeScript convention](https://www.typescriptlang.org/docs/handbook/variable-declarations.html#destructuring) for "intentionally unused"). All of the safety lives in the call signature.
+`defineLoader` does nothing at runtime — it returns `fn` unchanged. The `_path` argument is consumed only by the type system, hence the underscore prefix (a common community convention for "intentionally unused"; oxlint's `no-unused-vars` ignores `_`-prefixed parameters by default). All of the safety lives in the call signature.
 
 <TypeDeepDive title="TypeScript: Generic constraints with `extends keyof`">
 
@@ -183,6 +183,7 @@ We also need to register `eigen/helpers` so application code can import it — s
     "paths": {
       "eigen/types": ["./packages/eigen/types.ts"],
       "eigen/match-route": ["./packages/eigen/match-route.ts"],
+      "eigen/serialize": ["./packages/eigen/serialize.ts"],
       "eigen/helpers": ["./packages/eigen/helpers.ts"] // [!code ++]
     }
   }
@@ -194,12 +195,13 @@ resolve: {
   alias: {
     'eigen/types': resolve(__dirname, 'packages/eigen/types.ts'),
     'eigen/match-route': resolve(__dirname, 'packages/eigen/match-route.ts'),
+    'eigen/serialize': resolve(__dirname, 'packages/eigen/serialize.ts'),
     'eigen/helpers': resolve(__dirname, 'packages/eigen/helpers.ts'), // [!code ++]
   },
 },
 ```
 
-(In [Part 11](/11-framework-plugin) we'll consolidate these aliases into a single `resolveId` hook on the framework plugin and stop adding entries by hand.)
+(These per-file aliases stay until [Part 40](/40-monorepo-publishing) turns Eigen into a real workspace package with an `exports` map.)
 
 Usage:
 
@@ -296,7 +298,7 @@ export default function PostPage() {
 }
 ```
 
-This is the same idea behind [TanStack Router](https://tanstack.com/router)'s [code generation](https://tanstack.com/router/latest/docs/framework/react/guide/code-generation) and React Router v7's route type generation. Notice what the generator does _not_ do: it never extracts or evaluates the loader's type. It only emits `typeof import("…").loader` for each file it finds, and TypeScript's own inference fills in the rest. The plugin needs the same filesystem scan we already do in [Part 2](/02-route-discovery-plugin), plus one generated module per route file.
+This is the same idea behind [TanStack Router](https://tanstack.com/router)'s [code generation](https://tanstack.com/router/latest/docs/routing/file-based-routing) and React Router v7's route type generation. Notice what the generator does _not_ do: it never extracts or evaluates the loader's type. It only emits `typeof import("…").loader` for each file it finds, and TypeScript's own inference fills in the rest. The plugin needs the same filesystem scan we already do in [Part 2](/02-route-discovery-plugin), plus one generated module per route file.
 
 We won't implement this in the tutorial. The hard parts are mostly logistics: generated module names per route, keeping the declarations in sync as files move, and editor tooling that picks up regenerated files promptly. But knowing how little magic is involved helps explain the trade-offs real frameworks make.
 
@@ -315,7 +317,7 @@ Each row builds on the one above it. Eigen ships both Levels 2 and 3 — `Loader
 
 <Callout type="info" title="React Server Components sidesteps the spectrum">
 
-[Next.js App Router with Server Components](https://nextjs.org/docs/app/building-your-application/rendering/server-components) takes a different approach to the same problem. Components _are_ the data fetching layer, so there's no loader/component type bridge to build — data is fetched inline with `await`, and TypeScript infers the types naturally because the fetch and the render live in one function. This is an architectural trade-off, not a strict win: RSC eliminates the loader abstraction entirely, while the loader pattern keeps a clean separation between data fetching (server-only) and rendering (universal). We'll build our own RSC layer in [Part 21](/21-react-server-components).
+[Next.js App Router with Server Components](https://nextjs.org/docs/app/getting-started/server-and-client-components) takes a different approach to the same problem. Components _are_ the data fetching layer, so there's no loader/component type bridge to build — data is fetched inline with `await`, and TypeScript infers the types naturally because the fetch and the render live in one function. This is an architectural trade-off, not a strict win: RSC eliminates the loader abstraction entirely, while the loader pattern keeps a clean separation between data fetching (server-only) and rendering (universal). We'll build our own RSC layer in [Part 21](/21-react-server-components).
 
 </Callout>
 
@@ -352,6 +354,7 @@ Register it the same way as the other framework modules:
     "paths": {
       "eigen/types": ["./packages/eigen/types.ts"],
       "eigen/match-route": ["./packages/eigen/match-route.ts"],
+      "eigen/serialize": ["./packages/eigen/serialize.ts"],
       "eigen/helpers": ["./packages/eigen/helpers.ts"],
       "eigen/run-loader": ["./packages/eigen/run-loader.ts"] // [!code ++]
     }
@@ -364,6 +367,7 @@ resolve: {
   alias: {
     'eigen/types': resolve(__dirname, 'packages/eigen/types.ts'),
     'eigen/match-route': resolve(__dirname, 'packages/eigen/match-route.ts'),
+    'eigen/serialize': resolve(__dirname, 'packages/eigen/serialize.ts'),
     'eigen/helpers': resolve(__dirname, 'packages/eigen/helpers.ts'),
     'eigen/run-loader': resolve(__dirname, 'packages/eigen/run-loader.ts'), // [!code ++]
   },
@@ -432,24 +436,20 @@ function Router() {
   const [loading, setLoading] = useState(false); // [!code ++]
 
   useEffect(() => {
-    const handler = () => {
-      // [!code --]
-      setPathname(window.location.pathname); // [!code --]
-    }; // [!code --]
-    const handler = async () => {
-      // [!code ++]
+    const handler = () => setPathname(window.location.pathname); // [!code --]
+    const handler = async () => { // [!code ++]
       const newPath = window.location.pathname; // [!code ++]
       setPathname(newPath); // [!code ++]
       setLoading(true); // [!code ++]
-      try {
-        // [!code ++]
-        const res = await fetch(
-          // [!code ++]
-          `/_eigen/data?path=${encodeURIComponent(newPath)}`, // [!code ++]
-        ); // [!code ++]
+      try { // [!code ++]
+        const res = await fetch(`/_eigen/data?path=${encodeURIComponent(newPath)}`); // [!code ++]
+        // Not route data (a 404, a 500): let the server answer the URL itself // [!code ++]
+        if (!res.ok) { // [!code ++]
+          window.location.assign(newPath); // [!code ++]
+          return; // [!code ++]
+        } // [!code ++]
         setData(await res.json()); // [!code ++]
-      } finally {
-        // [!code ++]
+      } finally { // [!code ++]
         setLoading(false); // [!code ++]
       } // [!code ++]
     }; // [!code ++]
@@ -463,20 +463,16 @@ function Router() {
 
   return (
     <Suspense fallback={<div>Loading...</div>}>
-      {loading ? ( // [!code ++]
-        <div>Loading...</div> // [!code ++]
-      ) : (
-        // [!code ++]
-        <Component params={match.params} data={data} /> // [!code ++]
-      )}{" "}
-      // [!code ++]
-      <Component params={match.params} data={data} /> // [!code --]
+      <Component params={match.params} data={data} /> {/* [!code --] */}
+      {loading ? <div>Loading...</div> : <Component params={match.params} data={data} />} {/* [!code ++] */}
     </Suspense>
   );
 }
 ```
 
-The `try`/`finally` ensures `loading` always resets, even if the fetch throws — without it, a network error would leave the page stuck on "Loading…". `Link` already dispatches a `popstate` event on click ([Part 4](/04-hydration#the-client-entry-point)), so the same handler covers both back/forward navigation and Link clicks.
+The `try`/`finally` ensures `loading` always resets, even if the fetch throws — without it, a network error would leave the page stuck on "Loading…". The `res.ok` check matters because the endpoint's error responses are plain text: calling `res.json()` on a 500 would throw, leaving the previous page's data on screen. Instead, a failed data request becomes a full page load of the new URL, so the server renders whatever that URL really produces.
+
+One gap is left on purpose: there's no guard against out-of-order responses. Click two links quickly and the slower, older response can land last and overwrite the newer page's data. A request counter or an `AbortController` per navigation fixes it; [Part 22](/22-navigation-api) gets this for free from the Navigation API's abort signal. `Link` already dispatches a `popstate` event on click ([Part 4](/04-hydration#the-client-entry-point)), so the same handler covers both back/forward navigation and Link clicks.
 
 This is the standard framework data flow: the first page load gets data through serialized HTML; subsequent navigations fetch from an endpoint that calls the same loader functions on the server. The loader runs once per request in both cases — the client never executes loader code directly.
 
@@ -498,13 +494,13 @@ This is the standard framework data flow: the first page load gets data through 
 
 The loader type inference story is really a question about where the type information lives and how it flows. At the simplest level, the developer writes the types manually. At the most sophisticated level, the framework's plugin extracts type information from source files and generates declarations that connect everything automatically.
 
-The `satisfies` operator is the key TypeScript feature that makes Level 2 and Level 3 work. Without it, the loader's return type would widen to `unknown` (matching the `LoaderFn` signature), and `ReturnType` would be useless. `satisfies` constrains the shape while preserving the narrow type — exactly what framework type inference needs.
+Two techniques make Levels 2 and 3 work: `satisfies` (constrain without widening) and generic inference in `defineLoader` (`TData` captured from the callback's return type). Both avoid annotating the loader as `LoaderFn`, which would widen its return type to `unknown` and make `ReturnType` useless. Each constrains the shape while preserving the narrow type — exactly what framework type inference needs.
 
 ---
 
 <TestSection title="Testing: runLoader">
 
-`defineLoader` is a no-op at runtime — its safety lives in the type system, which `tsc` already verifies. The interesting runtime addition is `runLoader`: it owns the "match a URL, run the matched route's loader, return the data" pipeline that both the SSR handler and the client-side data endpoint depend on.
+`defineLoader` is a no-op at runtime — its safety lives in the type system, which `tsc` already verifies. The interesting runtime addition is `runLoader`: it owns the "match a URL, run the matched route's loader, return the data" pipeline that the client-side data endpoint depends on. (`render` in `entry-server.tsx` still calls `route.loader` itself, because it needs the `match` for rendering too; the two paths get unified behind one function in [Part 14](/14-framework-middleware#the-middleware-execution-engine).)
 
 ```typescript title="packages/eigen/__tests__/run-loader.test.ts"
 import { describe, expect, it } from "vitest";
@@ -563,8 +559,8 @@ Run with `pnpm vitest run packages/`.
 
 - [TypeScript `satisfies` Operator](https://www.typescriptlang.org/docs/handbook/release-notes/typescript-4-9.html#the-satisfies-operator) — The TypeScript 4.9 feature that enables constrained type inference without widening.
 - [TypeScript Utility Types](https://www.typescriptlang.org/docs/handbook/utility-types.html) — Reference for `ReturnType`, `Awaited`, and other built-in utility types used in loader type inference.
-- [TanStack Router Code Generation](https://tanstack.com/router/latest/docs/framework/react/guide/code-generation) — How TanStack Router generates fully typed route trees, eliminating manual type annotations entirely.
-- [Remix Data Loading](https://remix.run/docs/en/main/guides/data-loading) — Remix v2's approach to typed loaders using `useLoaderData<typeof loader>()`.
+- [TanStack Router File-Based Routing](https://tanstack.com/router/latest/docs/routing/file-based-routing) — How TanStack Router generates fully typed route trees, eliminating manual type annotations entirely.
+- [Remix Data Loading](https://v2.remix.run/docs/guides/data-loading) — Remix v2's approach to typed loaders using `useLoaderData<typeof loader>()`.
 - [Vite Environment API for Frameworks](https://vite.dev/guide/api-environment-frameworks) — `RunnableDevEnvironment`, `isRunnableDevEnvironment`, and `runner.import()`, the module-runner API the data endpoint uses.
 - [Next.js `getServerSideProps`](https://nextjs.org/docs/pages/building-your-application/data-fetching/get-server-side-props) — The Pages Router equivalent of the loader pattern, including the `/_next/data/...` endpoint that inspired our `/_eigen/data` design.
 - [Vite Plugin API: `configureServer`](https://vite.dev/guide/api-plugin#configureserver) — The hook used to register the client-side data fetching endpoint as Connect-style middleware.

@@ -27,7 +27,7 @@ Each remote is built, tested, and deployed independently. The host loads them at
 
 ## Vite and Module Federation
 
-Module Federation originated in webpack 5. The `@module-federation/vite` plugin, maintained by the Module Federation team, brings the same model to Vite — including Vite 8, where it targets Rolldown. A Vite remote publishes an ES module entry, so the host declares each remote as an object with `type: 'module'`. (The webpack-style string shorthand, `'dashboard@https://…/remoteEntry.js'`, still parses, but it means the legacy `var` format and the plugin warns about it.)
+Module Federation originated in webpack 5. The `@module-federation/vite` plugin, maintained by the Module Federation team, brings the same model to Vite — including Vite 8, where it targets Rolldown. A Vite remote publishes an ES module entry, so the host declares each remote as an object with `type: 'module'`. (An object remote that omits `type` defaults to the legacy `var` format, and the plugin warns about it.)
 
 ```typescript title="vite.config.ts"
 import { defineConfig } from "vite";
@@ -181,35 +181,39 @@ federation({
 
 ## Integration with Eigen's route system
 
-Module Federation composes naturally with file-based routing. Remote modules can provide entire route sub-trees:
+Module Federation composes naturally with file-based routing. Remote modules can provide entire route sub-trees.
+
+A federated route is an ordinary page file whose `default` export comes from a remote. The route plugin's discovery accepts `.remote.ts` files next to `.tsx` pages (`index.remote.ts` maps to the directory's path, like `index.tsx`). A remote layout follows Part 13's convention unchanged: a `layout.tsx` in the route's directory that re-exports the remote's layout component.
 
 ```typescript
-// In the host's route plugin — extending Part 2
-// A special convention for federated routes:
-// src/pages/dashboard.remote.ts → loads from the dashboard remote
-
-// src/pages/dashboard.remote.ts
+// src/pages/dashboard/index.remote.ts → /dashboard, served by the dashboard remote
 export { default } from "dashboard/DashboardApp";
-export const layout = () => import("dashboard/DashboardLayout");
 ```
 
-The route plugin's discovery accepts `.remote.ts` files next to `.tsx` pages. Instead of the usual static namespace import, it generates a _lazy_ one, so the remote is fetched only when someone visits the route (a static import would load every remote on startup). The generated code stays plain JavaScript:
+```typescript
+// src/pages/dashboard/layout.tsx → wraps every /dashboard/* route
+export { default } from "dashboard/DashboardLayout";
+```
+
+On the client, Part 13's generator already emits every page and layout as a `React.lazy` import, so a remote is fetched only when someone visits one of its routes. The generated code is the same plain JavaScript as for local pages:
 
 ```typescript
-// Generated virtual module
-import { lazy } from "react";
-import * as RouteMod0 from "/src/pages/index.tsx";
-
-const RouteMod1 = {
-  default: lazy(() => import("/src/pages/dashboard.remote.ts")),
-};
-
+// Generated virtual module (client environment)
+import React from "react";
+const layout0 = { path: "/", component: React.lazy(() => import("/src/pages/layout.tsx")) };
+const layout1 = { path: "/dashboard", component: React.lazy(() => import("/src/pages/dashboard/layout.tsx")) };
 export const routes = [
-  { path: "/", component: RouteMod0.default, loader: RouteMod0.loader },
-  { path: "/dashboard", component: RouteMod1.default },
+  { path: "/", component: React.lazy(() => import("/src/pages/index.tsx")), layouts: [layout0] },
+  {
+    path: "/dashboard",
+    component: React.lazy(() => import("/src/pages/dashboard/index.remote.ts")),
+    layouts: [layout0, layout1],
+  },
   // ... other routes
 ];
 ```
+
+The SSR branch is the one that needs a decision: its static namespace imports would pull `dashboard/DashboardApp` into the server build, and the server can't resolve a remote the way the browser does. The next section covers the options.
 
 The router already renders pages inside `<Suspense>`, which covers the lazy component while the remote loads.
 
@@ -217,7 +221,7 @@ The router already renders pages inside `<Suspense>`, which covers the lazy comp
 
 ## Server-side composition
 
-For SSR, remote modules need to be available on the server. This introduces complexity: the server can't load modules from a CDN URL at runtime the way a browser can.
+For SSR, remote modules need to be available on the server. This introduces complexity: the server can't simply `import()` a CDN URL the way a browser can; it needs the federation runtime's Node loader.
 
 Two approaches:
 
@@ -274,7 +278,7 @@ It's not justified for small teams, monorepos with fast builds, or applications 
 
 3. **Check the Network tab.** React is downloaded once, from the host. The remote's build output still contains a fallback React chunk, but it's never requested — unless you set `import: false`, which removes it.
 
-4. **Break the type contract** — change a remote's prop interface without updating the host's type package. TypeScript catches the mismatch if you're using shared type packages.
+4. **Break the type contract** — change a remote's props. With a shared types package, the host only notices after the package is republished and the host bumps it; until then it compiles against the old types. With `dts: true`, the host's next type check pulls the new declarations and flags the mismatch.
 
 ---
 

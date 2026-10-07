@@ -189,7 +189,11 @@ export function stripServerExports(code: string, id: string): MagicString | null
       const from = stmt.source ? ` from ${code.slice(stmt.source.start, stmt.source.end)}` : "";
       const list = kept.map((sp) => code.slice(sp.start, sp.end)).join(", ");
       s.overwrite(stmt.start, stmt.end, `export { ${list} }${from};`);
-      removed.push([stmt.start, stmt.end]);
+      // Only the dropped specifiers count as removed: the kept ones still
+      // reference their local bindings, so those imports must survive.
+      for (const sp of specs) {
+        if (!kept.includes(sp)) removed.push([sp.start, sp.end]);
+      }
     }
   }
 
@@ -299,7 +303,7 @@ The `db` and `defineLoader` imports are gone, because the only references to the
 
 Three passes do the work:
 
-1. **Remove server exports.** Every form is a different node shape: `export const loader = …` and `export function loader` are an `ExportNamedDeclaration` with a `declaration`. `export { loader }` and `export { load as loader }` are an `ExportNamedDeclaration` with `specifiers`; for those we also remove the local `load` declaration they point at. `export { loader } from "./loaders"` has a `source` and simply disappears. Because these are nodes rather than text, a semicolon inside the loader body, a `satisfies` clause, or a template literal can't confuse anything: `stmt.end` _is_ the end of the statement.
+1. **Remove server exports.** Every form is a different node shape: `export const loader = …` and `export function loader` are an `ExportNamedDeclaration` with a `declaration`. `export { loader }` and `export { load as loader }` are an `ExportNamedDeclaration` with `specifiers`; for those we also remove the local `load` declaration they point at. `export { loader } from "./loaders"` has a `source` and simply disappears. When a list mixes server and client names (`export { helper, load as loader }`), only the server specifiers are dropped and recorded as removed, so `helper` and its import stay. Because these are nodes rather than text, a semicolon inside the loader body, a `satisfies` clause, or a template literal can't confuse anything: `stmt.end` _is_ the end of the statement.
 2. **Count references.** Walk the rest of the file and count each identifier name, once over the original program and once skipping the removed ranges. A name that appeared before and doesn't appear after was only used by the code we removed.
 3. **Prune imports.** Remove those names from their import statements, and drop a statement entirely when nothing is left. Side-effect imports (`import "./post.css"`) have no bindings, so they always stay.
 
@@ -319,7 +323,7 @@ The visitor pattern walks every node in a tree and calls your code on each one. 
 
 ### Why `enforce: 'pre'`
 
-Vite runs plugins in a fixed order: aliases, then user plugins with `enforce: 'pre'`, then Vite's core plugins, then user plugins without `enforce`, then build plugins, then `enforce: 'post'` plugins. One of the core plugins is Vite's built-in Oxc transform, which strips TypeScript and compiles JSX. Without `enforce: 'pre'`, our plugin would receive JavaScript that has already been through it, no matter where we put it in the `plugins` array. That's workable (the AST would just look different), but `pre` gives us two guarantees. First, we see the source the developer wrote, which is what the error messages and tests are written against. Second, anything that runs after us, including the Oxc transform, React Fast Refresh, and Rolldown's tree-shaking, never sees the loader or its imports at all.
+Vite runs plugins in a fixed order: aliases, then user plugins with `enforce: 'pre'`, then Vite's core plugins, then user plugins without `enforce`, then Vite's build plugins, then `enforce: 'post'` plugins, then Vite's post-build plugins (minify, manifest, reporting). One of the core plugins is Vite's built-in Oxc transform, which strips TypeScript and compiles JSX. Without `enforce: 'pre'`, our plugin would receive JavaScript that has already been through it, no matter where we put it in the `plugins` array. That's workable (the AST would just look different), but `pre` gives us two guarantees. First, we see the source the developer wrote, which is what the error messages and tests are written against. Second, anything that runs after us, including the Oxc transform, React Fast Refresh, and Rolldown's tree-shaking, never sees the loader or its imports at all.
 
 <PluginOrderDiagram />
 
@@ -382,7 +386,7 @@ All three approaches use the `transform` hook (or its build-time equivalent) und
 
 <TypeDeepDive title="Concept: Why directives instead of file extensions?">
 
-`"use client"` and `"use server"` look like a regression from `.server.ts` filenames — strings inside files are easier to overlook than file extensions. But directives compose better: a single component file can be sometimes-server, sometimes-client depending on which graph imports it, and the directive moves with the file when refactored. File extensions force you to split a module the moment any of its exports becomes server-only, even when the export is naturally co-located with related code. RSC's authors chose the trade-off explicitly: directives create more linting/tooling work but allow more natural code organization. The compiler enforces what the eye might miss.
+`"use client"` and `"use server"` look like a regression from `.server.ts` filenames — strings inside files are easier to overlook than file extensions. But they mark something different. A `.server.ts` file marks a whole module as server-only. A directive marks an _entry point_ across the boundary: `"use client"` says "the server graph stops here and references this module instead", and `"use server"` says "these functions can be called from the client". Modules without a directive belong to neither side, so a shared component or utility can be pulled into either graph depending on who imports it. And an inline `"use server"` inside a function body lets a single function cross the boundary without moving its file. A file-level `"use server"` has the same cost as a `.server.ts` file (every export becomes a server function), so the gain is in what you _don't_ have to mark. The cost is tooling: a string in a file is easy to miss, so the compiler and lint rules have to enforce what the eye might not.
 
 </TypeDeepDive>
 
@@ -489,6 +493,18 @@ export default function Page() { return null; }
     expect(output).toContain("export const parse");
     expect(output).toContain('import { z } from "zod";');
     expect(output).toContain("export { parse as parseParams };");
+  });
+
+  it("keeps imports that a surviving export specifier re-exports", () => {
+    const input = `import { helper } from "./h";
+import { load } from "./l";
+export { helper, load as loader };
+`;
+    const output = stripLoaderForClient(input);
+
+    expect(output).toContain('import { helper } from "./h";');
+    expect(output).toContain("export { helper };");
+    expect(output).not.toContain("./l");
   });
 
   it("leaves files without server exports untouched", () => {

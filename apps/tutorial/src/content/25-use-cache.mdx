@@ -143,7 +143,7 @@ export default async function PostPage(...__args) { return __cache_run("PostPage
 
 A regex can't do this safely — it has to find the matching closing brace of each function and cope with `export default`, arrow functions and nested functions. Vite 8 exports Rolldown's parser as `parseAst`, which gives us an ESTree AST; `magic-string` makes the edits and produces a sourcemap. The plugin runs after Vite's own Oxc transform, so TypeScript and JSX are already gone by the time it sees the code:
 
-```typescript title="plugins/eigen-cache.ts"
+```typescript title="packages/eigen/plugins/eigen-cache.ts"
 import type { Plugin } from "vite";
 import { parseAst } from "vite";
 import MagicString from "magic-string";
@@ -310,9 +310,13 @@ export interface CacheLife {
   expire: number; // seconds until the entry is unusable (next request waits)
 }
 
+// Next.js's own "never expires" value. Not Infinity: JSON.stringify(Infinity)
+// is null, so a store that serializes entries would read it back as "expired"
+const NEVER = 0xfffffffe;
+
 // Mirrors the revalidate/expire values of Next.js's preset profiles
 export const PROFILES = {
-  default: { revalidate: 900, expire: Infinity },
+  default: { revalidate: 900, expire: NEVER },
   seconds: { revalidate: 1, expire: 60 },
   minutes: { revalidate: 60, expire: 3_600 },
   hours: { revalidate: 3_600, expire: 86_400 },
@@ -323,12 +327,15 @@ export const PROFILES = {
 
 interface CacheScope {
   life: CacheLife;
+  lifeSet: boolean; // true once the function called cacheLife() itself
   tags: Set<string>;
 }
 
+const newScope = (): CacheScope => ({ life: PROFILES.default, lifeSet: false, tags: new Set() });
+
 const cacheScope = new AsyncLocalStorage<CacheScope>();
 const requestMemo = new AsyncLocalStorage<Map<string, Promise<unknown>>>();
-const inFlight = new Map<string, Promise<unknown>>();
+const inFlight = new Map<string, Promise<CacheEntry>>();
 
 function activeScope(fn: string): CacheScope {
   const scope = cacheScope.getStore();
@@ -337,7 +344,9 @@ function activeScope(fn: string): CacheScope {
 }
 
 export function cacheLife(profile: keyof typeof PROFILES | Partial<CacheLife>): void {
-  activeScope("cacheLife").life = typeof profile === "string" ? PROFILES[profile] : { ...PROFILES.default, ...profile };
+  const scope = activeScope("cacheLife");
+  scope.life = typeof profile === "string" ? PROFILES[profile] : { ...PROFILES.default, ...profile };
+  scope.lifeSet = true;
 }
 
 export function cacheTag(...tags: string[]): void {
@@ -345,9 +354,27 @@ export function cacheTag(...tags: string[]): void {
   for (const tag of tags) scope.tags.add(tag);
 }
 
-/** Eigen's request handler wraps each request in this, giving private caches a per-request memo */
+/** Wraps one request's render (see below), giving private caches a per-request memo */
 export function withRequestCache<T>(fn: () => T): T {
   return requestMemo.run(new Map(), fn);
+}
+
+/**
+ * Called in the *caller's* scope after a cached call returns: an outer cached
+ * function depends on whatever its cached callees depend on.
+ */
+function propagate(entry: CacheEntry): void {
+  const parent = cacheScope.getStore();
+  if (!parent) return;
+  // revalidateTag on an inner tag must reach the outer entry too
+  for (const tag of entry.tags) parent.tags.add(tag);
+  // Without its own cacheLife, the outer entry can't outlive the inner one
+  if (!parent.lifeSet) {
+    parent.life = {
+      revalidate: Math.min(parent.life.revalidate, entry.revalidate),
+      expire: Math.min(parent.life.expire, entry.expire),
+    };
+  }
 }
 
 export function __cache_run<T>(
@@ -359,15 +386,11 @@ export function __cache_run<T>(
   const key = deriveCacheKey(fnId, args);
 
   if (variant === "private") {
+    // Always run inside a scope, so cacheLife()/cacheTag() in the body don't throw
+    const run = () => cacheScope.run(newScope(), () => impl(...args));
     const memo = requestMemo.getStore();
-    if (!memo) return impl(...args); // outside a request: nothing to share
-    if (!memo.has(key)) {
-      const scope = { life: PROFILES.default, tags: new Set<string>() };
-      memo.set(
-        key,
-        cacheScope.run(scope, () => impl(...args)),
-      );
-    }
+    if (!memo) return run(); // outside a request: nothing to share
+    if (!memo.has(key)) memo.set(key, run());
     return memo.get(key) as Promise<T>;
   }
 
@@ -383,33 +406,40 @@ async function runShared<T>(
   const entry = await store.get(key);
   const age = entry ? (Date.now() - entry.createdAt) / 1000 : Infinity;
 
-  if (entry && age < entry.revalidate) return entry.value as T; // fresh
+  if (entry && age < entry.revalidate) {
+    propagate(entry); // fresh
+    return entry.value as T;
+  }
 
   if (entry && age < entry.expire) {
     // Stale-while-revalidate: answer now, refresh in the background
     fill(store, key, args, impl).catch((err) => console.error("[eigen] background revalidation failed:", err));
+    propagate(entry);
     return entry.value as T;
   }
 
-  return fill(store, key, args, impl); // miss or expired
+  const filled = await fill(store, key, args, impl); // miss or expired
+  propagate(filled);
+  return filled.value as T;
 }
 
-function fill<T>(store: CacheStore, key: string, args: unknown[], impl: (...args: any[]) => Promise<T>): Promise<T> {
+function fill(
+  store: CacheStore,
+  key: string,
+  args: unknown[],
+  impl: (...args: any[]) => Promise<unknown>,
+): Promise<CacheEntry> {
   // Concurrent misses for the same key share one execution
   const existing = inFlight.get(key);
-  if (existing) return existing as Promise<T>;
+  if (existing) return existing;
 
-  const scope: CacheScope = { life: PROFILES.default, tags: new Set() };
+  const scope = newScope();
   const pending = cacheScope
     .run(scope, () => impl(...args))
     .then(async (value) => {
-      await store.set(key, {
-        value,
-        createdAt: Date.now(),
-        ...scope.life,
-        tags: [...scope.tags],
-      });
-      return value;
+      const entry: CacheEntry = { value, createdAt: Date.now(), ...scope.life, tags: [...scope.tags] };
+      await store.set(key, entry);
+      return entry;
     })
     .finally(() => inFlight.delete(key));
 
@@ -418,7 +448,28 @@ function fill<T>(store: CacheStore, key: string, args: unknown[], impl: (...args
 }
 ```
 
-Nested cached functions get their own scope: when `PostPage` calls a cached `getPost`, the inner `cacheLife` call configures the inner entry only.
+Nested cached functions get their own scope: when `PostPage` calls a cached `getPost`, the inner `cacheLife` call configures the inner entry. But the outer entry contains the inner result, so it can't be fully independent. If it were, `revalidateTag("post-42")` would delete only `getPost`'s entry, and the cached `PostPage` would keep serving the old title until its own lifetime ran out. So whenever a cached call returns (hit or fill), `propagate` copies the entry's tags into the caller's scope, and an outer function that didn't call `cacheLife` itself takes on the shorter of the two lifetimes. That's the direction Next.js propagates in too (an [outer scope without an explicit `cacheLife`](https://nextjs.org/docs/app/api-reference/functions/cacheLife#nested-caching-behavior) inherits a shorter inner one); an explicit outer `cacheLife` wins.
+
+`withRequestCache` has to wrap each request's render, or `requestMemo.getStore()` is `undefined` and every private call runs uncached. The RSC entry from Part 21 is where server components run, so that's where it goes:
+
+```tsx title="src/entry-rsc.tsx"
+import { withRequestCache } from "eigen/runtime/cache"; // [!code ++]
+
+export async function renderRSC(pathname: string): Promise<ReadableStream> {
+  // AsyncLocalStorage follows the render's continuations, so components that // [!code ++]
+  // render after the first chunk has flushed still see the same memo // [!code ++]
+  return withRequestCache(() => { // [!code ++]
+    const match = matchRoute(pathname, routes);
+    if (!match) return renderToReadableStream(<h1>404</h1>);
+
+    const Component = match.route.component;
+    // Server components can be async — they fetch data directly
+    const element = <Component params={match.params} />;
+
+    return renderToReadableStream(element);
+  }); // [!code ++]
+}
+```
 
 ---
 
@@ -516,6 +567,7 @@ export async function revalidateTag(tag: string): Promise<void> {
 import { createServerFn } from "eigen/server";
 import { revalidateTag } from "eigen/cache";
 import { z } from "zod";
+import { db } from "../lib/db";
 
 export const updatePost = createServerFn({ method: "POST" })
   .validator(z.object({ id: z.string(), title: z.string() }))
@@ -533,6 +585,8 @@ Eigen's `revalidateTag` deletes entries outright, so the next request waits for 
 
 This is the mechanism that makes `"use cache"` practical for dynamic content: you cache aggressively (hours, days), and invalidate precisely when the underlying data changes.
 
+<UseCachePlayground />
+
 ---
 
 ## What to observe
@@ -541,7 +595,7 @@ This is the mechanism that makes `"use cache"` practical for dynamic content: yo
 
 2. **Use `cacheLife({ revalidate: 5, expire: 60 })` and wait 10 seconds.** The next request returns instantly with the old value _and_ the log appears — that's the background refresh. The request after that sees the new value.
 
-3. **Call `revalidateTag` and request again.** The function re-executes and the new result is cached.
+3. **Call `revalidateTag` and request again.** The function re-executes and the new result is cached. Try it with a cached `PostPage` that calls a cached `getPost` tagged `post-42`: revalidating `post-42` re-runs both, because `propagate` gave the page's entry the inner tag.
 
 4. **Check the transform output in `vite-plugin-inspect`.** The `"use cache"` directive is gone, the function is still a declaration, and its body is wrapped in a `__cache_run(...)` call.
 
@@ -560,5 +614,3 @@ This is caching without ceremony. The mental model is simple: "this function is 
 ## What's next
 
 In Part 26, we'll implement **Partial Prerendering** — the convergence of SSG and SSR where a single route has a static shell (rendered at build time) and dynamic holes (filled at request time via Suspense). This is the architecture that `"use cache"` enables: cached components become the static shell, uncached components become the dynamic content.
-<UseCachePlayground />
-

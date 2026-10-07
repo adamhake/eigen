@@ -34,7 +34,7 @@ configureServer(server) {
 	return () => {
 		server.middlewares.use((req, res, next) => {
 			// This runs after Vite handles static files and modules,
-			// but before its index.html fallback
+			// but before Vite serves index.html
 		});
 	};
 }
@@ -47,7 +47,7 @@ The execution order is:
 Two details in that picture are easy to get wrong:
 
 - **Post-middlewares run _before_ Vite serves `index.html`.** Vite installs its `index.html` transform and 404 handler _after_ calling the returned function, so a framework's post-middleware can answer page requests with its own HTML. (In `spa`/`mpa` mode, the HTML fallback has already rewritten `req.url` to `/index.html` for navigation requests by then.) In our custom server ([Part 3](/03-server-side-rendering#the-custom-dev-server)) `appType` is `'custom'`, so those last two middlewares aren't installed at all. Anything Vite doesn't handle falls out of `vite.middlewares` and into H3's SSR route.
-- **HMR isn't a middleware.** Vite's HMR WebSocket attaches to the HTTP server's `upgrade` event, at the server's `base` path (plus `server.hmr.path` if you set one), using the `vite-hmr` subprotocol. It never passes through the Connect stack.
+- **HMR isn't a middleware.** With a standalone `vite` dev server, the HMR WebSocket attaches to the HTTP server's `upgrade` event at the server's `base` path (plus `server.hmr.path` if you set one), using the `vite-hmr` subprotocol. In our middleware-mode setup ([Part 3](/03-server-side-rendering#vite-middleware-integration)) Vite has no HTTP server of its own, so it opens a separate WebSocket server on port `24678` unless you pass one in as `server.hmr.server`. Either way, HMR never passes through the Connect stack.
 
 Understanding this stack explains _why_ framework middleware goes in the returned function (post-middleware). You want Vite to handle `.tsx` file requests, static assets, and `/@vite/client` before your SSR/API handler runs. If your SSR handler ran first, it would try to SSR-render a request for `/src/main.tsx` instead of letting Vite serve the transformed module.
 
@@ -214,7 +214,7 @@ Notice that the API middleware uses `server.environments.ssr.runner.import(apiPa
 - The handler file can use TypeScript — Vite transforms it on the fly
 - It can use ESM imports — including importing from `node_modules`
 - It can use the `eigen/*` aliases from `resolve.alias` (tsconfig `paths` alone don't affect Vite's resolution unless you enable `resolve.tsconfigPaths`)
-- It picks up edits without a restart — when you save the handler, Vite invalidates it in the SSR module graph, and the next `runner.import()` re-executes the new code
+- It picks up edits without a restart — when you save the handler, Vite's SSR hot channel tells the module runner to drop its cached copy, so the next `runner.import()` re-executes the new code ([Part 9](/09-hmr))
 
 This is a significant DX advantage over running API routes in a separate process. The entire application — pages, loaders, API routes — runs through a single Vite instance with shared configuration and consistent module resolution.
 
@@ -236,13 +236,11 @@ import type { ApiHandler } from "eigen/api-types"; // [!code ++]
 
 // Bundle every API route into the server build. With `eager: true`, Vite // [!code ++]
 // rewrites this into static imports, so the handlers land in entry-server.js. // [!code ++]
-const apiModules = import.meta.glob<{ default: ApiHandler }>("/src/api/**/*.ts", {
-  // [!code ++]
+const apiModules = import.meta.glob<{ default: ApiHandler }>("/src/api/**/*.ts", { // [!code ++]
   eager: true, // [!code ++]
 }); // [!code ++]
-// [!code ++]
-export function getApiHandler(pathname: string): ApiHandler | undefined {
-  // [!code ++]
+
+export function getApiHandler(pathname: string): ApiHandler | undefined { // [!code ++]
   // /api/hello → /src/api/hello.ts, the same mapping as the dev plugin // [!code ++]
   return apiModules[`/src/api${pathname.replace(/^\/api/, "")}.ts`]?.default; // [!code ++]
 } // [!code ++]
@@ -251,8 +249,11 @@ export function getApiHandler(pathname: string): ApiHandler | undefined {
 Second, the production server needs a route for them. In `server.prod.ts` from [Part 6](/06-production-builds#the-production-server), register it before the SSR fallback:
 
 ```typescript title="server.prod.ts"
-const { render, loadData, getApiHandler } = (await import("./dist/server/entry-server.js")) as { // [!code ++]
-const { render, loadData } = (await import("./dist/server/entry-server.js")) as { // [!code --]
+const {
+	render,
+	loadData,
+	getApiHandler, // [!code ++]
+} = (await import(serverEntry)) as {
 	render: (pathname: string) => Promise<RenderResult>;
 	loadData: (pathname: string) => Promise<unknown>;
 	getApiHandler: (pathname: string) => ApiHandler | undefined; // [!code ++]
@@ -313,7 +314,7 @@ This is a recurring pattern in framework development. The plugin generates type 
 
 2. **Visit a route that doesn't exist**, like `/api/nope`. You get a JSON 404, not a 500. The existence check runs before the module runner ever tries to load `/src/api/nope.ts`.
 
-3. **Edit the API handler** while the server is running. Make a change, save, and hit the endpoint again. The response reflects your changes immediately — Vite invalidated the module, so `runner.import()` re-executes it.
+3. **Edit the API handler** while the server is running. Make a change, save, and hit the endpoint again. The response reflects your changes immediately — the runner dropped its cached module, so `runner.import()` re-executes it.
 
 4. **Add a breakpoint** (or `console.log`) in the handler. It executes in the same Node process as the Vite dev server, so standard debugging tools work. Throw an error from the handler and the logged stack trace points at your `.ts` source lines.
 

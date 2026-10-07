@@ -21,7 +21,23 @@ Throughout this series, we've built separate plugins and a growing pile of manua
 - **`eigenDevOverlay`** ([Part 10](/10-dev-overlay)) — The dev diagnostics panel
 - **Build configuration** ([Part 6](/06-production-builds)) — The manifest, two output directories, and two separate `vite build` invocations
 
-A framework user shouldn't need to know about these internal pieces. They should add one thing to their config. First, move the `plugins/` directory into `packages/eigen/plugins/` so the plugins live with the rest of the framework source. Then:
+A framework user shouldn't need to know about these internal pieces. They should add one thing to their config. First, move the `plugins/` directory into `packages/eigen/plugins/` so the plugins live with the rest of the framework source. Two things point at the old location. In `eigen-routes.ts`, the Part 5 imports become `../run-loader` and `../types` (they were `../packages/eigen/run-loader` and `../packages/eigen/types`). And the tsconfigs have to agree on which zone the plugins belong to:
+
+```json title="tsconfig.node.json"
+{
+  "include": ["vite.config.ts", "plugins/**/*", "server.ts", "server.prod.ts"] // [!code --]
+  "include": ["vite.config.ts", "packages/eigen/plugin.ts", "packages/eigen/plugins/**/*", "server.ts", "server.prod.ts"] // [!code ++]
+}
+```
+
+```json title="tsconfig.json"
+{
+  "include": ["src/**/*", "packages/**/*", "node_modules/.eigen/*.d.ts"],
+  "exclude": ["packages/eigen/plugin.ts", "packages/eigen/plugins"] // [!code ++]
+}
+```
+
+The app config includes `packages/**/*`, so without the `exclude` the plugins would also be checked as app code. Then:
 
 ```typescript title="vite.config.ts"
 import { resolve } from "node:path";
@@ -36,7 +52,8 @@ export default defineConfig({
   plugins: [eigen(), react()],
   resolve: {
     alias: {
-      // ...the eigen/* aliases from earlier parts, plus the router:
+      // ...the eigen/* aliases from earlier parts (still one pair per
+      // module; Part 40 replaces them with a real package), plus the router:
       "eigen/router": resolve(__dirname, "packages/eigen/router.tsx"),
     },
   },
@@ -57,7 +74,7 @@ export interface EigenRoutesOptions { // [!code ++]
 	/** Directory containing page components, relative to the root */ // [!code ++]
 	pagesDir?: string; // [!code ++]
 } // [!code ++]
-// [!code ++]
+
 export default function eigenRoutes(): Plugin { // [!code --]
 export default function eigenRoutes(options: EigenRoutesOptions = {}): Plugin { // [!code ++]
 	// ...
@@ -84,7 +101,7 @@ export interface EigenApiOptions { // [!code ++]
 	/** Directory containing API route modules, relative to the root */ // [!code ++]
 	apiDir?: string; // [!code ++]
 } // [!code ++]
-// [!code ++]
+
 export default function eigenApi(): Plugin { // [!code --]
 export default function eigenApi(options: EigenApiOptions = {}): Plugin { // [!code ++]
 	let viteServer: ViteDevServer;
@@ -92,6 +109,30 @@ export default function eigenApi(options: EigenApiOptions = {}): Plugin { // [!c
 	// ...
 						const apiPath = `/src/api${urlPath.replace("/api", "")}.ts`; // [!code --]
 						const apiPath = `${apiDir}${urlPath.replace("/api", "")}.ts`; // [!code ++]
+```
+
+The strip plugin from [Part 7](/07-transform-hook) needs the pages directory too. Its hook filter hard-codes `/src/pages/`, and a filter that misses a page doesn't fail: the loader and its server-only imports silently ship to the browser again. A hook filter is read from the plugin object rather than computed per call, so build the pattern in the factory:
+
+```typescript title="packages/eigen/plugins/eigen-strip-loaders.ts"
+export interface EigenStripLoadersOptions { // [!code ++]
+	/** Directory containing page components, relative to the root */ // [!code ++]
+	pagesDir?: string; // [!code ++]
+} // [!code ++]
+
+export default function eigenStripLoaders(): Plugin { // [!code --]
+export default function eigenStripLoaders(options: EigenStripLoadersOptions = {}): Plugin { // [!code ++]
+	// "src/pages" → /\/src\/pages\/.+\.tsx$/, matched against absolute module IDs // [!code ++]
+	const dir = (options.pagesDir ?? "src/pages").replace(/^\.?\/+|\/+$/g, ""); // [!code ++]
+	const pageId = new RegExp(`/${dir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/.+\\.tsx$`); // [!code ++]
+
+	return {
+		// ...
+		transform: {
+			filter: {
+				id: /\/src\/pages\/.+\.tsx$/, // [!code --]
+				id: pageId, // [!code ++]
+				code: /\b(?:loader|middleware|generateStaticParams|generateMetadata)\b/,
+			},
 ```
 
 With those in place, the framework plugin composes everything:
@@ -113,7 +154,7 @@ export interface EigenOptions {
 export default function eigen(options: EigenOptions = {}): Plugin[] {
   return [
     eigenRoutes({ pagesDir: options.pagesDir }),
-    eigenStripLoaders(),
+    eigenStripLoaders({ pagesDir: options.pagesDir }),
     eigenApi({ apiDir: options.apiDir }),
     eigenDevOverlay(),
 
@@ -187,7 +228,7 @@ The `build:client` / `build:server` scripts from Part 6 can go too. A single `vi
 
 <TypeDeepDive title="Concept: Deep merge vs. shallow merge">
 
-A shallow merge (`Object.assign` or `{ ...a, ...b }`) only merges top-level properties — if both objects have a `build` key, `b.build` completely replaces `a.build`. A deep merge recurses into nested objects, so `a.build.manifest` and `b.build.outDir` both survive. Vite's [`mergeConfig`](https://vite.dev/guide/api-javascript#mergeconfig) deep-merges plugin configs this way. Two details matter for framework authors. First, when both sides set the same scalar, the later value (the plugin's return value, merged onto the user config) wins — hence the `userConfig` checks above. Second, arrays are **concatenated**, not replaced: if the user sets `optimizeDeps.include: ['a']` and a plugin returns `optimizeDeps.include: ['b']`, the result is `['a', 'b']`. That makes array-valued options safe to extend from a plugin, but impossible to _remove_ entries from by merging — a plugin that needs that must mutate the config in `configResolved` or document the conflict.
+A shallow merge (`Object.assign` or `{ ...a, ...b }`) only merges top-level properties — if both objects have a `build` key, `b.build` completely replaces `a.build`. A deep merge recurses into nested objects, so `a.build.manifest` and `b.build.outDir` both survive. Vite's [`mergeConfig`](https://vite.dev/guide/api-javascript#mergeconfig) deep-merges plugin configs this way. Two details matter for framework authors. First, when both sides set the same scalar, the later value (the plugin's return value, merged onto the user config) wins — hence the `userConfig` checks above. Second, arrays are **concatenated**, not replaced: if the user sets `optimizeDeps.include: ['a']` and a plugin returns `optimizeDeps.include: ['b']`, the result is `['a', 'b']`. That makes array-valued options safe to extend from a plugin, but impossible to _remove_ entries from by merging — a plugin that needs that can mutate the `config` argument directly inside its `config` hook (Vite allows this when merging can't express the change) or document the conflict. `configResolved` is for reading the final config, not changing it: derived values have already been computed from it.
 
 </TypeDeepDive>
 
@@ -339,10 +380,10 @@ This three-layer pattern is universal across typed frameworks. [TanStack Router]
 | Route discovery | Filesystem scan in `configResolved`           | `@tanstack/router-plugin/vite`               | Internal filesystem scanner         |
 | Virtual modules | `eigen/routes`                                | Internal virtual modules                     | Webpack virtual modules             |
 | Type generation | `.d.ts` in `node_modules/.eigen/`             | `routeTree.gen.ts` (committed)               | `.next/types/` (gitignored)         |
-| SSR             | ModuleRunner (`environments.ssr.runner`) + H3 | Nitro server                                 | Built-in Node server                |
+| SSR             | ModuleRunner (`environments.ssr.runner`) + H3 | Vite SSR environment (Nitro optional)        | Built-in Node server                |
 | Build           | `buildApp` hook                               | `buildApp` hook                              | Custom webpack/turbopack pipeline   |
 | Deployment      | Manual prod server                            | Netlify/Vercel/Cloudflare adapters           | Vercel-optimized, self-hostable     |
-| Code stripping  | `transform` hook                              | `.server.ts` convention                      | RSC compiler + separate compilation |
+| Code stripping  | `transform` hook                              | Compiler transforms (`createServerFn` etc.)  | RSC compiler + separate compilation |
 | HMR             | `hotUpdate` + React Fast Refresh              | Same                                         | Turbopack HMR                       |
 
 The architectural patterns are identical. The differences are in scale (Eigen handles 3 routes; Next.js handles thousands), robustness (Eigen's transforms handle a handful of export shapes; Next.js's SWC/Turbopack pipeline handles the whole language), and deployment surface (Eigen has one server file; Next.js supports dozens of platforms).
@@ -353,7 +394,7 @@ The architectural patterns are identical. The differences are in scale (Eigen ha
 
 Since [Part 4](/04-hydration#the-client-entry-point), `Router` and `Link` have lived inline in `src/entry-client.tsx` (with `matchRoute` already in `eigen/match-route`), and [Part 5](/05-typed-loaders#updating-the-client) taught `Router` to fetch fresh data on navigation. Now that Eigen has a proper package structure, it's time to move them into the framework.
 
-One change comes along for the ride. The Part 5 `Router` read `window.location.pathname` and `window.__EIGEN_DATA__` directly, so only the client could render it — the server entry had to hand-write a matching tree (`<nav>`, `<Suspense>`, the page). Two hand-maintained copies of the same tree is how hydration mismatches happen. Instead, `Router` now takes its initial pathname and data as props. The client passes the `window` values; the server passes the request's. Everything else is Part 5's code, unchanged:
+One change comes along for the ride. The Part 5 `Router` read `window.location.pathname` and `window.__EIGEN_DATA__` directly, so only the client could render it — the server entry had to hand-write a matching tree (`<nav>`, `<Suspense>`, the page). Two hand-maintained copies of the same tree is how hydration mismatches happen. Instead, `Router` now takes its initial pathname and data as props. The client passes the `window` values; the server passes the request's. Everything else is Part 5's code, except one cosmetic change in `LinkProps`: static routes now get `params?: never` instead of Part 2's `params?: undefined`. Both reject params on `/about`; `never` states the intent more directly, and later parts keep it:
 
 ```tsx title="packages/eigen/router.tsx"
 import { useState, useEffect, Suspense, type ReactNode } from "react";
@@ -380,6 +421,11 @@ export function Router({ initialPathname, initialData }: RouterProps) {
       setLoading(true);
       try {
         const res = await fetch(`/_eigen/data?path=${encodeURIComponent(newPath)}`);
+        if (!res.ok) {
+          // Let the server render the error or redirect, as in Part 5
+          window.location.assign(newPath);
+          return;
+        }
         setData(await res.json());
       } finally {
         setLoading(false);
@@ -448,14 +494,7 @@ export function App({ pathname, data }: { pathname: string; data: unknown }) {
   return (
     <div>
       <nav>
-        <Link to="/">Home</Link> | <Link to="/about">About</Link> |{" "}
-        <Link to="/posts/:id" params={{ id: "1" }}>
-          Post 1
-        </Link>{" "}
-        |{" "}
-        <Link to="/posts/:id" params={{ id: "2" }}>
-          Post 2
-        </Link>
+        <Link to="/">Home</Link> | <Link to="/about">About</Link> | <Link to="/posts/:id" params={{ id: "1" }}>Post 1</Link> | <Link to="/posts/:id" params={{ id: "2" }}>Post 2</Link>
       </nav>
       <Router initialPathname={pathname} initialData={data} />
     </div>
@@ -480,6 +519,8 @@ And the server entry renders the very same component instead of its hand-written
 import { renderToString } from "react-dom/server";
 import { matchRoute } from "eigen/match-route";
 import { routes } from "eigen/routes";
+import { runLoader } from "eigen/run-loader";
+import type { ApiHandler } from "eigen/api-types";
 import { App } from "./app";
 
 export interface RenderResult {
@@ -500,7 +541,7 @@ export async function render(pathname: string): Promise<RenderResult> {
   return { html, status: match ? 200 : 404, data };
 }
 
-// loadData (Part 6) is unchanged
+// loadData (Part 6) and apiModules/getApiHandler (Part 8) are unchanged
 ```
 
 The entry points do what entry points should do: mount the app, nothing more. The routing logic lives in the framework, and the shell lives in one file.

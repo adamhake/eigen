@@ -8,7 +8,9 @@ concepts:
   - "server-side analytics"
 ---
 
-## _In this installment, we explore how a framework connects to external services — databases, analytics, error tracking, and feature flags — through the plugin infrastructure. Rather than treating each service as an isolated npm import, we show how the framework plugin can generate configuration, inject scripts, instrument server functions, and provide typed helpers that make integration seamless._
+_In this installment, we explore how a framework connects to external services — databases, analytics, error tracking, and feature flags — through the plugin infrastructure. Rather than treating each service as an isolated npm import, we show how the framework plugin can generate configuration, inject scripts, instrument server functions, and provide typed helpers that make integration seamless._
+
+---
 
 ## The integration pattern
 
@@ -18,7 +20,7 @@ External services interact with the framework at multiple layers:
 | --------------------- | ---------------------------------- | -------------------------------------------- |
 | **Build time**        | Validate env vars exist            | `configResolved`                             |
 | **HTML injection**    | PostHog analytics script           | `transformIndexHtml`                         |
-| **Middleware**        | Database connection per request    | Framework middleware (Part 14)               |
+| **Middleware**        | Server-side pageview tracking      | Framework middleware (Part 14)               |
 | **Loaders**           | Query Neon in data loaders         | Direct import in server code                 |
 | **Server functions**  | Track events on mutations          | Instrumentation in `transform` or middleware |
 | **Client components** | PostHog event tracking             | Client-side SDK initialization               |
@@ -55,7 +57,10 @@ Neon is a serverless Postgres provider. In serverless environments (Netlify Func
 The framework integration handles connection management, so developers just write queries:
 
 ```typescript title="packages/eigen/integrations/neon.ts"
+import { mkdirSync, writeFileSync } from "node:fs";
+import path from "node:path";
 import { loadEnv, type Plugin, type ResolvedConfig } from "vite";
+import { DB_DECLARATIONS } from "./neon-types"; // the eigen-db.d.ts text shown below
 
 export function neonIntegration(): Plugin {
   return {
@@ -83,6 +88,11 @@ export function neonIntegration(): Plugin {
       if (dbUrl && !dbUrl.includes("neon.tech") && !dbUrl.includes("localhost")) {
         console.warn("⚠ DATABASE_URL does not appear to be a Neon connection string.");
       }
+
+      // Declarations for eigen/db, next to Part 2's eigen-routes.d.ts
+      const outDir = path.join(config.root, "node_modules/.eigen");
+      mkdirSync(outDir, { recursive: true });
+      writeFileSync(path.join(outDir, "eigen-db.d.ts"), DB_DECLARATIONS);
     },
 
     // Generate a database helper that handles connection lifecycle
@@ -141,23 +151,18 @@ export function neonIntegration(): Plugin {
           neonConfig.webSocketConstructor = ws
         }
 
-        let pool = null
-
-        function getPool() {
-          if (!pool) {
-            pool = new Pool({
-              connectionString: process.env.DATABASE_URL,
-              max: 10,
-            })
-          }
-          return pool
-        }
+        // One pool per server process, shared by every request. Creating it
+        // opens no connections; the first query does.
+        const pool = new Pool({
+          connectionString: process.env.DATABASE_URL,
+          max: 10,
+        })
 
         export async function query(text, params) {
-          return getPool().query(text, params)
+          return pool.query(text, params)
         }
 
-        export const sql = getPool()
+        export const sql = pool
       `;
     },
   };
@@ -178,6 +183,8 @@ declare module "eigen/db" {
   export const sql: unknown;
 }
 ```
+
+`configResolved` writes this file on every start. Part 2's tsconfig already includes `node_modules/.eigen/*.d.ts`, so `import { query } from "eigen/db"` type-checks with no further setup (after the dev server or a build has run once, as with the route declarations).
 
 The declared return type is the subset both drivers share — the Node `Pool` returns a `pg`-style `QueryResult`, and the edge path asks the HTTP driver for `fullResults` — so `result.rows` works identically in either environment.
 
@@ -227,8 +234,16 @@ export interface PostHogOptions {
   apiKey?: string;
   /** PostHog API host (default: https://us.i.posthog.com) */
   apiHost?: string;
-  /** Enable session replay */
+  /**
+   * Session replay is switched on in PostHog's project settings, not here.
+   * Set false to disable recording on this site even when the project has it on.
+   */
   sessionReplay?: boolean;
+  /**
+   * Track $pageview from the server (Eigen middleware) instead of the browser
+   * SDK. Turns the SDK's automatic pageviews off, so nothing is counted twice.
+   */
+  serverPageviews?: boolean;
   /** Enable error tracking */
   errorTracking?: boolean;
 }
@@ -265,7 +280,8 @@ export function posthogIntegration(options: PostHogOptions = {}): Plugin {
           posthog.init(${JSON.stringify(apiKey)}, {
             api_host: ${JSON.stringify(apiHost)},
             person_profiles: 'identified_only',
-            ${options.sessionReplay ? "session_recording: { maskAllInputs: true }," : ""}
+            ${options.sessionReplay === false ? "disable_session_recording: true," : ""}
+            ${options.serverPageviews ? "capture_pageview: false," : ""}
             ${options.errorTracking ? "capture_exceptions: true," : ""}
           })
         </script>
@@ -306,26 +322,31 @@ export function posthogIntegration(options: PostHogOptions = {}): Plugin {
       }
 
       // Server-side (Node and edge): PostHog Node SDK.
-      // Serverless and edge functions can be frozen as soon as the response is
-      // sent, so queued events would be lost. captureImmediate() resolves only
-      // after the event has been delivered; flush() drains anything else queued.
+      // capture() only queues the event; the SDK sends batches in the
+      // background, so tracking never adds a PostHog round trip to a response.
       return `
         import { PostHog } from 'posthog-node'
         import { getCookie } from 'eigen/cookies'
 
         const client = new PostHog(${JSON.stringify(apiKey ?? "")}, {
           host: ${JSON.stringify(apiHost)},
-          flushAt: 1,
-          flushInterval: 0,
         })
 
-        export async function trackEvent(event, properties = {}, distinctId) {
-          await client.captureImmediate({ distinctId, event, properties })
+        export function trackEvent(event, properties = {}, distinctId) {
+          client.capture({ distinctId, event, properties })
         }
 
-        export async function identifyUser(userId, properties = {}) {
+        export function identifyUser(userId, properties = {}) {
           client.identify({ distinctId: userId, properties })
-          await client.flush()
+        }
+
+        /**
+         * Serverless and edge invocations can be frozen as soon as the response
+         * is sent, and the queue with them. Their adapters pass this to the
+         * platform's waitUntil, so delivery finishes after the response.
+         */
+        export function flushAnalytics() {
+          return client.flush()
         }
 
         export async function getFeatureFlag(flag, distinctId) {
@@ -354,19 +375,27 @@ export function posthogIntegration(options: PostHogOptions = {}): Plugin {
 
 ### Usage in middleware and loaders
 
+With `posthogIntegration({ serverPageviews: true })`, a global middleware records page views on the server, where ad blockers can't drop them:
+
 ```typescript title="src/middleware/analytics.ts"
 import { defineMiddleware } from "eigen/middleware";
 import { trackEvent, getDistinctId } from "eigen/analytics";
 
 export const analyticsMiddleware = defineMiddleware(async (ctx) => {
-  // Track page views server-side (not affected by ad blockers).
+  // Global middleware also runs for /_eigen/data and server function calls
+  // (fetch() sends Sec-Fetch-Dest: empty). Only a document load is a page
+  // view, and a speculative prefetch (Part 24) isn't a visit yet.
+  const { headers } = ctx.request;
+  if (headers.get("sec-fetch-dest") !== "document" || headers.has("sec-purpose")) return;
+
   // Use the browser SDK's distinct ID so server and client events belong to
   // the same person. Without one (first visit, no JS yet), skip rather than
   // lumping every anonymous visitor into a single "anonymous" person.
   const distinctId = getDistinctId(ctx.request);
   if (!distinctId) return;
 
-  await trackEvent(
+  // Not awaited: the event is queued, and the page render doesn't wait for PostHog
+  trackEvent(
     "$pageview",
     {
       $current_url: ctx.request.url, // PostHog expects the full URL
@@ -376,6 +405,19 @@ export const analyticsMiddleware = defineMiddleware(async (ctx) => {
   );
 });
 ```
+
+Register it in the global chain from Part 14:
+
+```typescript title="src/middleware.ts"
+import { analyticsMiddleware } from "./middleware/analytics"; // [!code ++]
+
+export default [rateLimitMiddleware, sessionMiddleware]; // [!code --]
+export default [rateLimitMiddleware, sessionMiddleware, analyticsMiddleware]; // [!code ++]
+```
+
+This counts full page loads. Client-side navigations (Part 22) load `/_eigen/data`, which also serves hover preloads (Part 23), so the server can't tell a visit from a preload there. To count them, call `trackEvent("$pageview")` from the router after each navigation, or leave pageviews to the browser SDK and skip this middleware.
+
+On a long-running Node server, the SDK's background batches deliver the queued events. On serverless and edge platforms, the adapter (Part 17) passes `flushAnalytics()` to the platform's `waitUntil` (`context.waitUntil` on Netlify and Vercel, `ctx.waitUntil` on Cloudflare Workers), so the invocation stays alive until the batch is sent, without delaying the response.
 
 ```typescript title="src/pages/posts/new.tsx"
 // In a server function — track mutations
@@ -397,7 +439,7 @@ export const createPost = createServerFn({ method: "POST" })
     ]);
     const post = result.rows[0];
 
-    await trackEvent("post_created", { post_id: post.id, title: data.title }, user.id);
+    trackEvent("post_created", { post_id: post.id, title: data.title }, user.id);
 
     return post;
   });
@@ -436,8 +478,8 @@ Both Neon and PostHog integrations follow the same pattern:
 1. **`configResolved`** — Load `.env` values with `loadEnv` and validate that required variables exist and are well-formed
 2. **`resolveId` / `load`** — Generate virtual modules with environment-appropriate code (client vs. SSR vs. edge)
 3. **`transformIndexHtml`** — Inject client-side scripts (analytics snippets)
-4. **Type declarations** — Generate `.d.ts` files for the virtual modules
-5. **Middleware** — Provide pre-built middleware for common patterns (connection management, event tracking)
+4. **Type declarations** — Write `.d.ts` files for the virtual modules into `node_modules/.eigen/`, where Part 2's tsconfig `include` finds them
+5. **Middleware** — Provide pre-built middleware for request-scoped concerns (event tracking)
 
 This pattern is extensible to any service: Sentry for error tracking, LaunchDarkly for feature flags, Stripe for payments, Resend for email. Each integration is a Vite plugin that wires the service into the framework at the appropriate layers.
 
@@ -447,10 +489,10 @@ This pattern is extensible to any service: Sentry for error tracking, LaunchDark
 
 The most interesting aspect is how the virtual module generates different code per environment:
 
-| Module            | Client                                           | SSR (Node)       | Edge                                  |
-| ----------------- | ------------------------------------------------ | ---------------- | ------------------------------------- |
-| `eigen/db`        | Throws when called (normally stripped by Part 7) | WebSocket pool   | HTTP driver (`sql.query`)             |
-| `eigen/analytics` | `posthog.capture()` (browser SDK)                | PostHog Node SDK | PostHog Node SDK (`captureImmediate`) |
+| Module            | Client                                           | SSR (Node)       | Edge                                      |
+| ----------------- | ------------------------------------------------ | ---------------- | ----------------------------------------- |
+| `eigen/db`        | Throws when called (normally stripped by Part 7) | WebSocket pool   | HTTP driver (`sql.query`)                 |
+| `eigen/analytics` | `posthog.capture()` (browser SDK)                | PostHog Node SDK | PostHog Node SDK, flushed via `waitUntil` |
 
 This is the virtual module pattern from Part 2, applied to infrastructure. The developer writes `import { query } from 'eigen/db'` and the framework provides the right implementation for the target runtime.
 

@@ -92,17 +92,26 @@ export function useDeferred<T>(value: Deferred<T>): T {
 /**
  * Await every top-level promise in loader data, producing plain JSON.
  * Used wherever loader data is serialized instead of rendered.
+ * A promise that rejects, or is still pending when `signal` aborts,
+ * becomes null, so serializing never throws or hangs.
  */
-export async function resolveDeferred(data: unknown): Promise<unknown> {
+export async function resolveDeferred(data: unknown, signal?: AbortSignal): Promise<unknown> {
   if (data === null || typeof data !== "object" || Array.isArray(data)) return data;
+  const aborted = new Promise<null>((resolve) => {
+    if (signal?.aborted) resolve(null);
+    signal?.addEventListener("abort", () => resolve(null), { once: true });
+  });
+  const settle = (p: Promise<unknown>) => Promise.race([p.catch(() => null), aborted]);
   const entries = await Promise.all(
-    Object.entries(data).map(async ([key, value]) => [key, value instanceof Promise ? await value : value] as const),
+    Object.entries(data).map(async ([key, value]) => [key, value instanceof Promise ? await settle(value) : value] as const),
   );
   return Object.fromEntries(entries);
 }
 ```
 
 `use` is the documented way to suspend on data in React 19, and unlike other hooks it may be called conditionally. Before `use`, libraries suspended by throwing a promise out of render — a pattern React never documented and that you shouldn't build new code on.
+
+`resolveDeferred` never rejects and can be told to stop waiting. Both matter once it runs at the end of a streamed response, as we'll see in the server entry below.
 
 Add the `eigen/deferred` alias to `vite.config.ts` and `tsconfig.json` alongside the others.
 
@@ -247,16 +256,17 @@ export async function renderStream(
   const [htmlBefore, htmlAfter] = template.split("<!--ssr-outlet-->");
   const encoder = new TextEncoder();
 
-  // Abort rendering after 10s so a hung query can't hold the response open.
-  // React flushes the fallbacks of unfinished boundaries and lets the client retry them.
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(new Error("SSR timeout")), 10_000);
+  // Abort after 10s so a hung query can't hold the response open. React flushes
+  // the fallbacks of unfinished boundaries and lets the client render them, and
+  // resolveDeferred stops waiting for the same promises.
+  const abortController = new AbortController();
+  const timeout = setTimeout(() => abortController.abort(new Error("SSR timeout")), 10_000);
 
   let didError = false;
   let reactStream: ReactDOMServerReadableStream;
   try {
     reactStream = await renderToReadableStream(<App pathname={pathname} data={data} />, {
-      signal: controller.signal,
+      signal: abortController.signal,
       onError(error) {
         didError = true;
         console.error("Streaming SSR error:", error);
@@ -277,15 +287,17 @@ export async function renderStream(
 
   // Wrap React's stream: template head first, React's HTML in the middle,
   // then — only after React has finished — the data script and the rest
-  // of the template (which holds the client entry <script>).
+  // of the template (which holds the client entry <script> in dev).
   const body = reactStream.pipeThrough(
     new TransformStream<Uint8Array, Uint8Array>({
       start(controller) {
         controller.enqueue(encoder.encode(htmlBefore));
       },
       async flush(controller) {
+        // Still under the 10s budget: a deferred value no component rendered
+        // may be pending even though React is done
+        const resolved = await resolveDeferred(data, abortController.signal);
         clearTimeout(timeout);
-        const resolved = await resolveDeferred(data);
         controller.enqueue(
           encoder.encode(`<script>window.__EIGEN_DATA__ = ${serializeForScript(resolved)}</script>${htmlAfter}`),
         );
@@ -305,7 +317,9 @@ export async function renderStream(
 
 <StreamAssemblyDiagram />
 
-The data script goes in `flush` too, and that's deliberate. By the time React finishes, every deferred promise has resolved, so `resolveDeferred` produces the complete data without waiting. And the client entry is a `<script type="module">`, which the browser only runs after the whole document has been parsed — so `window.__EIGEN_DATA__` is always in place, with the orders already filled in, before `hydrateRoot` runs. `serializeForScript` (from [Part 3](/03-server-side-rendering)) escapes `<`, `>`, `&`, and the U+2028/U+2029 line separators, so a loader string containing `</script>` can't break out of the tag.
+The data script goes in `flush` too, and that's deliberate. In the normal case every deferred promise that a component rendered has already resolved by the time React finishes, so `resolveDeferred` produces the complete data without waiting. When something went wrong, it still finishes: a rejected value is serialized as `null`, and so is anything still pending when the 10-second timer aborts — React has sent that boundary's fallback with an instruction to render it on the client, and the client renders it from the `null`. Only then is the timer cleared, so even a deferred value that no component reads can't hold the response open.
+
+The client entry is a `<script type="module">`, which the browser only runs after the whole document has been parsed — so `window.__EIGEN_DATA__` is always in place, with the orders already filled in, before `hydrateRoot` runs. In dev the entry sits in the template's tail; Vite's production `index.html` moves it into `<head>`, which works the same way because module scripts are deferred. `serializeForScript` (from [Part 3](/03-server-side-rendering)) escapes `<`, `>`, `&`, and the U+2028/U+2029 line separators, so a loader string containing `</script>` can't break out of the tag.
 
 <Callout type="info" title="Streaming display, then hydration">
 With this setup the user *sees* content progressively, but hydration starts after the last chunk arrives. That's the right trade-off for a toy framework. Production frameworks go further: they load the client entry early (e.g. `bootstrapModules` in React's options) and stream each deferred value as its own small `<script>` chunk, so hydration can start — and [selective hydration](https://react.dev/reference/react-dom/client/hydrateRoot) can prioritize — while slow boundaries are still loading.
@@ -382,7 +396,7 @@ The production server from [Part 6](/06-production-builds) changes the same way:
 
 When you view the network response for a streaming SSR page, it looks surprising. The browser receives something like this, in chunks over time:
 
-**Chunk 1 (immediate — the shell):**
+**Chunk 1 (as soon as the awaited stats are in — `htmlBefore` plus the shell):**
 
 ```html
 <!DOCTYPE html>
@@ -394,22 +408,22 @@ When you view the network response for a streaming SSR page, it looks surprising
     <div id="root">
       <div>
         <nav>...</nav>
-        <h1>Dashboard</h1>
         <div>
-          <h2>Stats</h2>
-          <p>Users: 1042</p>
-          <p>Revenue: $54300</p>
+          <h1>Dashboard</h1>
+          <div>
+            <h2>Stats</h2>
+            <p>Users: 1042</p>
+            <p>Revenue: $54300</p>
+          </div>
+          <!--$?--><template id="B:0"></template>
+          <div>Loading orders...</div>
+          <!--/$-->
         </div>
-        <!--$?--><template id="B:0"></template>
-        <div>Loading orders...</div>
-        <!--/$-->
       </div>
-    </div>
-  </body>
-</html>
+      <!-- #root, <body> and <html> are still open: the connection stays open -->
 ```
 
-The `<!--$?-->` and `<template id="B:0">` markers are React's Suspense boundary placeholders. The fallback ("Loading orders...") is visible HTML. The `B:0` template is an empty insertion point.
+The `<!--$?-->` and `<template id="B:0">` markers are React's Suspense boundary placeholders. The fallback ("Loading orders...") is visible HTML. The `B:0` template is an empty insertion point. The chunk ends after `<App>`'s own wrapper `<div>`: the rest of the template, including the `</div>` that closes `#root`, is `htmlAfter`, which only `flush` writes.
 
 **Chunk 2 (800ms later — when the orders query resolves):**
 
@@ -435,13 +449,18 @@ The `<!--$?-->` and `<template id="B:0">` markers are React's Suspense boundary 
 **Chunk 3 (when React's stream closes — our `flush`):**
 
 ```html
-</div><script>window.__EIGEN_DATA__ = {"stats":{...},"recentOrders":[...]}</script>
-  <script type="module" src="/src/entry-client.tsx"></script>
-</body>
+      <script>window.__EIGEN_DATA__ = {"stats":{...},"recentOrders":[...]}</script>
+    </div>
+    <script type="module" src="/src/entry-client.tsx"></script>
+  </body>
 </html>
 ```
 
+The data script comes first, still inside `#root`, because `flush` enqueues it ahead of `htmlAfter`; `htmlAfter` then closes `#root` and carries the client entry and the closing tags.
+
 React sends the resolved content in a hidden `<div>`, then a `<script>` that performs the DOM swap — replacing the fallback with the real content. That swap is plain DOM manipulation; the new nodes become interactive when the client app hydrates. The browser progressively renders the page without a full page reload.
+
+<StreamingWirePlayground />
 
 ---
 
@@ -449,18 +468,16 @@ React sends the resolved content in a hidden `<div>`, then a `<script>` that per
 
 Streaming changes how we use `transformIndexHtml`. With `renderToString`, we had the complete HTML and could do simple string replacement. With streaming, we need to split the template into "before the React root" and "after the React root" and write them at different times.
 
-There's a subtlety here: `transformIndexHtml` adds Vite's HMR client script and the React Refresh preamble into `<head>`. This transformation must happen _before_ we split the template, because the `<head>` content needs to be in the first chunk that the browser receives. If it's deferred to after the stream, the browser won't establish the HMR WebSocket connection until the page has fully streamed.
+There's a subtlety here: `transformIndexHtml` adds Vite's HMR client script and the React Refresh preamble into `<head>`. Transform first, then split: `transformIndexHtml` expects a whole HTML document, and the tags it injects into `<head>` must end up in `htmlBefore`, the first chunk we send. Splitting first would hand it two fragments. (When the HMR client _runs_ doesn't change either way: it's a module script, so like the client entry it waits until the document has finished parsing.)
 
 ```typescript
 // The order matters:
 let template = readFileSync("index.html", "utf-8");
-template = await vite.transformIndexHtml(url, template); // ← FIRST: inject HMR client
+template = await vite.transformIndexHtml(url, template); // ← FIRST: transform the whole document
 const [before, after] = template.split("<!--ssr-outlet-->"); // ← THEN: split (inside renderStream)
 ```
 
 For production, `transformIndexHtml` isn't called (there's no dev server). The built `dist/client/index.html` already has the hashed asset URLs. But the split pattern is the same.
-
-<StreamingWirePlayground />
 
 ---
 
@@ -503,6 +520,10 @@ import { resolveDeferred } from "eigen/deferred";
 
 function renderToNode(res: ServerResponse, app: ReactNode, htmlBefore: string, data: unknown, htmlAfter: string) {
   let didError = false;
+  // Same 10s budget as the Web version, for React and for resolveDeferred
+  const abortController = new AbortController();
+  const timeout = setTimeout(() => abortController.abort(), 10_000);
+
   const { pipe, abort } = renderToPipeableStream(app, {
     onShellReady() {
       res.statusCode = didError ? 500 : 200;
@@ -515,7 +536,8 @@ function renderToNode(res: ServerResponse, app: ReactNode, htmlBefore: string, d
         },
         flush(callback) {
           // Runs after React ends the Transform — the last chance to write
-          resolveDeferred(data).then((resolved) => {
+          resolveDeferred(data, abortController.signal).then((resolved) => {
+            clearTimeout(timeout);
             this.push(`<script>window.__EIGEN_DATA__ = ${serializeForScript(resolved)}</script>${htmlAfter}`);
             callback();
           }, callback);
@@ -525,6 +547,8 @@ function renderToNode(res: ServerResponse, app: ReactNode, htmlBefore: string, d
       pipe(tail);
     },
     onShellError(error) {
+      clearTimeout(timeout);
+      console.error("Shell render failed:", error);
       res.statusCode = 500;
       res.setHeader("Content-Type", "text/html; charset=utf-8");
       res.end("<h1>Server Error</h1>");
@@ -534,7 +558,7 @@ function renderToNode(res: ServerResponse, app: ReactNode, htmlBefore: string, d
       console.error("Streaming SSR error:", error);
     },
   });
-  setTimeout(() => abort(), 10_000);
+  abortController.signal.addEventListener("abort", () => abort());
 }
 ```
 
@@ -552,7 +576,7 @@ For bots, do the same work in `onAllReady` instead of `onShellReady`. The type d
 
 4. **Test bot mode.** Change the user-agent to `Googlebot` and observe that the response waits for `allReady` — the full HTML arrives in one chunk, ensuring crawlers see complete content.
 
-5. **Error during streaming.** Remove the `.catch` from `fetchRecentOrders()` and make it reject after a delay. The shell renders successfully and the fallback appears; the error is logged by `onError`, and React tells the client to retry that boundary itself. The response stream doesn't crash.
+5. **Error during streaming.** Remove the `.catch` from `fetchRecentOrders()` and make it reject after a delay. The shell renders successfully and the fallback appears; the error is logged by `onError`, and React tells the client to render that boundary itself. The response still ends normally: `resolveDeferred` serializes the rejected value as `null`, so the data script and the client entry arrive, and after hydration the boundary shows "Couldn't load recent orders." Make the promise never settle instead, and the same thing happens after the 10-second abort.
 
 6. **Navigate to the dashboard client-side.** The `/_eigen/data` request takes the full 800ms, because `resolveDeferred` waits for the orders before responding. Only the initial, server-rendered load streams.
 

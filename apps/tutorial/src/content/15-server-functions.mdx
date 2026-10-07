@@ -97,7 +97,7 @@ This is the architecture behind TanStack Start's `createServerFn`, React's `"use
 The builder collects three things — the function's own middleware, an input validator, and the handler — and returns a callable. Every step returns a builder with a more specific type, so the handler sees exactly what the earlier steps produced.
 
 ```typescript title="packages/eigen/server.ts"
-import { executeMiddleware, type MiddlewareFn } from "./middleware";
+import { executeMiddleware, type Added, type MiddlewareFn } from "./middleware";
 import type { EigenContext } from "./types";
 
 /** Types that survive JSON serialization (see "Serialization boundaries") */
@@ -116,7 +116,7 @@ export interface ServerFn<TInput, TResult> {
 export interface ServerFnBuilder<TContext extends EigenContext, TInput> {
   middleware<TNew extends Record<string, unknown> = {}>(
     mws: MiddlewareFn<TContext, TNew>[],
-  ): ServerFnBuilder<TContext & TNew, TInput>;
+  ): ServerFnBuilder<TContext & Added<TNew>, TInput>;
 
   validator<T>(validator: Validator<T>): ServerFnBuilder<TContext, T>;
 
@@ -183,7 +183,7 @@ Two decisions are worth calling out:
 
 <TypeDeepDive title="TypeScript: The builder pattern for type accumulation">
 
-`createServerFn()` returns `ServerFnBuilder<EigenContext, void>`. `.middleware([requireAuth])` returns `ServerFnBuilder<EigenContext & TNew, void>`, where `TNew` is inferred from what the middleware returns. `.validator(v)` replaces `TInput` with the validator's output type `T` — inferred from either `parse()`'s return type or the function's return type. `.handler(fn)` receives `{ data: TInput; context: TContext }` with everything accumulated so far, and produces `ServerFn<TInput, TResult>`. A `TInput` of `void` means the function takes no argument: TypeScript lets you omit trailing `void` parameters, so `getStats()` type-checks without a validator. Each method returns the _same_ builder object at runtime; only the static type gets more specific. This is how TanStack Start, TanStack Router, and tRPC achieve end-to-end type safety.
+`createServerFn()` returns `ServerFnBuilder<EigenContext, void>`. `.middleware([requireAuth])` returns `ServerFnBuilder<EigenContext & Added<TNew>, void>`, where `TNew` is inferred from what the middleware returns. `requireAuth` returns nothing, so `TNew` is the `Record<string, unknown>` constraint and [Part 14](/14-framework-middleware#typed-context-accumulation)'s `Added<>` turns it into `{}`: the context stays `EigenContext`, and a typo like `context.usr` is still an error. `.validator(v)` replaces `TInput` with the validator's output type `T` — inferred from either `parse()`'s return type or the function's return type. `.handler(fn)` receives `{ data: TInput; context: TContext }` with everything accumulated so far, and produces `ServerFn<TInput, TResult>`. A `TInput` of `void` means the function takes no argument: TypeScript lets you omit trailing `void` parameters, so `getStats()` type-checks without a validator. Each method returns the _same_ builder object at runtime; only the static type gets more specific. This is how TanStack Start, TanStack Router, and tRPC achieve end-to-end type safety.
 
 </TypeDeepDive>
 
@@ -208,14 +208,14 @@ This is the most complex transform we've built. The plugin needs to:
 
 Matching a builder chain with a regex means finding the closing parenthesis of `.handler(...)` — which depends on how the code is formatted, and a lazy `[\s\S]*?\n\}\)` happily swallows unrelated code when the formatting differs. So we parse. Vite 8 re-exports Rolldown's Oxc-based `parseAst`, which returns an ESTree AST with `start`/`end` offsets, and `magic-string` edits the source by offset while producing a sourcemap — the same toolkit as [Part 7](/07-transform-hook).
 
-```typescript title="plugins/eigen-server-fns.ts"
+```typescript title="packages/eigen/plugins/eigen-server-fns.ts"
 import type { Plugin } from "vite";
 import { isRunnableDevEnvironment, normalizePath, parseAst } from "vite";
 import MagicString from "magic-string";
 import { createHash } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { relative, resolve } from "node:path";
-import { sendWebResponse, toWebRequest } from "../packages/eigen/node-http";
+import { sendWebResponse, toWebRequest } from "../node-http";
 
 const VIRTUAL_ID = "eigen/server-fns";
 const RESOLVED_ID = "\0eigen/server-fns";
@@ -256,25 +256,49 @@ export function findServerFns(code: string, file: string) {
   return { ast, found };
 }
 
+/** Depth-first walk over every AST node; return false from `enter` to skip a subtree */
+function walk(node: any, enter: (node: any) => boolean | void): void {
+  if (!node || typeof node.type !== "string" || enter(node) === false) return;
+  for (const key in node) {
+    const value = node[key];
+    if (Array.isArray(value)) for (const child of value) walk(child, enter);
+    else if (value && typeof value === "object") walk(value, enter);
+  }
+}
+
 /** Every identifier outside imports and outside the replaced ranges */
 function collectIdentifiers(ast: unknown, skip: Array<readonly [number, number]>): Set<string> {
   const names = new Set<string>();
-  const visit = (node: any): void => {
-    if (!node || typeof node.type !== "string" || node.type === "ImportDeclaration") return;
-    if (skip.some(([start, end]) => node.start >= start && node.end <= end)) return;
+  walk(ast, (node) => {
+    if (node.type === "ImportDeclaration") return false;
+    if (skip.some(([start, end]) => node.start >= start && node.end <= end)) return false;
     if (node.type === "Identifier" || node.type === "JSXIdentifier") names.add(node.name);
-    for (const key in node) {
-      const value = node[key];
-      if (Array.isArray(value)) value.forEach(visit);
-      else if (value && typeof value === "object") visit(value);
-    }
-  };
-  visit(ast);
+  });
   return names;
+}
+
+/** createServerFn() calls that aren't part of a chain findServerFns found */
+function hasStrayServerFn(ast: unknown, found: Array<{ start: number; end: number }>): boolean {
+  let stray = false;
+  walk(ast, (node) => {
+    if (
+      node.type === "CallExpression" &&
+      node.callee.type === "Identifier" &&
+      node.callee.name === "createServerFn" &&
+      !found.some((fn) => node.start >= fn.start && node.end <= fn.end)
+    ) {
+      stray = true;
+    }
+  });
+  return stray;
 }
 
 export function transformForClient(code: string, file: string, root: string) {
   const { ast, found } = findServerFns(code, file);
+  // Any other form would reach the browser untouched, handler and imports included
+  if (hasStrayServerFn(ast, found)) {
+    throw new Error(`${file}: createServerFn() must initialize an exported const (export const name = createServerFn()...)`);
+  }
   if (found.length === 0) return null;
 
   const s = new MagicString(code);
@@ -405,12 +429,13 @@ export default function eigenServerFns(): Plugin {
 }
 ```
 
-Add `eigenServerFns()` to the plugin array returned by `eigen()` ([Part 11](/11-framework-plugin)), register `eigen/server`, `eigen/server-fn-client`, and `eigen/server-fn-endpoint` in `resolve.alias` and tsconfig `paths` like the other framework modules (`eigen/server-fns` is virtual — the plugin resolves it), and install `magic-string` if [Part 7](/07-transform-hook) hasn't already.
+Add `eigenServerFns()` to the plugin array returned by `eigen()` in `packages/eigen/plugin.ts` ([Part 11](/11-framework-plugin#the-unified-plugin)), importing it with `import eigenServerFns from "./plugins/eigen-server-fns"`. Register `eigen/server`, `eigen/server-fn-client`, and `eigen/server-fn-endpoint` in `resolve.alias` and tsconfig `paths` like the other framework modules (`eigen/server-fns` is virtual — the plugin resolves it), and install `magic-string` if [Part 7](/07-transform-hook) hasn't already.
 
 Some details worth noting:
 
 - **`enforce: 'pre'`** — the plugin sees the TypeScript source, so `parseAst` is told to parse `tsx`/`ts`. Running after the TS transform would work too, but then sourcemaps would have to chain through the reprinted output.
 - **Hook filters** — `filter: { id, code }` lets Rolldown skip the JavaScript hook entirely for files that don't contain `createServerFn`. The definition file `packages/eigen/server.ts` matches the filter but has no `export const X = createServerFn(...)`, so it passes through unchanged.
+- **Only `export const NAME = createServerFn()...` is rewritten, so every other form is a build error.** A module-private `const getUsers = createServerFn()...`, one exported later with `export { getUsers }`, or a chain inside a component would pass through the client transform untouched: the handler, its `db` import, and `eigen/server` would all ship to the browser, and the function would never be registered. `transformForClient` throws when it finds a `createServerFn()` call outside the chains it rewrites, and Vite reports that as an error for the file. (The server side doesn't check: a stray chain there only fails to register.)
 - **IDs use root-relative paths**, so the client build, the server build, and every developer's machine compute the same ID.
 - **Import pruning is conservative.** An import is removed only when _none_ of its bindings are referenced outside the replaced chains. `import { db, formatDate } from '../lib/database'` stays whole if `formatDate` is used by the component — keep server-only modules in their own import statements.
 
@@ -418,7 +443,7 @@ Some details worth noting:
 
 ## What the transform actually produces
 
-Given the `Dashboard.tsx` from the design goal:
+Given the `users.tsx` from the design goal:
 
 **Server bundle (ssr environment):**
 
@@ -435,7 +460,7 @@ export const getUsers = createServerFn()
   });
 getUsers.url = "/_eigen/fn/a3f2c891";
 
-export default function Dashboard() {
+export default function UsersPage() {
   // ... uses getUsers()
 }
 ```
@@ -448,7 +473,7 @@ import { useEffect, useState } from "react";
 
 export const getUsers = createServerFnStub("a3f2c891");
 
-export default function Dashboard() {
+export default function UsersPage() {
   // ... uses getUsers() — same call, but it goes over the network
 }
 ```
@@ -486,6 +511,8 @@ export function createServerFnStub(id: string) {
 
 The client bundle has zero server code. The `db` import is gone, and so is `eigen/server` — the builder, the validator, and the handler body never ship. On the server, `getUsers.url` is set too, so a server-rendered `<form action={getUsers.url}>` ([Part 38](/38-forms-mutations)) points at the same endpoint the stub calls.
 
+A middleware `Response` that isn't a redirect, such as the rate limiter's `429`, takes the `!res.ok` path. Its body is plain text, so there's no JSON `error` to read, and the caller gets a generic `Server function failed (429)`. That's enough for a toy; a real framework would throw a typed error that carries the status.
+
 ---
 
 ## The RPC endpoint
@@ -502,7 +529,7 @@ export type ServerFnImpl = (input: unknown, baseContext: EigenContext) => Promis
 
 /** One entry of the generated eigen/server-fns registry */
 export interface ServerFnRegistration {
-  /** Root-relative source file, e.g. 'src/pages/Dashboard.tsx' (for logs and tracing) */
+  /** Root-relative source file, e.g. 'src/pages/users.tsx' (for logs and tracing) */
   file: string;
   /** The export name, e.g. 'getUsers' */
   exportName: string;
@@ -597,7 +624,9 @@ declare module "eigen/server-fns" {
 In dev, the plugin's `configureServer` middleware above forwards `/_eigen/fn/*` to `callServerFn` through the SSR module runner. In production, the H3 server from [Part 6](/06-production-builds#the-production-server) mounts it in one line:
 
 ```typescript title="server.prod.ts"
-app.post("/_eigen/fn/**", (event) => callServerFn(event.req));
+// all(), not post(): a GET must reach the endpoint's 405, as in dev,
+// instead of falling through to the SSR route
+app.all("/_eigen/fn/**", (event) => callServerFn(event.req));
 ```
 
 Because `eigen/server-fns` statically imports every server function, the production server bundle contains them all, and an ID resolves to a function with a single object lookup. No manifest of source paths is needed — source files don't exist in production anyway.
@@ -633,8 +662,10 @@ This is a profound insight about Vite's architecture: **TypeScript checks source
 That's why `handler` constrains its result with `TResult extends JsonValue | void`:
 
 ```typescript
-createServerFn().handler(async () => new Date());
-// TS Error: Type 'Date' does not satisfy the constraint 'JsonValue | void'
+export const now = createServerFn().handler(async () => new Date());
+// TS error: Type 'Promise<Date>' is not assignable to type 'void | Promise<void | JsonValue> | JsonValue'.
+//   ...
+//   Type 'Date' is not assignable to type 'void | JsonValue'.
 ```
 
 `Date` is an interface with methods, so it isn't assignable to `{ [key: string]: JsonValue }`. The constraint is deliberately restrictive. One sharp edge: _interfaces_ never get implicit index signatures, so returning a value typed with `interface User { ... }` fails too, while the equivalent `type User = { ... }` passes. Developers sometimes need to map rich types to plain objects before returning them.
@@ -750,12 +781,12 @@ This separation of concerns — types from source, implementation from transform
 
 Server functions have two testable surfaces: the transforms that generate stubs, and the endpoint that executes functions. Both are exported as plain functions, so the tests exercise the real code rather than a copy of its regexes.
 
-```typescript title="plugins/__tests__/eigen-server-fns.test.ts"
+```typescript title="packages/eigen/plugins/__tests__/eigen-server-fns.test.ts"
 import { describe, it, expect } from "vitest";
 import { generateFnId, transformForClient, transformForServer } from "../eigen-server-fns";
 
 const root = "/project";
-const file = "/project/src/pages/Dashboard.tsx";
+const file = "/project/src/pages/users.tsx";
 
 const input = `import { createServerFn } from 'eigen/server'
 import { db } from '../lib/database'
@@ -771,20 +802,20 @@ export const getUsers = createServerFn()
 
 export const ping = createServerFn().handler(async () => 'pong')
 
-export default function Dashboard() {
-  return <div>{formatName('Dashboard')}</div>
+export default function UsersPage() {
+  return <div>{formatName('Users')}</div>
 }`;
 
 describe("generateFnId", () => {
   it("produces stable IDs for the same input", () => {
-    expect(generateFnId("src/pages/Dashboard.tsx", "getUsers")).toBe(
-      generateFnId("src/pages/Dashboard.tsx", "getUsers"),
+    expect(generateFnId("src/pages/users.tsx", "getUsers")).toBe(
+      generateFnId("src/pages/users.tsx", "getUsers"),
     );
   });
 
   it("produces different IDs for different functions and files", () => {
-    const id = generateFnId("src/pages/Dashboard.tsx", "getData");
-    expect(generateFnId("src/pages/Dashboard.tsx", "other")).not.toBe(id);
+    const id = generateFnId("src/pages/users.tsx", "getData");
+    expect(generateFnId("src/pages/users.tsx", "other")).not.toBe(id);
     expect(generateFnId("src/pages/Settings.tsx", "getData")).not.toBe(id);
   });
 });
@@ -793,7 +824,7 @@ describe("transformForClient", () => {
   const output = transformForClient(input, file, root)!.code;
 
   it("replaces every builder chain with a stub, regardless of formatting", () => {
-    const id = generateFnId("src/pages/Dashboard.tsx", "getUsers");
+    const id = generateFnId("src/pages/users.tsx", "getUsers");
     expect(output).toContain(`export const getUsers = createServerFnStub("${id}")`);
     expect(output).toContain("export const ping = createServerFnStub(");
   });
@@ -806,18 +837,25 @@ describe("transformForClient", () => {
 
   it("keeps imports the component still uses", () => {
     expect(output).toContain("from '../lib/format'");
-    expect(output).toContain("export default function Dashboard");
+    expect(output).toContain("export default function UsersPage");
   });
 
   it("ignores files without server functions", () => {
     expect(transformForClient("export const x = 1", file, root)).toBeNull();
+  });
+
+  it("rejects chains it can't rewrite instead of shipping them", () => {
+    const local = `import { createServerFn } from 'eigen/server'
+const ping = createServerFn().handler(async () => 'pong')
+export { ping }`;
+    expect(() => transformForClient(local, file, root)).toThrow("exported const");
   });
 });
 
 describe("transformForServer", () => {
   it("keeps the implementation and attaches the endpoint URL", () => {
     const output = transformForServer(input, file, root)!.code;
-    const id = generateFnId("src/pages/Dashboard.tsx", "getUsers");
+    const id = generateFnId("src/pages/users.tsx", "getUsers");
     expect(output).toContain("db.query");
     expect(output).toContain(`getUsers.url = "/_eigen/fn/${id}";`);
   });

@@ -265,23 +265,63 @@ import { sessionMiddleware } from "./middleware/session";
 export default [rateLimitMiddleware, sessionMiddleware];
 ```
 
-The route plugin from [Part 2](/02-route-discovery-plugin) picks this file up in its SSR branch and exposes it from `eigen/routes`, alongside each page's `middleware` export:
+The route plugin picks this file up and exposes it from `eigen/routes`, alongside each page's `middleware` export. Both are server-only, so they go in the SSR branch of [Part 13](/13-nested-layouts#generating-the-nested-virtual-module)'s `generateRouteCode`:
 
-```typescript title="plugins/eigen-routes.ts"
-// In the load() hook, SSR branch. `root` is config.root from configResolved.
-const hasGlobalMiddleware = existsSync(resolve(root, "src/middleware.ts"));
+```typescript title="packages/eigen/plugins/route-tree.ts"
+export function generateRouteCode(tree: RouteNode, isSSR: boolean): string { // [!code --]
+export function generateRouteCode( // [!code ++]
+  tree: RouteNode, // [!code ++]
+  isSSR: boolean, // [!code ++]
+  /** Import URL of src/middleware.ts, or null if the app has none */ // [!code ++]
+  globalMiddlewareUrl: string | null, // [!code ++]
+): string { // [!code ++]
+  // ...declarations, routes, and the walk() over layouts as before, except the SSR page entry:
+      if (isSSR) {
+        const mod = `RouteMod${n++}`;
+        declarations.push(`import * as ${mod} from '${page.url}'`);
+        routes.push(
+          `  { path: '${page.path}', component: ${mod}.default, loader: ${mod}.loader, layouts: ${layouts} }`, // [!code --]
+          `  { path: '${page.path}', component: ${mod}.default, loader: ${mod}.loader, ` + // [!code ++]
+            `middleware: ${mod}.middleware, layouts: ${layouts} }`, // [!code ++]
+        );
+      }
+  // ...
 
-return [
-  hasGlobalMiddleware ? `import globalMiddlewareList from '/src/middleware.ts'` : `const globalMiddlewareList = []`,
-  ...routes.map((r, i) => `import * as RouteMod${i} from '${r.componentPath}'`),
-  `export const globalMiddleware = globalMiddlewareList`,
-  `export const routes = [`,
-  ...routes.map(
-    (r, i) =>
-      `  { path: '${r.path}', component: RouteMod${i}.default, loader: RouteMod${i}.loader, middleware: RouteMod${i}.middleware },`,
-  ),
-  `]`,
-].join("\n");
+  // Server only: src/middleware.ts's ordered list, or an empty one // [!code ++]
+  let globalExport = ""; // [!code ++]
+  if (isSSR) { // [!code ++]
+    globalExport = globalMiddlewareUrl // [!code ++]
+      ? `export { default as globalMiddleware } from '${globalMiddlewareUrl}'` // [!code ++]
+      : `export const globalMiddleware = []`; // [!code ++]
+  } // [!code ++]
+
+  return [
+    isSSR ? "" : `import React from 'react'`,
+    ...declarations,
+    `export const routes = [\n${routes.join(",\n")}\n]`,
+    globalExport, // [!code ++]
+  ].join("\n");
+}
+```
+
+The `load` hook checks for the file and passes its URL in. `root` is the `config.root` that `configResolved` already stores ([Part 11](/11-framework-plugin#the-unified-plugin)); import `existsSync` from `node:fs`:
+
+```typescript title="packages/eigen/plugins/eigen-routes.ts"
+		load(id: string) {
+			if (id === resolvedVirtualModuleId) {
+				const tree = buildRouteTree(pagesDir, pagesUrl);
+				const hasGlobalMiddleware = existsSync(resolve(root, "src/middleware.ts")); // [!code ++]
+				return {
+					code: generateRouteCode(tree, this.environment.name === "ssr"), // [!code --]
+					code: generateRouteCode( // [!code ++]
+						tree, // [!code ++]
+						this.environment.name === "ssr", // [!code ++]
+						hasGlobalMiddleware ? "/src/middleware.ts" : null, // [!code ++]
+					), // [!code ++]
+					moduleType: "js",
+				};
+			}
+		},
 ```
 
 Add `export const globalMiddleware: MiddlewareFn<any, any>[]` to the `eigen/routes` declaration. Creating `src/middleware.ts` while the dev server is running requires a restart (or a watcher that invalidates `eigen/routes`, as in [Part 9](/09-hmr)).
@@ -308,6 +348,8 @@ export const loader = defineLoader("/dashboard", async ({ ctx }) => {
 ```
 
 `redirect()` returns `never`, so `ctx.user ?? redirect('/login')` has type `User`. Loaders can throw `redirect()` too — the pipeline below catches it the same way.
+
+Per-route middleware is per _page_. `generateRouteCode` only reads `middleware` from page modules, so this export guards `/dashboard` alone: `/dashboard/settings` and `/dashboard/analytics` (and the dashboard layout's loader when they render) need their own `export const middleware = [requireAuth]`. To protect a whole subtree from one place, extend `generateRouteCode` to prepend each layout module's `middleware` export to its pages' lists.
 
 ---
 
@@ -401,24 +443,30 @@ export async function loadRouteData( // [!code ++]
 `eigen/routes` is a virtual module, so `run-route.ts` only works inside a Vite-processed module graph — the SSR environment in dev, the server bundle in production. That's exactly where it runs. The server entry uses it for both the streaming page render from [Part 12](/12-streaming-ssr) and the data endpoint. `renderStream` now takes the whole `Request` instead of a pathname, because middleware needs headers and cookies:
 
 ```tsx title="src/entry-server.tsx"
-import { renderToString } from "react-dom/server";
+import { renderToReadableStream, type ReactDOMServerReadableStream } from "react-dom/server"; // [!code --]
+import { renderToReadableStream, renderToString, type ReactDOMServerReadableStream } from "react-dom/server"; // [!code ++]
 import { matchRoute } from "eigen/match-route";
 import { routes } from "eigen/routes";
-import { asClientRedirect } from "eigen/middleware";
-import { resolveRouteData, type RouteData } from "eigen/route-data";
-import { runRoute } from "eigen/run-route";
+import { serializeForScript } from "eigen/serialize";
+import { asClientRedirect } from "eigen/middleware"; // [!code ++]
+import { loadRouteData, resolveRouteData } from "eigen/route-data"; // [!code --]
+import { resolveRouteData, type RouteData } from "eigen/route-data"; // [!code ++]
+import { runRoute } from "eigen/run-route"; // [!code ++]
+import { App } from "./app";
 
-export async function renderStream( // [!code ++]
+// StreamOptions is unchanged from Part 12
+
+export async function renderStream(
+  pathname: string, // [!code --]
   request: Request, // [!code ++]
-  { template, waitForAll = false }: StreamOptions, // [!code ++]
+  { template, waitForAll = false }: StreamOptions,
 ): Promise<Response> {
-  // [!code ++]
   const pathname = new URL(request.url).pathname; // [!code ++]
   const match = matchRoute(pathname, routes);
+  const data = match ? await loadRouteData(match) : null; // [!code --]
 
   let data: RouteData | null = null; // [!code ++]
-  if (match) {
-    // [!code ++]
+  if (match) { // [!code ++]
     const result = await runRoute(match, request); // [!code ++]
     // Middleware returned a Response (redirect, 429, ...) — send it as-is // [!code ++]
     if ("response" in result) return result.response; // [!code ++]
@@ -428,6 +476,8 @@ export async function renderStream( // [!code ++]
   // ...unchanged from Parts 12 and 13: render <App pathname={pathname} data={data} />
   // to a stream, and resolve deferred values with resolveRouteData() in flush()
 }
+
+// render() and loadData() replace their earlier versions entirely
 
 export type RenderResult = { response: Response } | { html: string; status: number; data: RouteData | null };
 
@@ -537,9 +587,9 @@ export async function sendWebResponse(res: ServerResponse, response: Response): 
 }
 ```
 
-```typescript title="plugins/eigen-routes.ts"
+```typescript title="packages/eigen/plugins/eigen-routes.ts"
 import { isRunnableDevEnvironment } from "vite";
-import { sendWebResponse, toWebRequest } from "../packages/eigen/node-http";
+import { sendWebResponse, toWebRequest } from "../node-http";
 
 // inside configureServer
 server.middlewares.use(async (req, res, next) => {
@@ -565,17 +615,26 @@ app.get("/_eigen/data", (event) => loadData(event.req));
 app.all("/**", (event) => renderStream(event.req, { template, waitForAll: isBot(event.req) }));
 ```
 
-The client router follows redirects that come back from the data endpoint. `fetch()` would otherwise follow a 302 to `/login` silently and try to parse the login page's HTML as JSON:
+The client router follows redirects that come back from the data endpoint. `fetch()` would otherwise follow a 302 to `/login` silently and try to parse the login page's HTML as JSON. Any other middleware `Response` (the rate limiter's `429`, say) reaches the router unchanged, because `asClientRedirect` only rewrites 3xx; it isn't route data either, so the router hands that navigation to the server as a full page load. In the `popstate` handler of [Part 13](/13-nested-layouts#rendering-the-stack-and-why-layouts-persist)'s `Router`:
 
-```tsx title="src/entry-client.tsx"
-const res = await fetch(`/_eigen/data?path=${encodeURIComponent(newPath)}`);
-const redirectTo = res.headers.get("X-Eigen-Redirect"); // [!code ++]
-if (redirectTo) {
-  // [!code ++]
-  window.location.assign(redirectTo); // [!code ++]
-  return; // [!code ++]
-} // [!code ++]
-setData(await res.json());
+```tsx title="packages/eigen/router.tsx"
+      try {
+        const res = await fetch(`/_eigen/data?path=${encodeURIComponent(newPath)}`);
+        const redirectTo = res.headers.get("X-Eigen-Redirect"); // [!code ++]
+        if (redirectTo) { // [!code ++]
+          window.location.assign(redirectTo); // [!code ++]
+          return; // [!code ++]
+        } // [!code ++]
+        // Not route data (a 429, a 404, a 500): let the server answer the URL itself // [!code ++]
+        if (!res.ok) { // [!code ++]
+          window.location.assign(newPath); // [!code ++]
+          return; // [!code ++]
+        } // [!code ++]
+        const data = (await res.json()) as RouteData | null;
+        startTransition(() => setState({ pathname: newPath, data }));
+      } finally {
+        setLoading(false);
+      }
 ```
 
 ---
@@ -585,10 +644,17 @@ setData(await res.json());
 `EigenContext` describes what every loader can rely on. Inside the chain itself, we can do better: TypeScript can track the exact context shape at each step.
 
 ```typescript title="packages/eigen/middleware.ts"
+/**
+ * What a middleware adds to the context. One that only returns a Response or
+ * nothing infers TOut as the Record<string, unknown> constraint, which would
+ * let any property name through; it adds nothing, so map it to {}.
+ */
+export type Added<T> = string extends keyof T ? {} : T;
+
 export type ChainedMiddleware<TContext extends BaseContext> = {
   use<TOutput extends Record<string, unknown> = {}>(
     mw: MiddlewareFn<TContext, TOutput>,
-  ): ChainedMiddleware<TContext & TOutput>;
+  ): ChainedMiddleware<TContext & Added<TOutput>>;
   build(): MiddlewareFn<any, any>[];
 };
 
@@ -694,9 +760,11 @@ export default chain.build();
 
 Each `.use()` call returns a chain type that includes the properties returned by the previous middleware. This is the same idea as TanStack Start's `createMiddleware().server(...)` and `createServerFn().middleware([...])` builders, and tRPC's `.use()`.
 
+<MiddlewareOnionPlayground />
+
 <TypeDeepDive title="TypeScript: Intersection types and type accumulation">
 
-The `ChainedMiddleware<TContext & TOutput>` return type uses an intersection (`&`) to merge the existing context with the new properties. After `sessionMiddleware`, the context is `BaseContext & { user: User | null }`. The third `.use()` callback's `ctx` parameter is contextually typed from `MiddlewareFn<TContext, TOutput>`, so it gets every accumulated property without an annotation. A middleware that returns nothing has no inference candidate for `TOutput`, so it falls back to the `= {}` default and the context type is unchanged. `ContextOf` uses `infer` to pull the final `TContext` back out, and `AssertAssignable<T extends U, U>` turns "is this assignable?" into a compile error when it isn't — there's no runtime cost to any of it.
+The `ChainedMiddleware<TContext & Added<TOutput>>` return type uses an intersection (`&`) to merge the existing context with the new properties. After `sessionMiddleware`, the context is `BaseContext & { user: User | null }`. The third `.use()` callback's `ctx` parameter is contextually typed from `MiddlewareFn<TContext, TOutput>`, so it gets every accumulated property without an annotation. A middleware that returns nothing (or only a `Response`) gives TypeScript no object type to infer `TOutput` from, so it doesn't land on the `= {}` default: inference falls back to the constraint, `Record<string, unknown>`. That's what `defineMiddleware` gives `rateLimitMiddleware` and `requireAuth`. Intersected into the context as-is, its index signature would make `ctx.usr` a silent `unknown` instead of an error. `Added<T>` checks for exactly that case (`string extends keyof T` only holds for an index signature) and maps it to `{}`, so the context type is unchanged. `ContextOf` uses `infer` to pull the final `TContext` back out, and `AssertAssignable<T extends U, U>` turns "is this assignable?" into a compile error when it isn't — there's no runtime cost to any of it.
 
 </TypeDeepDive>
 
@@ -746,7 +814,6 @@ The type accumulation pattern (each middleware extends the context type for down
 `executeMiddleware` and `getCookie` are pure functions over web-standard objects, with no HTTP server or Vite dependency — test them directly:
 
 ```typescript title="packages/eigen/__tests__/middleware.test.ts"
-  //    ^?
 import { describe, it, expect, vi } from "vitest";
 import { executeMiddleware, redirect, type MiddlewareFn } from "eigen/middleware";
 import { getCookie } from "eigen/cookies";
@@ -817,8 +884,6 @@ describe("executeMiddleware", () => {
     };
     const mw2: MiddlewareFn = () => {
       order.push("second");
-<MiddlewareOnionPlayground />
-
     };
 
     await executeMiddleware([mw1, mw2], makeCtx());

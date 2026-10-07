@@ -76,7 +76,7 @@ export interface AdapterContext {
   prerendered: string[];
 }
 
-/** An adapter is a Vite plugin factory */
+/** An adapter is a Vite plugin factory; each adapter below is typed with it */
 export type Adapter<TOptions = void> = (options?: TOptions) => Plugin;
 
 export function defineAdapter(options: {
@@ -145,10 +145,9 @@ Every adapter routes requests the same way — static files first, then `/_eigen
 The simplest adapter generates a self-contained H3 server — the same server as [Part 16](/16-static-site-generation#hybrid-ssrssg-serving)'s `server.prod.ts`, with paths resolved relative to the generated file:
 
 ```typescript title="packages/eigen/adapters/node.ts"
-import type { Plugin } from "vite";
 import { writeFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { defineAdapter, importPath, type AdapterConfig } from "../adapter";
+import { defineAdapter, importPath, type Adapter, type AdapterConfig } from "../adapter";
 
 export interface NodeAdapterOptions {
   port?: number;
@@ -164,7 +163,7 @@ export const NODE_CONFIG: AdapterConfig = {
   nodeApis: "full",
 };
 
-export function nodeAdapter(options: NodeAdapterOptions = {}): Plugin {
+export const nodeAdapter: Adapter<NodeAdapterOptions> = (options = {}) => {
   return defineAdapter({
     name: "node",
     config: NODE_CONFIG,
@@ -234,7 +233,7 @@ serve(app, { port: Number(process.env.PORT ?? ${port}), hostname: ${JSON.stringi
       console.log(`    Run: cd ${outDir} && npm install && npm start\n`);
     },
   });
-}
+};
 ```
 
 Values from the build (paths, port, host) are injected with `JSON.stringify`, which produces valid, correctly escaped JavaScript literals — safer than splicing raw strings into generated code.
@@ -247,10 +246,9 @@ Values from the build (paths, port, host) are injected with `JSON.stringify`, wh
 Netlify's [Frameworks API](https://docs.netlify.com/build/frameworks/frameworks-api/) is designed for exactly this job: during the build, a framework writes functions and configuration into `.netlify/v1/`, and Netlify picks them up when the build finishes. Functions use the modern signature — a default export taking a web `Request` and returning a `Response` — and declare their own routes with an exported `config`, so no `_redirects` rewrite rules are needed.
 
 ```typescript title="packages/eigen/adapters/netlify.ts"
-import type { Plugin } from "vite";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { defineAdapter, importPath, type AdapterConfig } from "../adapter";
+import { defineAdapter, importPath, type Adapter, type AdapterConfig } from "../adapter";
 
 export interface NetlifyAdapterOptions {
   /** Render on Netlify Edge Functions (Deno) instead of Netlify Functions (Node) */
@@ -272,7 +270,7 @@ export const NETLIFY_EDGE_CONFIG: AdapterConfig = {
   nodeApis: "partial", // Deno with Node compatibility; CPU time is limited per request
 };
 
-export function netlifyAdapter(options: NetlifyAdapterOptions = {}): Plugin {
+export const netlifyAdapter: Adapter<NetlifyAdapterOptions> = (options = {}) => {
   return defineAdapter({
     name: "netlify",
     config: options.edge ? NETLIFY_EDGE_CONFIG : NETLIFY_CONFIG,
@@ -327,7 +325,7 @@ export const config = ${JSON.stringify(routeConfig, null, 2)}
       console.log(`\n  ✓ Netlify adapter: ${fnDir}/eigen-ssr.mjs`);
     },
   });
-}
+};
 ```
 
 The template is inlined as a string literal because a function's deployment bundle contains its traced imports, not arbitrary files — a `readFileSync('../../dist/server/template.html')` at runtime would fail with `ENOENT`. Imports _are_ traced, so the relative import of `entry-server.js` is bundled along with the function.
@@ -350,10 +348,9 @@ The edge variant runs in Deno. Our SSR bundle was built for Node, and runs there
 Cloudflare Workers can serve a static assets directory alongside the Worker. A request that matches a file in that directory is served _without invoking the Worker_ — so pre-rendered pages and `/assets/*` come straight from Cloudflare's edge, and the Worker only sees dynamic requests:
 
 ```typescript title="packages/eigen/adapters/cloudflare.ts"
-import type { Plugin } from "vite";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { defineAdapter, importPath, type AdapterConfig } from "../adapter";
+import { defineAdapter, importPath, type Adapter, type AdapterConfig } from "../adapter";
 
 export interface CloudflareAdapterOptions {
   /** Worker name. Default: 'eigen-app' */
@@ -371,7 +368,7 @@ export const CLOUDFLARE_CONFIG: AdapterConfig = {
   // limited instead (30s by default on paid plans, configurable)
 };
 
-export function cloudflareAdapter(options: CloudflareAdapterOptions = {}): Plugin {
+export const cloudflareAdapter: Adapter<CloudflareAdapterOptions> = (options = {}) => {
   return defineAdapter({
     name: "cloudflare",
     config: CLOUDFLARE_CONFIG,
@@ -400,6 +397,8 @@ export default {
       const wranglerConfig = {
         name: options.name ?? "eigen-app",
         main: "worker.js",
+        // Use today's date or earlier: Wrangler rejects dates newer than
+        // the Workers runtime it ships with
         compatibility_date: options.compatibilityDate ?? "2026-10-01",
         // react-dom/server's Node build uses node:stream and friends
         compatibility_flags: ["nodejs_compat"],
@@ -418,7 +417,7 @@ export default {
       console.log(`    Deploy: npx wrangler deploy --config dist/cloudflare/wrangler.json\n`);
     },
   });
-}
+};
 ```
 
 `wrangler deploy` bundles `worker.js` (following its import of `entry-server.js`) and uploads the assets directory. Because SSG removed the raw template from `dist/client/index.html` ([Part 16](/16-static-site-generation#the-ssg-build-plugin)), `/` is only served as a static file when the home page was actually pre-rendered.
@@ -437,8 +436,11 @@ The adapter slots into the framework's plugin array. The user picks their deploy
 ```typescript title="vite.config.ts"
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
-import eigen from "./packages/eigen/plugin"; // a package import from Part 40 on
-import { netlifyAdapter } from "eigen/adapters/netlify";
+// File paths, like the plugin itself (Part 11): resolve.alias doesn't
+// apply to vite.config.ts. From Part 40 on these become "eigen/plugin"
+// and "eigen/adapters/netlify".
+import eigen from "./packages/eigen/plugin";
+import { netlifyAdapter } from "./packages/eigen/adapters/netlify";
 
 export default defineConfig({
   plugins: [
@@ -545,7 +547,7 @@ Adapters are the bridge between "framework build output" and "production deploym
 
 From a Vite perspective, adapters are post-build `buildApp` hooks. They run after every environment is built and after SSG, read the output artifacts, and write platform-specific files. They don't participate in the transform pipeline or module resolution — apart from asking the server build to bundle its dependencies, they're purely post-processing. This is a clean separation of concerns: the framework handles code transformation and build orchestration, the adapter handles deployment packaging.
 
-The adapter pattern also creates a natural extension point for the community. Supporting a new hosting platform doesn't require changes to Eigen's core — it just requires a new `defineAdapter()` call that conforms to the `Adapter` type.
+The adapter pattern also creates a natural extension point for the community. Supporting a new hosting platform doesn't require changes to Eigen's core — it just requires a new factory, typed as `Adapter<Options>`, that returns a `defineAdapter({...})` plugin.
 
 ---
 

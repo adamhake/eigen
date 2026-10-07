@@ -35,7 +35,10 @@ That's it — `npm create <name>` is shorthand for `npx create-<name>`.
 import { parseArgs } from "node:util";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { cp, readFile, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { cp, readdir, readFile, rename, writeFile } from "node:fs/promises";
+import { loadFile, writeFile as writeModule } from "magicast";
+import { addVitePlugin } from "magicast/helpers";
 import prompts from "prompts";
 import { mergePackageJson } from "./merge.js";
 
@@ -45,11 +48,9 @@ const OVERLAYS = fileURLToPath(new URL("../overlays/", import.meta.url));
 
 const { values, positionals } = parseArgs({
   allowPositionals: true,
-  allowNegative: true, // --no-typescript, --no-tailwind
+  allowNegative: true, // --no-tailwind
   options: {
-    typescript: { type: "boolean", default: true },
     tailwind: { type: "boolean" },
-    template: { type: "string", default: "default" },
   },
 });
 
@@ -92,23 +93,28 @@ async function main() {
 
   const config = {
     projectName,
-    typescript: values.typescript ?? true,
     tailwind: values.tailwind ?? options.tailwind ?? true,
     deploy: options.deploy ?? "node",
   };
 
-  // Copy the base template (fails if the directory already exists)
+  // Refuse to scaffold into a non-empty directory. (fs.cp would merge into
+  // it silently: errorOnExist only fires when an individual file collides.)
   const targetDir = resolve(process.cwd(), projectName);
+  if (existsSync(targetDir) && (await readdir(targetDir)).length > 0) {
+    throw new Error(`${targetDir} already exists and is not empty`);
+  }
+
+  // Copy the base template
   const base = config.deploy === "none" ? "node" : config.deploy;
-  await cp(resolve(TEMPLATES, base), targetDir, {
-    recursive: true,
-    errorOnExist: true,
-    force: false,
-  });
+  await cp(resolve(TEMPLATES, base), targetDir, { recursive: true });
+
+  // npm never publishes a file named .gitignore, so templates ship it as _gitignore
+  await rename(resolve(targetDir, "_gitignore"), resolve(targetDir, ".gitignore"));
 
   // Apply variant overlays
   if (config.tailwind) {
     await applyOverlay(targetDir, "tailwind");
+    await addTailwindPlugin(targetDir);
   }
 
   // Post-setup
@@ -137,7 +143,19 @@ async function applyOverlay(targetDir: string, overlay: string) {
   await writeFile(pkgPath, JSON.stringify(mergePackageJson(basePkg, overlayPkg), null, 2) + "\n");
 }
 
-main().catch(console.error);
+// vite.config.ts belongs to the base template (Netlify and Cloudflare put their
+// adapter plugins there), so the overlay patches it instead of replacing it
+async function addTailwindPlugin(targetDir: string) {
+  const configPath = resolve(targetDir, "vite.config.ts");
+  const mod = await loadFile(configPath);
+  addVitePlugin(mod, { from: "@tailwindcss/vite", constructor: "tailwindcss", index: 0 });
+  await writeModule(mod, configPath);
+}
+
+main().catch((error) => {
+  console.error(error instanceof Error ? error.message : error);
+  process.exit(1);
+});
 ```
 
 ### The `package.json` for `create-eigen`
@@ -152,6 +170,7 @@ main().catch(console.error);
   },
   "files": ["dist", "templates", "overlays"],
   "dependencies": {
+    "magicast": "^0.5.5",
     "prompts": "^2.4.2"
   }
 }
@@ -188,9 +207,11 @@ packages/create-eigen/
           Layout.tsx
         app.css
       index.html
+      server.ts                # dev server (Part 3); the adapter builds the production one
       vite.config.ts
       package.json
       tsconfig.json
+      _gitignore               # renamed to .gitignore on copy
     netlify/                 # Netlify deployment target
       ...same structure...
       netlify.toml
@@ -201,8 +222,7 @@ packages/create-eigen/
     tailwind/                # Adds Tailwind to any template
       src/
         app.css              # Replaces base app.css with Tailwind imports
-      vite.config.ts         # Adds tailwindcss plugin
-      package.json           # Adds tailwindcss dependency (merged)
+      package.json           # Adds tailwindcss + @tailwindcss/vite (merged)
 ```
 
 ### Variant composition
@@ -215,7 +235,7 @@ base template (node/netlify/cloudflare)
   = final project
 ```
 
-Overlays add or replace files. The `package.json` is special — it's **merged** rather than replaced, so overlay dependencies are combined with base dependencies:
+Overlays add or replace files, so an overlay must never ship a file that varies between base templates. `vite.config.ts` is one: the Netlify and Cloudflare templates register their adapter plugins in it ([Part 17](/17-deployment-adapters)), and a replaced config would silently drop them. That's why the Tailwind overlay has no `vite.config.ts`. `addTailwindPlugin` patches the base template's config with `magicast` (introduced under [Codegen commands](#editing-an-existing-file-ast-based-with-magicast) below), which adds the import and the plugin call and leaves the rest of the file as it was. The `package.json` is special too — it's **merged** rather than replaced, so overlay dependencies are combined with base dependencies:
 
 ```typescript title="packages/create-eigen/src/merge.ts"
 export function mergePackageJson(
@@ -264,13 +284,17 @@ A brand-new file has nothing to preserve, so a template string is the simplest c
 
 ```typescript title="packages/eigen/cli/generate.ts"
 import { writeFile, mkdir } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { dirname, relative, resolve } from "node:path";
 import { existsSync } from "node:fs";
+import { fileToRoute } from "../plugins/eigen-routes";
 
 export async function generateRoute(routePath: string) {
-  // Parse routePath: "dashboard/settings" → file + component name
-  const segments = routePath.split("/");
-  const componentName = segments.map((s) => s[0].toUpperCase() + s.slice(1)).join("") + "Page";
+  // "posts/[id]" → '/posts/:id', "blog/index" → '/blog', "About" → '/about':
+  // the same rule the route plugin applies, so the path matches RouteParamsMap
+  const { path } = fileToRoute(`${routePath}.tsx`);
+  // "user-settings/[id]" → UserSettingsIdPage: a valid identifier
+  const words = routePath.split(/[^A-Za-z0-9]+/).filter(Boolean);
+  const componentName = words.map((w) => w[0].toUpperCase() + w.slice(1)).join("") + "Page";
   const filePath = `src/pages/${routePath}.tsx`;
   const fullPath = resolve(process.cwd(), filePath);
   if (existsSync(fullPath)) throw new Error(`${filePath} already exists`);
@@ -278,16 +302,16 @@ export async function generateRoute(routePath: string) {
   const code = `import { defineLoader } from 'eigen/helpers'
 import type { PageProps } from 'eigen/types'
 
-export const loader = defineLoader('/${routePath}', async ({ params }) => {
+export const loader = defineLoader('${path}', async ({ params }) => {
   return {}
 })
 
 type LoaderData = Awaited<ReturnType<typeof loader>>
 
-export default function ${componentName}({ data }: PageProps<'/${routePath}', LoaderData>) {
+export default function ${componentName}({ data }: PageProps<'${path}', LoaderData>) {
   return (
     <div>
-      <h1>${segments[segments.length - 1]}</h1>
+      <h1>${componentName}</h1>
     </div>
   )
 }
@@ -299,14 +323,15 @@ export default function ${componentName}({ data }: PageProps<'/${routePath}', Lo
 }
 ```
 
+The new path type-checks once the running dev server's watcher regenerates `eigen-routes.d.ts` for the new file ([Part 9](/09-hmr)); until then, `defineLoader` reports it as an unknown route.
+
 ### Editing an existing file: AST-based with `magicast`
 
 `eigen generate loader src/pages/dashboard.tsx` adds a loader to a page the developer has already written. String concatenation would have to guess where imports end and exports begin; [`magicast`](https://github.com/unjs/magicast) parses the file, lets you edit it through a proxy, and prints it back with the original formatting preserved everywhere you didn't touch:
 
 ```typescript title="packages/eigen/cli/generate.ts (continued)"
 import { builders, loadFile, writeFile as writeModule } from "magicast";
-import { relative, resolve } from "node:path";
-import { fileToRoute } from "../plugins/eigen-routes";
+// relative, resolve, and fileToRoute are already imported at the top of the file
 
 export async function generateLoader(file: string) {
   const mod = await loadFile(file);
@@ -371,53 +396,50 @@ For `npx eigen generate ...` to find this file, the `eigen` package needs a `"bi
 
 ## Custom ESLint rules
 
-Framework-specific linting catches mistakes that generic ESLint rules can't detect — like a synchronous loader, or a server function the compiler won't recognize.
+Framework-specific linting catches mistakes that generic ESLint rules and the type checker can't — like a loader that's never exported, or a server function the compiler won't recognize.
 
 ### `eslint-plugin-eigen`
 
-```typescript title="packages/eslint-plugin-eigen/src/rules/no-sync-loader.ts"
+A page's loader only runs if it's exported: the route generator ([Part 2](/02-route-discovery-plugin)) reads `mod.loader`, and Part 7's transform only strips exported loaders. Drop the `export` and everything still type-checks and renders, but the loader never runs and `data` is `undefined`. That's a bug no type can express, which makes it a good lint rule:
+
+```typescript title="packages/eslint-plugin-eigen/src/rules/no-unexported-loader.ts"
 import type { Rule } from "eslint";
 
 /**
- * Disallows synchronous loader exports.
- * Loaders must be async to support data fetching.
+ * Reports a top-level `loader` that isn't exported.
+ * Eigen only reads exported loaders, so this one would silently never run.
  */
-export const noSyncLoader: Rule.RuleModule = {
+export const noUnexportedLoader: Rule.RuleModule = {
   meta: {
     type: "problem",
     docs: {
-      description: "Loaders must be async functions",
+      description: "Require page loaders to be exported",
     },
     messages: {
-      syncLoader: "Loader must be an async function. Add `async` keyword.",
+      unexported: "`loader` is declared but not exported, so Eigen never runs it. Add `export`.",
     },
   },
 
   create(context) {
-    return {
-      ExportNamedDeclaration(node) {
-        // Check: export const loader = (non-async function)
-        if (
-          node.declaration?.type === "VariableDeclaration" &&
-          node.declaration.declarations[0]?.id.type === "Identifier" &&
-          node.declaration.declarations[0].id.name === "loader"
-        ) {
-          const init = node.declaration.declarations[0].init;
-          if (init?.type === "ArrowFunctionExpression" && !init.async) {
-            context.report({ node: init, messageId: "syncLoader" });
-          }
-        }
+    let declaration: Rule.Node | null = null;
+    let exported = false;
 
-        // Check: export function loader() (non-async)
-        if (
-          node.declaration?.type === "FunctionDeclaration" &&
-          node.declaration.id?.name === "loader" &&
-          !node.declaration.async
-        ) {
-          context.report({
-            node: node.declaration,
-            messageId: "syncLoader",
-          });
+    return {
+      // `const loader = ...` / `function loader() {}` directly in the module body.
+      // Exported declarations sit under an ExportNamedDeclaration instead, so they don't match.
+      "Program > VariableDeclaration > VariableDeclarator[id.name='loader']"(node: Rule.Node) {
+        declaration = node;
+      },
+      "Program > FunctionDeclaration[id.name='loader']"(node: Rule.Node) {
+        declaration = node;
+      },
+      // ...unless an `export { loader }` further down exports it after all
+      "ExportNamedDeclaration > ExportSpecifier[local.name='loader'][exported.name='loader']"() {
+        exported = true;
+      },
+      "Program:exit"() {
+        if (declaration && !exported) {
+          context.report({ node: declaration, messageId: "unexported" });
         }
       },
     };
@@ -425,75 +447,79 @@ export const noSyncLoader: Rule.RuleModule = {
 };
 ```
 
+The keys are [ESLint selectors](https://eslint.org/docs/latest/extend/selectors), CSS-like patterns over the AST: `>` means "direct child", and `[id.name='loader']` matches on a property. The rule is meant for page files; scope it to `src/pages/**` in the config (below) so an unrelated module-level `loader` elsewhere isn't flagged.
+
 ### Server-only boundary detection
 
-A second rule (`server-fn-boundary`) protects the server/client split from [Part 15](/15-server-functions). That transform only rewrites `createServerFn(...)` chains that initialize an **exported** `const`; a chain anywhere else — a non-exported `const`, inline in a component, inside a function — would be left as-is, shipping the handler (and its `db` import) to the browser. The rule visits every `CallExpression` whose callee is `createServerFn`, walks up through the builder's member calls to the outermost chain, and reports unless that chain's parent is a `VariableDeclarator` inside an `ExportNamedDeclaration`. Same shape as `no-sync-loader`: a visitor, a structural check, a `context.report`.
+A second rule (`server-fn-boundary`) protects the server/client split from [Part 15](/15-server-functions). That transform only rewrites `createServerFn(...)` chains that initialize an **exported** `const`; a chain anywhere else — a non-exported `const`, inline in a component, inside a function — makes Part 15's client transform fail the build, because left as-is it would ship the handler (and its `db` import) to the browser. The lint rule reports the same mistake in the editor, before a build. The rule visits every `CallExpression` whose callee is `createServerFn`, walks up through the builder's member calls to the outermost chain, and reports unless that chain's parent is a `VariableDeclarator` inside an `ExportNamedDeclaration`. Same shape as `no-unexported-loader`: visitors, a structural check, a `context.report`.
 
 ### Plugin entry point
 
 ```typescript title="packages/eslint-plugin-eigen/src/index.ts"
 import type { ESLint, Linter } from "eslint";
-import { noSyncLoader } from "./rules/no-sync-loader";
+import { noUnexportedLoader } from "./rules/no-unexported-loader";
 import { serverFnBoundary } from "./rules/server-fn-boundary";
 
 const plugin = {
   meta: { name: "eslint-plugin-eigen", version: "0.1.0" },
   rules: {
-    "no-sync-loader": noSyncLoader,
+    "no-unexported-loader": noUnexportedLoader,
     "server-fn-boundary": serverFnBoundary,
   },
-  configs: {} as Record<string, Linter.Config>,
+  configs: {} as Record<string, Linter.Config[]>,
 } satisfies ESLint.Plugin;
 
 // Flat config: `plugins` is an object mapping a namespace to the plugin
 // itself (not an array of names, as in the legacy .eslintrc format)
-plugin.configs.recommended = {
-  name: "eigen/recommended",
-  plugins: { eigen: plugin },
-  rules: {
-    "eigen/no-sync-loader": "error",
-    "eigen/server-fn-boundary": "error",
+plugin.configs.recommended = [
+  {
+    name: "eigen/recommended",
+    plugins: { eigen: plugin },
+    rules: { "eigen/server-fn-boundary": "error" },
   },
-};
+  {
+    name: "eigen/recommended/pages",
+    files: ["src/pages/**/*.{ts,tsx}"],
+    rules: { "eigen/no-unexported-loader": "error" },
+  },
+];
 
 export default plugin;
 ```
 
-The plugin is the module's **default** export, and its recommended config references the plugin object directly — that's the flat-config shape ESLint 9 and 10 expect. Users enable it with a single line in their ESLint config:
+The plugin is the module's **default** export, and its recommended config references the plugin object directly — that's the flat-config shape ESLint 9 and 10 expect. The recommended config is an array of two config objects, so the loader rule can be limited to page files with `files`. (Plugins registered in the first object are available to the second.) Users enable it with a single spread in their ESLint config:
 
 ```javascript title="eslint.config.js"
 import eigen from "eslint-plugin-eigen";
 
-export default [eigen.configs.recommended];
+export default [...eigen.configs.recommended];
 ```
 
 ---
 
 ## TypeScript plugin
 
-A TypeScript language service plugin runs inside the editor — it can provide autocomplete, go-to-definition, and diagnostics for framework-specific patterns.
+A TypeScript language service plugin runs inside the editor's TypeScript server. It wraps the language service, so it can add completions, go-to-definition targets, and diagnostics for framework-specific patterns.
 
-### What it does
+### What it's for
 
-| Feature                         | Example                                                         |
-| ------------------------------- | --------------------------------------------------------------- |
-| **Route autocomplete**          | `<Link to="/` → suggests all known routes                       |
-| **Virtual module types**        | `import { routes } from 'eigen/routes'` → shows generated types |
-| **Loader return type checking** | Red squiggly if `data` prop doesn't match loader return type    |
+Most editor intelligence comes from the types alone. `<Link to="/` already completes every route path, because `to` is typed with the generated `RoutePaths` union ([Part 2](/02-route-discovery-plugin), [Part 11](/11-framework-plugin)), and a page's `data` prop is checked against its loader's return type ([Part 5](/05-typed-loaders)). A plugin that re-added those completions would only produce duplicates. A plugin earns its place for rules the type system can't express. One example: every file in `src/pages/` must default-export the page component. A page without one compiles cleanly, then renders nothing. The plugin turns that into an error in the editor.
 
 ### Plugin structure
 
 ```typescript title="packages/eigen/typescript-plugin.ts"
-import type ts from "typescript/lib/tsserverlibrary";
+import type ts from "typescript";
 
 function init(modules: { typescript: typeof ts }) {
   const ts = modules.typescript;
 
-  function create(info: ts.server.PluginCreateInfo) {
-    const proxy = Object.create(null) as ts.LanguageService;
+  function create(info: ts.server.PluginCreateInfo): ts.LanguageService {
     const ls = info.languageService;
+    // Configurable from the tsconfig entry, like the eigen() plugin's pagesDir (Part 11)
+    const pagesDir = `${info.project.getCurrentDirectory()}/${info.config.pagesDir ?? "src/pages"}/`;
 
-    // Forward all methods to the original language service
+    // Forward every method to the original language service...
+    const proxy = Object.create(null) as ts.LanguageService;
     for (const k of Object.keys(ls) as Array<keyof ts.LanguageService>) {
       const x = ls[k];
       if (typeof x === "function") {
@@ -501,32 +527,32 @@ function init(modules: { typescript: typeof ts }) {
       }
     }
 
-    // Override getCompletionsAtPosition for route autocomplete
-    proxy.getCompletionsAtPosition = (fileName, position, options) => {
-      const original = ls.getCompletionsAtPosition(fileName, position, options);
+    // ...then add one Eigen-specific check on top of TypeScript's own
+    proxy.getSemanticDiagnostics = (fileName) => {
+      const diagnostics = ls.getSemanticDiagnostics(fileName);
+      const isPage = fileName.startsWith(pagesDir) && fileName.endsWith(".tsx") && !fileName.endsWith("/layout.tsx");
+      if (!isPage) return diagnostics;
 
-      // Check if we're inside a <Link to="..." /> prop
-      const sourceFile = ls.getProgram()?.getSourceFile(fileName);
-      if (!sourceFile) return original;
+      const program = ls.getProgram();
+      const sourceFile = program?.getSourceFile(fileName);
+      if (!program || !sourceFile) return diagnostics;
 
-      const token = findTokenAtPosition(sourceFile, position, ts);
-      if (isLinkToProp(token, ts)) {
-        // Read the generated route types to suggest completions
-        const routeEntries = getKnownRoutes(info.project).map((route): ts.CompletionEntry => ({
-          name: route,
-          kind: ts.ScriptElementKind.string,
-          sortText: "0", // Sort before other completions
-        }));
+      // A file with no exports at all has no module symbol
+      const moduleSymbol = program.getTypeChecker().getSymbolAtLocation(sourceFile);
+      if (moduleSymbol?.exports?.has(ts.InternalSymbolName.Default)) return diagnostics;
 
-        return {
-          isGlobalCompletion: false,
-          isMemberCompletion: false,
-          isNewIdentifierLocation: false,
-          entries: [...routeEntries, ...(original?.entries ?? [])],
-        };
-      }
-
-      return original;
+      return [
+        ...diagnostics,
+        {
+          category: ts.DiagnosticCategory.Error,
+          code: 100001, // any number TypeScript doesn't use itself
+          source: "eigen",
+          file: sourceFile,
+          start: 0,
+          length: 0,
+          messageText: "Eigen pages need a default export (the page component). This route renders nothing.",
+        },
+      ];
     };
 
     return proxy;
@@ -535,25 +561,12 @@ function init(modules: { typescript: typeof ts }) {
   return { create };
 }
 
-// Helper: read route paths from .eigen/routes.d.ts
-function getKnownRoutes(project: ts.server.Project): string[] {
-  const routesDts = project.getCurrentDirectory() + "/.eigen/routes.d.ts";
-  const sourceFile = project.getLanguageService().getProgram()?.getSourceFile(routesDts);
-  if (!sourceFile) return [];
-  const text = sourceFile.getFullText();
-  const matches = text.matchAll(/['"](\/.+?)['"]/g);
-  return [...matches].map((m) => m[1]);
-}
-
-// Helper: walk the AST to find the token at cursor position,
-// then walk up to check if it's inside a <Link to="..."> prop.
-// Implementation uses ts.forEachChild for the downward walk
-// and parent references for the upward check.
-
 export default init;
 ```
 
-`tsserver` loads plugins with `require()`, so this file has to reach users as **CommonJS** even though the rest of `eigen` is ESM. [Part 40](/40-monorepo-publishing) builds it separately as `typescript-plugin.cjs` (tsdown turns the single `export default` into `module.exports = init`) and exposes it with a `require` condition at `eigen/typescript-plugin`.
+In TypeScript 6, `typescript/lib/tsserverlibrary` is just a re-export of `typescript`, so the `server` namespace (`ts.server.PluginCreateInfo`) comes from the main package. The plugin only uses its types: at run time, everything goes through the `typescript` instance the server passes to `init`, which is the version the editor is actually running.
+
+`tsserver` loads plugins with `require()`, so this file has to reach users as **CommonJS** even though the rest of `eigen` is ESM. [Part 40](/40-monorepo-publishing) builds it separately as `typescript-plugin.cjs` (tsdown turns the single `export default` into `module.exports = init`). How `tsserver` _finds_ it matters too. It resolves plugin names with the old `node10` algorithm, which ignores the `exports` map, so `eigen/typescript-plugin` must exist as a real path inside the package. Part 40 adds a `typescript-plugin/package.json` stub whose `main` points at the built file.
 
 ### Registering the plugin
 
@@ -567,9 +580,14 @@ Users add it to their `tsconfig.json`:
 }
 ```
 
-<Callout type="info" title="IDE support">
-  TypeScript plugins work in VS Code (with the "Use Workspace Version" TypeScript setting), WebStorm, and any editor
-  that delegates to `tsserver`. They don't affect `tsc` on the command line — they're purely for editor intelligence.
+<Callout type="warning" title="Editor support: TypeScript 6 only, for now">
+  Language service plugins run in the JavaScript-based TypeScript language service, the one in TypeScript 6.x and
+  earlier, that VS Code (with "Use Workspace Version"), WebStorm, and other `tsserver`-based editors load. TypeScript 7,
+  the native Go port, ships without a programmatic API, so its language server doesn't load `compilerOptions.plugins` at
+  all. The TypeScript team expects a new, different API in 7.1. Until then, a project that wants the plugin can follow
+  the split the TypeScript team suggests for Angular projects: TypeScript 7's `tsc` for fast command-line checks, and
+  TypeScript 6 (installable side by side as `@typescript/typescript6`) for the editor. Plugins never affect `tsc` on the
+  command line either way: they're purely for editor intelligence.
 </Callout>
 
 ---
@@ -640,7 +658,7 @@ async function checkRouteDirectory(root: string): Promise<Diagnostic[]> {
 
 ### Integrating with the dev overlay
 
-Send diagnostics through the overlay's collector from [Part 10](/10-dev-overlay). Two details matter. Eigen's dev server runs in middleware mode ([Part 3](/03-server-side-rendering)), so `server.httpServer` is `null` and there's no `'listening'` event to wait for. And the checks finish long before any browser connects — a broadcast at startup would reach nobody. Part 10's collector solves the second problem already: it buffers events and replays them to each overlay that connects to `/_eigen/dev-ws`.
+Send diagnostics through the overlay's collector from [Part 10](/10-dev-overlay). Two details matter. Eigen's dev server runs in middleware mode ([Part 3](/03-server-side-rendering)), so `server.httpServer` is `null` and there's no `'listening'` event to wait for. And the checks finish long before any browser connects — a broadcast at startup would reach nobody. Part 10's collector solves the second problem already: it buffers events and replays them to each overlay that announces itself with `eigen:dev-hello` over Vite's HMR channel. Since Part 10 publishes the collector in `configResolved`, it exists by the time any `configureServer` runs.
 
 <DiagnosticsFlowDiagram />
 
@@ -667,11 +685,14 @@ export function eigenDiagnosticsPlugin(): Plugin {
         data: { diagnostics },
       });
 
-      // Also log to terminal
+      // Also log to the terminal, at the matching log level
+      const { logger } = server.config;
       for (const d of diagnostics) {
         const prefix = d.level === "error" ? "✗" : d.level === "warning" ? "⚠" : "ℹ";
-        server.config.logger.warn(`  ${prefix} ${d.title}: ${d.message}`);
-        if (d.fix) server.config.logger.warn(`    Fix: ${d.fix}`);
+        const text = `  ${prefix} ${d.title}: ${d.message}` + (d.fix ? `\n    Fix: ${d.fix}` : "");
+        if (d.level === "error") logger.error(text);
+        else if (d.level === "warning") logger.warn(text);
+        else logger.info(text);
       }
     },
   };
@@ -719,7 +740,7 @@ Developer writes code
   ├── create-eigen         → scaffolds the project
   ├── eigen generate       → generates routes, loaders
   ├── eslint-plugin-eigen  → catches framework-specific mistakes
-  ├── TypeScript plugin    → autocomplete, go-to-definition
+  ├── TypeScript plugin    → editor errors for rules types can't express
   └── Dev overlay          → runtime diagnostics, health checks
 
 Developer runs dev server
@@ -734,7 +755,7 @@ None of these tools change the runtime behavior. They exist to make the develope
 
 ## Key insight
 
-A framework's developer experience is a force multiplier — it doesn't change what's possible, but it dramatically changes what's practical. The scaffolding CLI removes the "blank page" problem. Code generation enforces conventions without documentation. ESLint rules catch mistakes before they become bugs. The TypeScript plugin makes the type system work harder for the developer. And diagnostics surface problems before the developer even knows to look.
+A framework's developer experience is a force multiplier — it doesn't change what's possible, but it dramatically changes what's practical. The scaffolding CLI removes the "blank page" problem. Code generation enforces conventions without documentation. ESLint rules catch mistakes before they become bugs. The TypeScript plugin puts framework rules the type system can't express into the editor. And diagnostics surface problems before the developer even knows to look.
 
 The common thread: every DX tool is built from the same information the framework already has — the route tree, the module graph, the type definitions. The runtime framework _knows_ your routes, your loaders, your server functions. The DX layer just makes that knowledge accessible to the developer in the right place at the right time.
 

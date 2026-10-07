@@ -29,7 +29,7 @@ In Eigen, this maps directly to existing primitives:
 | **Validate**   | `.validator()` (from Part 15) + client-side schema                  | Both            |
 | **Mutate**     | Server function `.handler()`                                        | Server          |
 | **Revalidate** | `revalidateTag()` (from Part 25)                                    | Server          |
-| **Update UI**  | React re-render with fresh data                                     | Client          |
+| **Update UI**  | `redirect()` or `navigation.reload()` re-fetches loader data        | Client          |
 
 The framework's job is wiring these steps together so they work without JavaScript (progressive enhancement) and feel instant with JavaScript (optimistic UI).
 
@@ -99,11 +99,15 @@ If your app uses [Part 33](/33-authentication-authorization)'s auth, its global 
 import type { ComponentProps } from "react";
 import type { ServerFn } from "./server";
 
-type FormProps = Omit<ComponentProps<"form">, "action" | "method" | "encType"> & {
-  action: ServerFn<any, unknown>;
+type FormProps<TResult> = Omit<ComponentProps<"form">, "action" | "method" | "encType" | "onError"> & {
+  action: ServerFn<any, TResult>;
+  /** JS only: called with the server function's return value */
+  onResult?: (result: TResult) => void;
+  /** JS only: called instead of the nearest error boundary when the call fails */
+  onError?: (error: Error) => void;
 };
 
-export function Form({ action, ...props }: FormProps) {
+export function Form<TResult>({ action, onResult, onError, ...props }: FormProps<TResult>) {
   if (import.meta.env.SSR) {
     // No JavaScript yet: a real form that posts to the endpoint
     return <form {...props} action={action.url} method="post" />;
@@ -116,7 +120,12 @@ export function Form({ action, ...props }: FormProps) {
       action={async (formData: FormData) => {
         // The stub sends the CSRF token as a header (Part 33), not a field
         const { _csrf, ...input } = Object.fromEntries(formData);
-        await action(input);
+        try {
+          onResult?.(await action(input));
+        } catch (error) {
+          if (!onError) throw error; // no handler: the nearest error boundary renders
+          onError(error instanceof Error ? error : new Error(String(error)));
+        }
       }}
     />
   );
@@ -124,6 +133,8 @@ export function Form({ action, ...props }: FormProps) {
 ```
 
 The server and client render different `action` values, and that's fine: when the client-side `action` is a function, React skips hydration checks for the form's `action`, `method`, and `encType` attributes, precisely because frameworks render their own progressive-enhancement attributes on the server. Both paths send the validator the same shape — a plain object built from the form fields (file inputs would need a multipart path, which this toy leaves out).
+
+Failures take different routes on the two paths. With JavaScript, a 400 or 500 makes the stub reject; `onError` turns that into UI, and without it the rejection escapes the form action and the nearest error boundary ([Part 35](/35-error-boundaries-loading)) replaces the page. Without JavaScript, the endpoint's response _is_ the page, so an invalid submission shows the raw `{"error":"Invalid input"}` JSON, and a value the handler returns is lost when the endpoint redirects back. Production frameworks carry errors across that redirect in a flash cookie or the query string; this toy leaves the no-JS error path out.
 
 ### The endpoint accepts form posts
 
@@ -335,7 +346,7 @@ export default function TodoList({ data }: { data: { todos: Todo[] } }) {
 
 The key: `useOptimistic` state lives only as long as the transition. When the action finishes — successfully or not — React drops the optimistic value and renders from the real state again. That's why the success path must update the confirmed state (`setTodos` with the saved row), or the new todo would vanish the moment the request completes. On failure there's nothing to undo: the temporary todo disappears on its own, and the `catch` turns the error into a message instead of letting it reach the nearest error boundary.
 
-This form uses a client-only action (it needs JavaScript). For a no-JS fallback, use `<Form action={addTodo}>`; the progressive-enhancement path and the optimistic path can't share one function, because only the server function has a `.url` to post to.
+This form uses a client-only action (it needs JavaScript). For a no-JS fallback, use `<Form action={addTodo}>`. In this toy `<Form>` the two paths don't combine: `<Form>` owns its action function, so there's nowhere to call `addOptimistic`, and only the server function has a `.url` to post to. That's a limit of this design, not of forms in general. Frameworks built on React's Server Actions let one action serve both the no-JS post and the optimistic update.
 
 ### Error rollback
 
@@ -366,7 +377,7 @@ export const addTodo = createServerFn()
   });
 ```
 
-If validation fails, the endpoint answers 400; if the `INSERT` fails (constraint violation, lost connection), it answers 500. Either way the stub rejects, `addAction`'s `catch` shows a message, and `useOptimistic` reverts to the confirmed list when the transition ends. No manual rollback logic needed.
+If validation fails, the endpoint answers 400; if the `INSERT` fails (constraint violation, lost connection), it answers 500. Either way the stub rejects, `addAction`'s `catch` shows a message, and `useOptimistic` reverts to the confirmed list when the transition ends. No manual rollback logic needed. The message is the endpoint's, not zod's: Part 15's validator wrapper answers every invalid input with a generic `{ error: "Invalid input" }`, so "Title required" never reaches the client. To show the schema's own messages, validate on the client as well, or return them as a result (both below).
 
 <OptimisticFormPlayground />
 
@@ -396,6 +407,7 @@ This schema is consumed on both sides:
 
 ```typescript title="src/actions/posts.ts"
 import { createServerFn } from "eigen/server";
+import { redirect } from "eigen/middleware";
 import { createPostSchema } from "../schemas/post";
 import { db } from "../lib/database";
 
@@ -407,39 +419,40 @@ export const createPost = createServerFn()
       data.body,
       data.tags ?? [],
     ]);
-    return { id: result.rows[0].id as string };
+    redirect(`/posts/${result.rows[0].id}`);
   });
 ```
 
-**Client side** — for instant feedback before submission:
+**Client side** — for instant feedback before submission. Client validation layers onto `<Form>` rather than replacing it, so the no-JS path keeps working:
 
 ```tsx title="src/pages/posts/new.tsx"
-import { useState } from "react";
+import { useState, type FormEvent } from "react";
+import { Form } from "eigen/forms";
 import { createPostSchema } from "../../schemas/post";
 import { createPost } from "../../actions/posts";
 
 export default function NewPost() {
   const [errors, setErrors] = useState<Record<string, string>>({});
 
-  async function handleSubmit(formData: FormData) {
-    const input = Object.fromEntries(formData);
-    const result = createPostSchema.safeParse(input);
-
-    if (!result.success) {
-      const fieldErrors: Record<string, string> = {};
-      for (const issue of result.error.issues) {
-        fieldErrors[String(issue.path[0])] = issue.message;
-      }
-      setErrors(fieldErrors);
-      return;
+  // Runs before <Form>'s action. preventDefault() cancels the submission,
+  // so the action never runs and React doesn't reset what the user typed.
+  function validate(event: FormEvent<HTMLFormElement>) {
+    const result = createPostSchema.safeParse(Object.fromEntries(new FormData(event.currentTarget)));
+    if (result.success) {
+      setErrors({});
+      return; // let the submission through
     }
 
-    setErrors({});
-    await createPost(result.data);
+    event.preventDefault();
+    const fieldErrors: Record<string, string> = {};
+    for (const issue of result.error.issues) {
+      fieldErrors[String(issue.path[0])] ??= issue.message; // first message per field
+    }
+    setErrors(fieldErrors);
   }
 
   return (
-    <form action={handleSubmit}>
+    <Form action={createPost} onSubmit={validate}>
       <label>
         Title
         <input name="title" required />
@@ -451,10 +464,12 @@ export default function NewPost() {
         {errors.body && <span className="error">{errors.body}</span>}
       </label>
       <button type="submit">Create</button>
-    </form>
+    </Form>
   );
 }
 ```
+
+Without JavaScript, `onSubmit` never runs: the browser posts the form, and the same schema runs in `.validator()` on the server. With JavaScript, `validate` runs first. React only starts a form action if the submit event wasn't cancelled, so invalid input never reaches the network and the fields keep their values. (React resets uncontrolled fields after every form action that completes, so cancelling is what keeps them here.) Valid input goes through `<Form>` as usual, and the handler's `redirect()` takes the user to the new post.
 
 <Callout type="warning" title="Never trust client validation alone">
   Client-side validation is a UX optimization — it gives instant feedback. But the server function's `.validator()` is
@@ -464,29 +479,76 @@ export default function NewPost() {
 
 ### Returning field-level errors from the server
 
-When server validation catches something client validation missed (uniqueness constraints, rate limits), the server function returns structured errors:
+When server validation catches something client validation can't (uniqueness constraints, rate limits), the server function returns structured errors instead of throwing, and still redirects on success:
 
 ```typescript title="src/actions/posts.ts"
+/** What the page gets back when the post can't be created. Success redirects instead. */
+export type CreatePostResult = { fieldErrors: Record<string, string> };
+
 export const createPost = createServerFn()
   .validator(createPostSchema)
-  .handler(async ({ data }) => {
+  .handler(async ({ data }): Promise<CreatePostResult> => {
     const existing = await db.query("SELECT id FROM posts WHERE title = $1", [data.title]);
     if (existing.rows.length > 0) {
-      return {
-        error: true,
-        fieldErrors: { title: "A post with this title already exists" },
-      };
+      return { fieldErrors: { title: "A post with this title already exists" } };
     }
 
-    const post = await db.query("INSERT INTO posts (title, body) VALUES ($1, $2) RETURNING id, title", [
+    const result = await db.query("INSERT INTO posts (title, body, tags) VALUES ($1, $2, $3) RETURNING id", [
       data.title,
       data.body,
+      data.tags ?? [],
     ]);
-    return { error: false, post: post.rows[0] as { id: string; title: string } };
+    redirect(`/posts/${result.rows[0].id}`);
   });
 ```
 
-The return type is a discriminated union, so the client narrows on `result.error` before reading `fieldErrors` or `post`.
+`redirect()` returns `never`, so TypeScript knows the function can't fall off the end. The annotation names the contract for the page. It matters more once branches return _different_ shapes, say `{ error: true, fieldErrors }` and `{ error: false, post }`. TypeScript normalizes an inferred union of object literals by adding the missing keys as optional `undefined` (`post?: undefined` on the first branch). `undefined` isn't a `JsonValue`, so Part 15's `handler` constraint rejects it. Declaring the union as a type alias and annotating the return type avoids the normalization.
+
+The page renders the returned errors through `<Form>`'s `onResult`, and a thrown failure (the generic 400, a 500, a network error) through `onError`:
+
+```tsx title="src/pages/posts/new.tsx"
+export default function NewPost() {
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  // React resets the form after every action that completes, and a reset // [!code ++]
+  // restores each field's defaultValue: keep the last submitted values // [!code ++]
+  const [values, setValues] = useState({ title: "", body: "" }); // [!code ++]
+
+  function validate(event: FormEvent<HTMLFormElement>) {
+    const result = createPostSchema.safeParse(Object.fromEntries(new FormData(event.currentTarget))); // [!code --]
+    const input = Object.fromEntries(new FormData(event.currentTarget)); // [!code ++]
+    setValues({ title: String(input.title ?? ""), body: String(input.body ?? "") }); // [!code ++]
+    const result = createPostSchema.safeParse(input); // [!code ++]
+    // ...unchanged
+  }
+
+  return (
+    <Form action={createPost} onSubmit={validate}> {/* [!code --] */}
+    <Form // [!code ++]
+      action={createPost} // [!code ++]
+      onSubmit={validate} // [!code ++]
+      onResult={(result) => setErrors(result.fieldErrors)} // [!code ++]
+      onError={(error) => setErrors({ form: error.message })} // [!code ++]
+    > {/* [!code ++] */}
+      {errors.form && <p role="alert">{errors.form}</p>} {/* [!code ++] */}
+      <label>
+        Title
+        <input name="title" required /> {/* [!code --] */}
+        <input name="title" defaultValue={values.title} required /> {/* [!code ++] */}
+        {errors.title && <span className="error">{errors.title}</span>}
+      </label>
+      <label>
+        Body
+        <textarea name="body" required /> {/* [!code --] */}
+        <textarea name="body" defaultValue={values.body} required /> {/* [!code ++] */}
+        {errors.body && <span className="error">{errors.body}</span>}
+      </label>
+      <button type="submit">Create</button>
+    </Form>
+  );
+}
+```
+
+`onResult`'s parameter is typed `CreatePostResult`, inferred from `action`. Without `defaultValue`, the duplicate-title message would appear next to an empty form: returning a result counts as a completed action, and React resets the fields. Without JavaScript, the returned errors are lost on the redirect back, as described [above](#how-form-works).
 
 ---
 
@@ -509,6 +571,7 @@ interface StepData {
 export function MultiStepForm() {
   const [step, setStep] = useState(0);
   const [data, setData] = useState<StepData>({});
+  const [error, setError] = useState<string | null>(null);
 
   async function handleStep(formData: FormData) {
     const stepData = Object.fromEntries(formData) as StepData;
@@ -517,14 +580,22 @@ export function MultiStepForm() {
 
     if (step < 2) {
       setStep(step + 1);
-    } else {
-      // Final step: submit everything
+      return;
+    }
+
+    // Final step: submit everything, then leave the wizard
+    try {
       await createUser(merged);
+      navigation.navigate("/dashboard");
+    } catch (err) {
+      // Stay on the review step, with everything entered so far still in `data`
+      setError(err instanceof Error ? err.message : "Could not create the account");
     }
   }
 
   return (
     <form action={handleStep}>
+      {error && <p role="alert">{error}</p>}
       {step === 0 && (
         <>
           <input name="name" defaultValue={data.name} required />
@@ -623,6 +694,17 @@ export const updatePost = createServerFn()
 
 `revalidateTag` is async (Part 25's store may live in Redis or a KV store), so await it: the response shouldn't go out before the stale entries are gone, or the next request could still read them.
 
+Clearing the cache doesn't change what the browser is showing. The page still holds the loader data it rendered with, and Eigen's router only fetches loader data when it navigates. A mutation that ends in `redirect()` (like `createPost`) gets that for free: the stub navigates. One that stays on the page asks for it:
+
+```tsx title="src/pages/posts/[id]/edit.tsx (excerpt)"
+await updatePost({ id, title, body });
+// Re-run this route's loaders: the Part 22 router intercepts the reload
+// like any other navigation and fetches fresh data from /_eigen/data
+navigation.reload();
+```
+
+Without the Navigation API, `navigation.reload()` isn't available; `window.location.reload()` does the same job with a full page load.
+
 ### The revalidation flow
 
 ```
@@ -630,8 +712,9 @@ export const updatePost = createServerFn()
 2. Server function validates + mutates (database write)
 3. Server function awaits revalidateTag('posts-list')
 4. Cache store deletes the entries tagged 'posts-list'
-5. Next request for the posts list loader runs fresh
-6. Client re-renders with new data
+5. Client asks for fresh data: redirect() navigates, or navigation.reload()
+   re-runs the current route's loaders through /_eigen/data
+6. The posts list loader runs fresh, and the router renders the new data
 ```
 
 With optimistic UI, steps 5–6 happen in the background. The user already sees the updated state (optimistically) — the server response just confirms or corrects it.

@@ -57,14 +57,19 @@ The browser re-imports the changed modules (making new HTTP requests to Vite, wh
 
 ## The module graph
 
-Vite's module graph is the central data structure of the dev server. Since Vite 6 there isn't _one_ graph — each environment has its own. The client graph tracks what the browser has imported; the SSR graph tracks what the ModuleRunner has imported. You can inspect either programmatically:
+Vite's module graph is the central data structure of the dev server. Since Vite 6 there isn't _one_ graph — each environment has its own. The client graph tracks what the browser has imported; the SSR graph tracks what the ModuleRunner has imported. You can inspect either programmatically. A debug endpoint is the easiest way, because it reads the graph at the moment you ask, after a page has loaded:
 
 ```typescript
 configureServer(server) {
-	server.httpServer?.on("listening", () => {
-		// Wait a moment for the initial module graph to populate
-		setTimeout(() => {
+	// Eigen runs Vite in middleware mode (Part 3), so server.httpServer is
+	// null and there's no "listening" event to hook. Serve the graph on
+	// demand instead: load a page, then visit /__eigen/graph.
+	return () => {
+		server.middlewares.use((req, res, next) => {
+			if (req.url !== "/__eigen/graph") return next();
+
 			const graph = server.environments.client.moduleGraph;
+			const lines: string[] = [];
 
 			// The graph maps module IDs to EnvironmentModuleNode objects
 			for (const [id, mod] of graph.idToModuleMap) {
@@ -73,12 +78,14 @@ configureServer(server) {
 					.filter(Boolean);
 
 				if (importedBy.length > 0) {
-					console.log(`${id}`);
-					console.log(`  ← imported by: ${importedBy.join(", ")}`);
+					lines.push(id, `  ← imported by: ${importedBy.join(", ")}`);
 				}
 			}
-		}, 3000);
-	});
+
+			res.setHeader("Content-Type", "text/plain; charset=utf-8");
+			res.end(lines.join("\n"));
+		});
+	};
 }
 ```
 
@@ -150,7 +157,7 @@ Older plugins use `handleHotUpdate({ file, server, modules })`. In Vite 8 it sti
 
 ### Module invalidation
 
-`moduleGraph.invalidateModule(mod)` clears the module's cached transform result in that environment. The next time the module is requested — by the browser, or by the ModuleRunner — Vite re-runs the `resolveId` → `load` → `transform` pipeline from scratch.
+`moduleGraph.invalidateModule(mod)` clears the module's cached transform result in that environment. The next time the module is requested — by the browser, or by the ModuleRunner — Vite re-runs `load` → `transform` for it. (The URL-to-module resolution stays cached in the graph, so `resolveId` doesn't run again for that module.)
 
 For our route virtual module, invalidation means the next request triggers the `load` hook again, which rescans the pages directory and generates fresh route code. Invalidation alone doesn't push anything anywhere, though. That's the job of the `full-reload` message: the browser re-requests the page, and the SSR runner drops its cached modules.
 
@@ -190,6 +197,10 @@ configureServer(server) {
 
 	server.watcher.on("add", onStructuralChange);
 	server.watcher.on("unlink", onStructuralChange);
+
+	return () => {
+		// ...the /_eigen/data post-middleware from Part 5, unchanged
+	};
 },
 ```
 
@@ -238,6 +249,8 @@ When Vite finds a boundary, it sends a WebSocket message to the browser. The `@v
 
 **When no boundary is found** — for example, changing a utility function that's imported by a non-component module all the way up to the entry point — Vite has no safe update path. It falls back to a **full page reload**. This is the correct behavior: without an accept handler, there's no way to know how to apply the update without restarting the application.
 
+<HmrPropagationPlayground />
+
 Framework authors have an additional concern: hot updates to framework internals (the router, the data loading layer) might need special handling. If the route matching logic changes, a simple component re-render won't update the router — you need a full page reload.
 
 That's why our `hotUpdate` hook splits the cases: content edits go through normal HMR, and structural changes (a route appearing or disappearing) force a reload. A more sophisticated framework could go further:
@@ -249,8 +262,6 @@ That's why our `hotUpdate` hook splits the cases: content edits go through norma
 ---
 
 ## What to observe
-<HmrPropagationPlayground />
-
 
 1. **Edit a page component's markup** — just the JSX. The browser updates without a full reload, and component state survives. React Fast Refresh handles it; our `hotUpdate` hook returns early for `type: 'update'`.
 
@@ -282,4 +293,4 @@ For a typed framework, HMR has a second dimension: declaration file regeneration
 
 ## What's next
 
-In Part 10, we'll build Eigen's **dev overlay** — an in-browser diagnostic panel that streams request timings from the dev server in real time, with an instrumentation hook that later parts use for loaders, middleware, and caching. Then in Part 11, we'll compose everything into a single `eigen()` plugin function, introduce the `buildApp` hook for production build orchestration, and examine the three-layer type architecture that frameworks ship. This is where the toy framework becomes a coherent, distributable package.
+In Part 10, we'll build Eigen's **dev overlay** — an in-browser diagnostic panel that streams request timings from the dev server in real time over Vite's own HMR channel, with an instrumentation hook any framework code can report into. Then in Part 11, we'll compose everything into a single `eigen()` plugin function, introduce the `buildApp` hook for production build orchestration, and examine the three-layer type architecture that frameworks ship. This is where the toy framework becomes a coherent, distributable package.

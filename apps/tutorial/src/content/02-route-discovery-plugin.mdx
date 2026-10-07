@@ -24,7 +24,7 @@ Our route plugin has three jobs:
 
 <RouteCodegenDiagram />
 
-This three-part pattern — filesystem scan → runtime JavaScript → type declarations — is the core of every typed framework's routing system. [TanStack Router](https://tanstack.com/router) does it with `routeTree.gen.ts`. [Next.js](https://nextjs.org) does a version of it internally (though with less type exposure). We're going to build it from scratch.
+This three-part pattern — filesystem scan → runtime JavaScript → type declarations — is the core of every typed framework's routing system. [TanStack Router](https://tanstack.com/router) does it with `routeTree.gen.ts`. [Next.js](https://nextjs.org) generates route types into `.next/types` (its `typedRoutes` option and the global `PageProps<'/blog/[slug]'>` helpers). We're going to build it from scratch.
 
 ---
 
@@ -33,6 +33,8 @@ This three-part pattern — filesystem scan → runtime JavaScript → type decl
 Before writing the plugin, we need to define the types that Eigen exposes to application code. These are the framework's public API:
 
 ```typescript title="packages/eigen/types.ts"
+import type * as React from "react";
+
 /**
  * Walk a path string and collect one { name: string } object per
  * `:name` segment. Static paths produce {}.
@@ -111,7 +113,6 @@ type Result = RouteParams<"/posts/:id/:slug">;
 //   ^?
 //   → { id: string; slug: string }
 ```
-//   ^?
 
 When there are no more `:param` segments, the recursion bottoms out at `{}`. That base case matters: for `'/users/:userId/posts'`, the result is `{ userId: string } & {}`, which is just `{ userId: string }`. (Had the base case been `Record<string, never>`, the intersection would have forced `userId` to `string & never` — that is, `never`.)
 
@@ -132,7 +133,7 @@ This is the same technique [TanStack Router](https://tanstack.com/router) uses f
 Here's the complete plugin file. We'll walk through each section after the listing:
 
 ```typescript title="plugins/eigen-routes.ts"
-import { mkdirSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { Plugin, ResolvedConfig } from "vite";
 
@@ -172,6 +173,9 @@ export function fileToRoute(filename: string): {
 }
 
 export function discoverRoutes(pagesDir: string): DiscoveredRoute[] {
+  // No pages yet: an empty route table, not an ENOENT crash
+  if (!existsSync(pagesDir)) return [];
+
   const files = readdirSync(pagesDir, { recursive: true })
     .filter((f): f is string => typeof f === "string" && f.endsWith(".tsx"))
     // readdirSync returns backslash-separated paths on Windows
@@ -317,7 +321,7 @@ export const routes = [\n${routeArray}\n]
 
 **`fileToRoute`** converts filesystem paths to route paths, borrowing the bracket syntax of the [Next.js pages router](https://nextjs.org/docs/pages/building-your-application/routing) with a couple of Eigen-specific twists: `Home.tsx` (or `index.tsx`) → `/`, `About.tsx` → `/about`, `posts/[id].tsx` → `/posts/:id`, `blog/index.tsx` → `/blog`. It works segment by segment. Static segments are lowercased so PascalCase component files produce conventional URLs. Param segments keep their exact spelling — `[userId]` becomes `:userId`, not `:userid` — because the param name has to agree everywhere it appears: in the route path the matcher reads, in the generated `RouteParamsMap`, and in the `params` object components receive.
 
-**`discoverRoutes`** scans the pages directory recursively and maps each `.tsx` file through `fileToRoute`. It normalizes Windows backslashes to `/` first, so `posts\[id].tsx` produces the same route (and the same `/src/pages/...` import URL) on every OS.
+**`discoverRoutes`** scans the pages directory recursively and maps each `.tsx` file through `fileToRoute`. A missing `src/pages` directory just means no routes yet, so it returns an empty table rather than letting `readdirSync` throw. It normalizes Windows backslashes to `/` first, so `posts\[id].tsx` produces the same route (and the same `/src/pages/...` import URL) on every OS.
 
 ### Type declarations
 
@@ -368,6 +372,26 @@ Why `import * as` instead of `import Page0, { loader as loader0 }`? Most pages d
 **`configureServer`** listens for page files being added (`add`) or deleted (`unlink`) — a rename fires both. Editing an existing page is _not_ a structural change, so it's left to normal HMR. On a structural change, it regenerates the type declarations and invalidates the virtual module in each environment's module graph (`server.environments.client.moduleGraph` and `server.environments.ssr.moduleGraph`), since each environment has its own copy of `eigen/routes`. Then `server.environments.client.hot.send({ type: 'full-reload' })` tells the browser to refresh, since the route table has changed. (We don't need to add `src/pages` to the watcher: Vite already watches everything under the project root.)
 
 <RouteWatcherDiagram />
+
+---
+
+## Some pages to discover
+
+The plugin needs something to scan. Create two static pages; the dynamic `posts/[id].tsx` page comes [later in this part](#a-type-safe-page-component).
+
+```tsx title="src/pages/Home.tsx"
+export default function Home() {
+  return <h1>Home</h1>;
+}
+```
+
+```tsx title="src/pages/About.tsx"
+export default function About() {
+  return <h1>About</h1>;
+}
+```
+
+`fileToRoute` maps these to `/` and `/about`, the two paths the `Link`s in `main.tsx` below point at.
 
 ---
 
@@ -423,16 +447,21 @@ interface RouteMatch {
 }
 
 function matchRoute(pathname: string): RouteMatch | null {
+  // '/about/' is the same page as '/about'; '/' stays '/'
+  const path = pathname.replace(/\/+$/, "") || "/";
+
   for (const route of routes) {
-    if (route.path === pathname) return { route, params: {} };
+    if (route.path === path) return { route, params: {} };
 
     const routeParts = route.path.split("/");
-    const pathParts = pathname.split("/");
+    const pathParts = path.split("/");
     if (routeParts.length !== pathParts.length) continue;
 
     const params: Record<string, string> = {};
     const match = routeParts.every((part, i) => {
       if (part.startsWith(":")) {
+        // An empty segment ('/posts//comments') is never a param value
+        if (pathParts[i] === "") return false;
         params[part.slice(1)] = pathParts[i];
         return true;
       }

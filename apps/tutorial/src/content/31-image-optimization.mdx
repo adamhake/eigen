@@ -4,12 +4,14 @@ description: "Build-time image processing with sharp, responsive srcset generati
 concepts:
   - "build-time image processing"
   - "responsive images and srcset"
-  - "format negotiation (WebP/AVIF)"
+  - "format negotiation (WebP/AVIF via the CDN)"
   - "blur placeholders (LQIP)"
   - "image CDN integration"
 ---
 
-## _In this installment, we build an image optimization pipeline — a Vite plugin that processes images at build time and a React component that serves responsive, format-optimized images with blur placeholders. We also integrate with external DAMs like Cloudinary for on-the-fly transformations._
+_In this installment, we build an image optimization pipeline — a Vite plugin that processes images at build time and a React component that serves responsive, format-optimized images with blur placeholders. We also integrate with external DAMs like Cloudinary for on-the-fly transformations._
+
+---
 
 ## The problem: images on the modern web
 
@@ -30,17 +32,36 @@ For images imported from the project's `src/` directory, the Vite plugin process
 
 <ImagePipelineDiagram />
 
-```typescript title="plugins/eigen-images.ts"
+The build plugin and the `<Image>` component (for CDN images) both produce `srcset`s, so the breakpoints live in one small module they share:
+
+```typescript title="packages/eigen/image-widths.ts"
+/** Responsive breakpoints, shared by the build plugin and <Image> */
+export const IMAGE_WIDTHS = [640, 750, 828, 1080, 1200, 1920, 2048];
+
+/**
+ * The variant widths for an image `sourceWidth` pixels wide: every breakpoint
+ * below it, plus the source's own width, capped at the largest breakpoint.
+ * Never upscales, and the largest variant keeps the full available resolution.
+ */
+export function variantWidths(sourceWidth: number): number[] {
+  const max = Math.min(sourceWidth, IMAGE_WIDTHS[IMAGE_WIDTHS.length - 1]);
+  return [...IMAGE_WIDTHS.filter((w) => w < max), max];
+}
+```
+
+Without the source's own width, a 1500px image would top out at the 1200w variant, and its last 300 pixels of resolution would never be served. With it, the variants are 640, 750, 828, 1080, 1200 and 1500; a 4000px original stops at 2048, and an image narrower than 640px gets a single variant at its own width.
+
+```typescript title="packages/eigen/plugins/eigen-images.ts"
 import type { Plugin } from "vite";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import sharp from "sharp";
+import { variantWidths } from "../image-widths";
 
 const QUERY = "?eigen-image";
 const PREFIX = "\0eigen-image:";
-const WIDTHS = [640, 750, 828, 1080, 1200, 1920, 2048];
 
 export default function eigenImages(): Plugin {
   let cacheDir = "";
@@ -82,9 +103,7 @@ export default function eigenImages(): Plugin {
       const blurBuffer = await sharp(input).rotate().resize(10).blur(3).jpeg({ quality: 50 }).toBuffer();
       const blurDataURL = `data:image/jpeg;base64,${blurBuffer.toString("base64")}`;
 
-      // Never upscale; an image narrower than 640px gets one variant at its own width
-      const widths = WIDTHS.filter((w) => w <= width);
-      if (widths.length === 0) widths.push(width);
+      const widths = variantWidths(width);
 
       // Content hash: editing the image produces new variant files
       const hash = createHash("sha256").update(input).digest("hex").slice(0, 8);
@@ -115,6 +134,8 @@ export default {
   };
 }
 ```
+
+Variants are WebP only: every current browser decodes it, and one format keeps the output to a single `srcset`. AVIF is often smaller still, but serving it would mean a second set of variants and a `<picture>` with a `<source type="image/avif">`, so for local images we stop at WebP. CDN images (below) get AVIF where the browser accepts it, because the CDN negotiates the format per request.
 
 `load` runs once per module per build, and the dev server caches the result until the source image changes (`addWatchFile` invalidates it). The cache directory lives under `node_modules`, which Vite's file watcher ignores, so writing variants never triggers a reload — and because file names include a content hash, unchanged images are not re-encoded on the next build.
 
@@ -172,6 +193,9 @@ export const cloudinaryProvider: ImageProvider = {
   buildURL(src: string, opts: ImageTransformOptions): string {
     // Cloudinary URL transformation API
     // https://res.cloudinary.com/demo/image/upload/w_800,f_auto,q_80/sample.jpg
+    // Without /upload/ there's nowhere to put the transforms, and every srcset
+    // entry would be the same full-size file: fail loudly instead
+    if (!src.includes("/upload/")) throw new Error(`Not a Cloudinary delivery URL: ${src}`);
     const transforms: string[] = [];
     if (opts.width) transforms.push(`w_${opts.width}`);
     if (opts.height) transforms.push(`h_${opts.height}`);
@@ -216,8 +240,10 @@ export const imgixProvider: ImageProvider = {
 ## The `<Image>` component
 
 ```tsx title="packages/eigen/image.tsx"
+import { useState } from "react";
 import { preload } from "react-dom";
 import type { ImageProvider } from "./image-providers";
+import { variantWidths } from "./image-widths";
 
 /** What an `?eigen-image` import resolves to */
 export interface ProcessedImage {
@@ -229,12 +255,8 @@ export interface ProcessedImage {
   blurDataURL: string;
 }
 
-interface ImageProps {
-  /** Local processed image or external URL string */
-  src: ProcessedImage | string;
+interface BaseImageProps {
   alt: string;
-  width?: number;
-  height?: number;
   sizes?: string;
   /** Above-the-fold image: eager loading, high fetch priority, preloaded */
   priority?: boolean;
@@ -246,25 +268,35 @@ interface ImageProps {
   quality?: number;
 }
 
-const DEFAULT_SIZES = "(max-width: 768px) 100vw, (max-width: 1200px) 50vw, 33vw";
-const WIDTHS = [640, 750, 828, 1080, 1200, 1920];
+/** Local processed image: its size comes from the import */
+interface LocalImageProps extends BaseImageProps {
+  src: ProcessedImage;
+}
 
-export function Image({
-  src,
-  alt,
-  width,
-  height,
-  sizes = DEFAULT_SIZES,
-  priority = false,
-  provider,
-  className,
-  quality = 80,
-}: ImageProps) {
+/** External URL: carries no size, so the intrinsic width and height are required */
+interface ExternalImageProps extends BaseImageProps {
+  src: string;
+  width: number;
+  height: number;
+}
+
+type ImageProps = LocalImageProps | ExternalImageProps;
+
+function isLocal(props: ImageProps): props is LocalImageProps {
+  return typeof props.src === "object";
+}
+
+const DEFAULT_SIZES = "(max-width: 768px) 100vw, (max-width: 1200px) 50vw, 33vw";
+
+export function Image(props: ImageProps) {
+  const { alt, sizes = DEFAULT_SIZES, priority = false, provider, className, quality = 80 } = props;
+  const [loaded, setLoaded] = useState(false);
   const loading = priority ? "eager" : "lazy";
   const fetchPriority = priority ? "high" : undefined;
 
   // Local processed image
-  if (typeof src === "object") {
+  if (isLocal(props)) {
+    const { src } = props;
     if (priority) {
       preload(src.src, { as: "image", imageSrcSet: src.srcSet, imageSizes: sizes, fetchPriority: "high" });
     }
@@ -277,8 +309,9 @@ export function Image({
           aspectRatio: `${src.width} / ${src.height}`,
         }}
       >
-        {/* Blur placeholder — shown while the real image loads */}
-        {!priority && (
+        {/* Blur placeholder — removed once the real image loads, so it
+            doesn't show through transparent PNG/WebP images */}
+        {!priority && !loaded && (
           <img
             src={src.blurDataURL}
             alt=""
@@ -304,6 +337,11 @@ export function Image({
           loading={loading}
           fetchPriority={fetchPriority}
           decoding="async"
+          onLoad={() => setLoaded(true)}
+          // An image that finished loading before hydration never fires onLoad
+          ref={(img) => {
+            if (img?.complete) setLoaded(true);
+          }}
           style={{
             position: "relative",
             width: "100%",
@@ -314,12 +352,14 @@ export function Image({
     );
   }
 
-  // External image with provider (Cloudinary, Imgix, etc.)
+  const { src, width, height } = props; // narrowed to ExternalImageProps
+
+  // External image with provider (Cloudinary, Imgix, etc.): the same widths
+  // as a local image of this size, generated by the CDN instead of sharp
   if (provider) {
-    const srcSet = WIDTHS.map((w) => `${provider.buildURL(src, { width: w, quality, format: "auto" })} ${w}w`).join(
-      ", ",
-    );
-    const fallbackSrc = provider.buildURL(src, { width: width ?? 1200, quality, format: "auto" });
+    const widths = variantWidths(width);
+    const srcSet = widths.map((w) => `${provider.buildURL(src, { width: w, quality, format: "auto" })} ${w}w`).join(", ");
+    const fallbackSrc = provider.buildURL(src, { width: widths[widths.length - 1], quality, format: "auto" });
 
     if (priority) {
       preload(fallbackSrc, { as: "image", imageSrcSet: srcSet, imageSizes: sizes, fetchPriority: "high" });
@@ -356,6 +396,10 @@ export function Image({
 }
 ```
 
+For local images, `width` and `height` come from the import, so the wrapper's `aspect-ratio` reserves the space before the file arrives. An external URL carries no size information, so the props type requires `width` and `height` (the image's intrinsic size, as `next/image` requires for remote images): the browser derives the aspect ratio from those attributes and avoids layout shift, and the provider branch caps the `srcset` at that width instead of asking the CDN to upscale.
+
+The provider widths match the build plugin's, so a 3000px Cloudinary image and a 3000px local image get the same candidates. With `format: "auto"`, Cloudinary's `f_auto` and imgix's `auto=format` pick AVIF or WebP from the browser's `Accept` header, which is the format negotiation the local pipeline leaves out.
+
 <ResponsiveImagePlayground />
 
 ---
@@ -370,29 +414,20 @@ During SSR, React collects these resource hints while rendering and emits them a
 
 ## Configuration
 
-The image plugin is configured in the framework:
+The image plugin sits next to the framework plugin:
 
 ```typescript title="vite.config.ts"
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import eigen from "./packages/eigen/plugin"; // a package import from Part 40 on
-import { cloudinaryProvider } from "eigen/image-providers";
+import eigenImages from "./plugins/eigen-images";
 
 export default defineConfig({
-  plugins: [
-    eigen({
-      images: {
-        provider: cloudinaryProvider,
-        domains: ["res.cloudinary.com", "images.ctfassets.net"],
-        quality: 80,
-        formats: ["webp", "avif"],
-        deviceSizes: [640, 750, 828, 1080, 1200, 1920, 2048],
-      },
-    }),
-    react(),
-  ],
+  plugins: [eigen(), eigenImages(), react()],
 });
 ```
+
+Everything else is deliberately not configuration. The breakpoints live in `image-widths.ts`, where the plugin and the component both read them; quality is a prop, and the provider is chosen per `<Image>` (an app that uses one CDN everywhere wraps it once, as a `CmsImage` that passes `provider={cloudinaryProvider}`). Eigen also needs no `domains` allowlist: `next/image` has one because its optimizer fetches remote images on your server, whereas Eigen's providers only build URLs, and the browser fetches straight from the CDN.
 
 ---
 

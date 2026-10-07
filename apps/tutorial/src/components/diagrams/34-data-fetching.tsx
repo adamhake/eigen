@@ -135,7 +135,7 @@ export function QueryHandoffDiagram() {
       <Region x={4} y={8} w={712} h={112} label="Server · one request" />
       <Region x={4} y={172} w={712} h={112} label="Browser" tone="accent" />
 
-      <Box {...loaderBox} label="loader" sub="ensureQueryData()" />
+      <Box {...loaderBox} label="loader" sub="queryClient.query()" />
       <Box {...qc} label="QueryClient" sub="one per request" />
       <Box {...dehydrate} label="dehydrate()" sub="serializeForScript" mono />
       <Box {...state} label="__EIGEN_QUERY_STATE__" sub="inline <script>" mono />

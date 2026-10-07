@@ -18,47 +18,37 @@ The View Transitions API lets the browser capture a "before" snapshot of the pag
 
 ### Same-document transitions (SPA)
 
-In our Navigation API intercept handler, wrap the DOM update in `startViewTransition`:
+In our Navigation API intercept handler, wrap the DOM update in `startViewTransition`. This is the manual version, written against the platform API so you can see each moving part; [below](#with-reacts-viewtransition), React's `<ViewTransition>` does the same work for us.
 
 ```typescript
-import { flushSync } from "react-dom";
-
-// Part 23's data fetch, pulled into a helper: preloaded result first, network second
-function fetchRouteData(url: URL, signal: AbortSignal): Promise<unknown> {
-  const href = url.pathname + url.search;
-  return (
-    takePreloadedData(href) ??
-    fetch(`/_eigen/data?path=${encodeURIComponent(href)}`, { signal }).then((res) => res.json())
-  );
-}
-
 event.intercept({
+  // We reset/restore scroll ourselves, inside the transition (see below)
+  scroll: "manual",
   async handler() {
-    const newData = await fetchRouteData(url, event.signal);
+    // Part 23's helper: preloaded or fetched data, parsed search params
+    const next = await prepareNavigation(url, match, event.signal);
+    event.signal.throwIfAborted();
 
-    const commit = () => {
-      // flushSync makes React apply the update synchronously,
-      // so the "after" snapshot sees the new page
-      flushSync(() => {
-        setLocation({ pathname: url.pathname, search: url.search });
-        setData(newData);
-      });
+    // The DOM update the browser snapshots around. Part 22's commit() renders
+    // in a React transition and resolves once React has committed
+    const update = async () => {
+      await commit(next);
+      event.scroll(); // Scroll the new page before the "after" snapshot
     };
 
     // Feature-detect: browsers without view transitions just update
-    if (!document.startViewTransition) {
-      commit();
-      return;
-    }
+    if (!("startViewTransition" in document)) return update();
 
     // Wrap the state update in a view transition
-    const transition = document.startViewTransition(commit);
+    const transition = document.startViewTransition(update);
 
-    // Optionally wait for the animation to complete
+    // Keep the navigation pending until the animation completes
     await transition.finished;
   },
 });
 ```
+
+Three details matter. The fetch happens _before_ `startViewTransition`: while the update callback runs, the browser keeps showing the frozen "before" snapshot, so slow work inside it freezes the page. The update is a transition, not a `flushSync`: Part 2's client routes are `React.lazy`, and a synchronous update that mounts a page whose chunk hasn't loaded yet suspends and shows the nearest Suspense fallback, which then becomes the "after" snapshot. A transition waits for the chunk instead. And `scroll: "manual"`: the default, `"after-transition"`, scrolls when the handler settles, which here is after the animation, so the new page would slide in at the old scroll offset and then jump. Calling `event.scroll()` inside the update scrolls before the browser captures the new page.
 
 The browser automatically creates `::view-transition-old(root)` and `::view-transition-new(root)` pseudo-elements and crossfades between them — that default needs no CSS at all. To change it, you target those pseudo-elements in CSS. For example, a slide instead of a crossfade:
 
@@ -116,26 +106,41 @@ The browser detects that `post-42` exists in both the old and new snapshots, and
 The Navigation API provides navigation direction, which we can use to set transition types:
 
 ```typescript
-event.intercept({
-  async handler() {
-    // Determine direction based on history position
-    const isBack =
-      event.navigationType === "traverse" && event.destination.index < (navigation.currentEntry?.index ?? 0);
+const handleNavigate = (event: NavigateEvent) => {
+  // ...filters and matchRoute, as in Part 22...
 
-    const newData = await fetchRouteData(url, event.signal);
+  // Read the direction *before* intercept(): the handler runs after the
+  // navigation commits, when navigation.currentEntry is already the destination
+  const fromIndex = navigation.currentEntry?.index ?? -1;
+  const isBack = event.navigationType === "traverse" && event.destination.index < fromIndex;
 
-    // Set the transition type — CSS uses this to choose the animation
-    const transition = document.startViewTransition({
-      update: () =>
-        flushSync(() => {
-          setLocation({ pathname: url.pathname, search: url.search });
-          setData(newData);
-        }),
-      types: [isBack ? "slide-backward" : "slide-forward"],
-    });
-    await transition.finished;
-  },
-});
+  event.intercept({
+    scroll: "manual",
+    async handler() {
+      const next = await prepareNavigation(url, match, event.signal);
+      event.signal.throwIfAborted();
+      const update = async () => {
+        await commit(next);
+        event.scroll();
+      };
+
+      if (!("startViewTransition" in document)) return update();
+
+      let transition: ViewTransition;
+      try {
+        // Set the transition type — CSS uses this to choose the animation
+        transition = document.startViewTransition({
+          update,
+          types: [isBack ? "slide-backward" : "slide-forward"],
+        });
+      } catch {
+        // Older engines only accept the callback form and throw on an object
+        transition = document.startViewTransition(update);
+      }
+      await transition.finished;
+    },
+  });
+};
 ```
 
 Types are matched in CSS with the `:active-view-transition-type()` pseudo-class on the document element (the `@view-transition` at-rule doesn't take selectors — it only has `navigation` and `types` descriptors):
@@ -182,6 +187,70 @@ html:active-view-transition-type(slide-backward) {
   }
 }
 ```
+
+### With React's `<ViewTransition>`
+
+[React 19.3](https://react.dev/blog/2026/09/09/react-19-3) made `<ViewTransition>` and `addTransitionType` stable, and for a React framework they replace the hand-rolled code above. React calls `document.startViewTransition` itself for updates inside `startTransition` and for Suspense reveals. Before it takes the "after" snapshot, it waits for suspended content (lazy route chunks included), new stylesheets, fonts and visible images. It also adds every transition type to the browser's view-transition types, so `:active-view-transition-type()` keeps working. Pick one approach, though: React interrupts any view transition it didn't start itself.
+
+The router wraps the route outlet in a `<ViewTransition>`, and Part 22's `commit()` gains an optional type:
+
+```tsx title="packages/eigen/router.tsx"
+import { ViewTransition, addTransitionType } from "react"; // [!code ++]
+
+const commit = (next: RouterState) => // [!code --]
+const commit = (next: RouterState, type?: string) => // [!code ++]
+  new Promise<void>((resolve) => {
+    onCommit.current = resolve;
+    startTransition(() => {
+      if (type) addTransitionType(type); // [!code ++]
+      setState(next);
+    });
+  });
+
+// The handler: no startViewTransition, and scroll stays "after-transition"
+event.intercept({
+  async handler() {
+    const next = await prepareNavigation(url, match, event.signal);
+    event.signal.throwIfAborted();
+    await commit(next, isBack ? "slide-backward" : "slide-forward"); // [!code ++]
+  },
+  focusReset: "after-transition",
+  scroll: "after-transition",
+});
+
+// Router's render: the page area is one view transition boundary
+<Suspense fallback={<div>Loading...</div>}>
+  <ViewTransition default="page"> {/* [!code ++] */}
+    <RouteTree match={match} data={state.data} search={state.search} />
+  </ViewTransition> {/* [!code ++] */}
+</Suspense>;
+```
+
+`isBack` is computed in the `navigate` listener exactly as above. Scroll needs no special handling: React waits for the pending navigation to finish before it measures the new page, so the browser's scroll restoration lands inside the animation. That only works because the handler resolves from a layout effect (Part 22's `useLayoutEffect`). If it waited on a passive `useEffect`, React and the navigation would wait on each other.
+
+`default="page"` gives the boundary the view transition class `page`. The boundary gets its own snapshot, separate from `root`, so the directional rules target the class instead:
+
+```css
+html:active-view-transition-type(slide-forward) {
+  &::view-transition-old(.page) {
+    animation: slide-out-left 300ms ease both;
+  }
+  &::view-transition-new(.page) {
+    animation: slide-in-right 300ms ease both;
+  }
+}
+
+html:active-view-transition-type(slide-backward) {
+  &::view-transition-old(.page) {
+    animation: slide-out-right 300ms ease both;
+  }
+  &::view-transition-new(.page) {
+    animation: slide-in-left 300ms ease both;
+  }
+}
+```
+
+The manual version is still worth knowing: it's what React does under the hood, and it's what a non-React framework writes.
 
 ---
 
@@ -244,19 +313,19 @@ Eagerness levels (Chrome's desktop heuristics): `immediate` (as soon as the rule
 
 ### Choosing per route: intercept or prerender
 
-Eigen lets a route opt out of client-side interception with one export:
+Eigen lets a route opt out of client-side interception with one export. It isn't called `navigation`, because inside the page module that name would shadow the global `navigation` object this part is about:
 
 ```tsx title="src/pages/pricing.tsx"
 // Navigations *to* this page are full document loads: prerendered by
 // Speculation Rules, animated by the cross-document @view-transition rule
-export const navigation = "document";
+export const navigationMode = "document";
 ```
 
-The generated routes module carries it (`navigation: RouteMod${i}.navigation ?? 'intercept'`), and the intercept handler leaves those navigations to the browser:
+The router needs this value before it decides to intercept, but the client routes module only reaches page modules through `React.lazy`. So the route plugin reads the export from the page's source at generation time, with the same regex the speculation-rules generator below uses, and emits a literal in both environments (`navigationMode: 'document'` or `navigationMode: 'intercept'`). The intercept handler leaves those navigations to the browser:
 
 ```typescript
-const match = matchRoute(url.pathname);
-if (!match || match.route.navigation === "document") return; // don't intercept
+const match = matchRoute(url.pathname, routes);
+if (!match || match.route.navigationMode === "document") return; // don't intercept
 ```
 
 Intercepted routes keep using Part 23's data preloading on hover — the SPA equivalent of a prerender.
@@ -275,8 +344,8 @@ import { serializeForScript } from 'eigen/serialize'
 import { discoverRoutes } from './eigen-routes'
 
 transformIndexHtml(html: string) {
-  const documentRoutes = discoverRoutes(pagesDir).filter(r =>
-    /export\s+const\s+navigation\s*=\s*['"]document['"]/.test(readFileSync(resolve(pagesDir, r.file), 'utf-8')),
+  const documentRoutes = discoverRoutes(pagesDir, pagesUrl).filter(r =>
+    /export\s+const\s+navigationMode\s*=\s*['"]document['"]/.test(readFileSync(resolve(pagesDir, r.file), 'utf-8')),
   )
   if (documentRoutes.length === 0) return html
 
@@ -330,7 +399,7 @@ This can be generated by the virtual module — each page's speculation rules ar
 For a document-navigation route, View Transitions and Speculation Rules work together:
 
 1. **User hovers over a link.** Speculation Rules start prerendering the target page in the background.
-2. **User clicks.** The router sees `navigation: 'document'` and doesn't intercept, so the browser performs a normal cross-document navigation.
+2. **User clicks.** The router sees `navigationMode: 'document'` and doesn't intercept, so the browser performs a normal cross-document navigation.
 3. **The browser finds the prerendered page** for that URL.
 4. **The cross-document view transition captures** the old page snapshot (both pages opted in with `@view-transition`).
 5. **The prerendered page activates** (near-instant — it's already rendered).
@@ -338,7 +407,7 @@ For a document-navigation route, View Transitions and Speculation Rules work tog
 
 Total perceived latency: the animation duration (~200ms). Data fetching, rendering, and JavaScript execution happened during the hover — invisible to the user.
 
-For intercepted routes, the same shape comes from Eigen's own pieces: Part 23's hover preload fetches the data, and `document.startViewTransition` animates the same-document update. This is the experience that native apps provide. For document routes, the browser now delivers it without any framework JavaScript for the prerendering step.
+For intercepted routes, the same shape comes from Eigen's own pieces: Part 23's hover preload fetches the data, and React's `<ViewTransition>` animates the same-document update. This is the experience that native apps provide. For document routes, the browser now delivers it without any framework JavaScript for the prerendering step.
 
 ---
 
@@ -368,7 +437,7 @@ Speculation is already conditional on the user's situation, so the framework doe
 
 3. **Open Chrome DevTools → Application → Speculative loads.** You'll see which pages are being prerendered and their status.
 
-4. **Throttle the network to "Slow 3G"** and navigate to a `navigation: 'document'` route. Without speculation rules, you wait for the full page load. With speculation rules on moderate eagerness, the page appears instantly if you hovered for >200ms before clicking. Then do the same for an intercepted route: DevTools shows no prerender for it — Part 23's data preload does that job instead.
+4. **Throttle the network to "Slow 3G"** and navigate to a `navigationMode: 'document'` route. Without speculation rules, you wait for the full page load. With speculation rules on moderate eagerness, the page appears instantly if you hovered for >200ms before clicking. Then do the same for an intercepted route: DevTools shows no prerender for it — Part 23's data preload does that job instead.
 
 5. **Disable JavaScript entirely.** Cross-document view transitions (the CSS `@view-transition` rule) still work — the animation happens between full page loads.
 

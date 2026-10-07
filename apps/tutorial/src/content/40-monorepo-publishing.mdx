@@ -65,6 +65,11 @@ Move the app (`src/`, `index.html`, `vite.config.ts`) into `apps/demo/`. `packag
   "name": "eigen",
   "version": "0.1.0",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/your-org/eigen.git",
+    "directory": "packages/eigen"
+  },
   "scripts": {
     "build": "tsdown",
     "dev": "tsdown --watch",
@@ -93,26 +98,51 @@ Move the app (`src/`, `index.html`, `vite.config.ts`) into `apps/demo/`. `packag
   "bin": {
     "eigen": "./dist/cli/index.js"
   },
-  "files": ["dist", "dist-cjs", "theme.css"],
+  "files": ["dist", "dist-cjs", "typescript-plugin", "theme.css"],
+  "dependencies": {
+    "@vitejs/plugin-react": "^6.1.0",
+    "h3": "^2.0.1",
+    "magic-string": "^1.4.0",
+    "magicast": "^0.5.5",
+    "ws": "^8.22.0"
+  },
   "peerDependencies": {
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "vite": "^8.0.0"
   },
   "devDependencies": {
+    "@types/node": "^26.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@types/ws": "^8.18.0",
     "tsdown": "^0.23.0",
     "typescript": "^6.0.0"
   }
 }
 ```
 
+```json title="packages/eigen/typescript-plugin/package.json"
+{
+  "main": "../dist-cjs/typescript-plugin.cjs"
+}
+```
+
 A few details in that `exports` map matter:
 
-- **The `"./*"` pattern** maps every `eigen/<name>` — including nested ones like `eigen/auth/session` and `eigen/adapters/netlify` — to its built file. Because the build mirrors the source tree one file per module (below), the map is complete by construction: a new module needs no new `exports` entry. Exact keys take precedence over the pattern — which is how `eigen/auth/session` keeps pointing at `auth-session.tsx`, the one alias whose name doesn't match its file path.
+- **The `"./*"` pattern** maps every `eigen/<name>` — including nested ones like `eigen/adapters/netlify` — to its built file. Because the build mirrors the source tree one file per module (below), the map is complete by construction: a new module needs no new `exports` entry. Exact keys take precedence over the pattern. That's how `eigen/auth/session` resolves to `./dist/auth-session.js` (built from `auth-session.tsx`), the one alias whose name doesn't match its file path; the pattern alone would look for `./dist/auth/session.js`.
 - **`"types"` comes first** in every condition object. Conditions are matched in order, and TypeScript stops at the first one it recognizes; `types` after `default` only works by accident (when the `.d.ts` happens to sit next to the `.js`), and tools like [publint](https://publint.dev) flag it.
-- **`./typescript-plugin` is CommonJS-only** (`require`), because `tsserver` loads plugins with `require()` ([Part 39](/39-developer-experience-cli#plugin-structure)).
+- **`./typescript-plugin` is CommonJS-only** (`require`), because `tsserver` loads plugins with `require()` ([Part 39](/39-developer-experience-cli#plugin-structure)). The `exports` entry serves Node and bundlers, but `tsserver` doesn't read it. It resolves plugin names with TypeScript's `node10` resolution, which ignores `exports` and looks for a real `eigen/typescript-plugin` path in the package. The `typescript-plugin/package.json` stub above is that path: its `main` points at the built file, and `"files"` includes the directory so it's published.
 - **`bin`** makes `npx eigen generate ...` from Part 39 work.
-- **Virtual modules aren't exported.** `eigen/routes`, `eigen/server-fns`, and `eigen/styles` are resolved by the `eigen()` plugin's `resolveId` before package resolution happens, so they never reach the `exports` map.
+- **`repository`** has to match the GitHub repository exactly for trusted publishing (below). `directory` tells npm where the package lives inside it.
+- **`dependencies` lists every third-party package the framework imports at run time.** tsdown keeps `dependencies` and `peerDependencies` external and bundles anything else into `dist/`. A native module like `sharp` ([Part 31](/31-image-optimization)) breaks when bundled, and a bundled Vite plugin is a second copy of it. Every bare import in `packages/eigen` belongs in one of the two lists. The block above shows the core ones; add the rest the same way (`sharp`, `jose` from Part 33, the OpenTelemetry packages from Part 20). `publint: true` (below) and a dry-run install in a fresh project catch the misses.
+- **Virtual modules aren't exported**, and they must not resolve through the map. `eigen/routes`, `eigen/server-fns`, `eigen/styles`, and `eigen/client-manifest` look like package subpaths, and the `"./*"` pattern matches them. Vite runs aliases, then `enforce: 'pre'` plugins, then its own resolver, then normal plugins ([Part 7](/07-transform-hook#why-enforce-pre)). A virtual-module plugin without `enforce: 'pre'` is only reached because Vite's resolver maps `eigen/routes` to `./dist/routes.js`, finds no such file, and gives up. That's the catch-all hazard [Part 1](/01-bare-vite-spa) warned about. The server-functions, styles, and client-manifest plugins are already `enforce: 'pre'`; give Part 2's routes plugin the same, so it claims its ID before package resolution runs:
+
+```typescript title="packages/eigen/plugins/eigen-routes.ts"
+  return {
+    name: "eigen-routes",
+    enforce: "pre", // resolve eigen/routes before Vite's package resolver sees it // [!code ++]
+```
 
 <ExportsResolverPlayground />
 
@@ -125,16 +155,24 @@ Update the app's `package.json` to reference the workspace package:
   "name": "eigen-demo",
   "private": true,
   "type": "module",
+  "scripts": {
+    "dev": "tsx server.ts",
+    "build": "vite build",
+    "start": "tsx server.prod.ts"
+  },
   "dependencies": {
     "eigen": "workspace:*",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
   "devDependencies": {
+    "tsx": "^4.0.0",
     "vite": "^8.0.0"
   }
 }
 ```
+
+The scripts are the ones the app has used all along: the custom H3 dev server from [Part 3](/03-server-side-rendering) (plain `vite` doesn't server-render), and `vite build`, which builds both environments since [Part 11](/11-framework-plugin)'s `builder: {}`. `server.ts` and `server.prod.ts` move into `apps/demo/` with the rest of the app. Turborepo (below) runs these scripts, so a package without them has nothing to run.
 
 Then delete the `eigen/*` entries from `resolve.alias` in `vite.config.ts` and from `paths` in `tsconfig.json`. **This is also the moment the config's plugin import changes** from the file path to the package name:
 
@@ -200,6 +238,7 @@ eigen/
       forms.tsx                     # <Form> (Part 38)
       types.ts                      # Public type exports
       typescript-plugin.ts          # tsserver plugin (Part 39) — built as CJS
+      typescript-plugin/package.json # "main" stub so tsserver can find it
       theme.css                     # Tailwind theme (Part 37)
       auth/ adapters/ cli/ plugins/ runtime/ ...
       tsdown.config.ts
@@ -224,6 +263,8 @@ eigen/
       src/
         pages/
       index.html
+      server.ts                     # Dev server (Part 3)
+      server.prod.ts                # Production server (Part 6)
       vite.config.ts
       package.json
 ```
@@ -319,7 +360,7 @@ With multiple packages, you need a task runner that understands the dependency g
 pnpm add -Dw turbo
 ```
 
-Turborepo requires the root `package.json` to declare the package manager:
+Turborepo requires the root `package.json` to declare the package manager, with `packageManager` (used here, and read by `pnpm/action-setup` in CI) or `devEngines.packageManager`:
 
 ```json title="package.json (root)"
 {
@@ -336,7 +377,7 @@ Turborepo requires the root `package.json` to declare the package manager:
 }
 ```
 
-`--filter=eigen-demo...` selects the demo app _and its workspace dependencies_, so `pnpm dev` starts `tsdown --watch` in `packages/eigen` and `vite` in `apps/demo` together. (Filters match package names; a directory filter would be written `--filter=./apps/demo...`.)
+`--filter=eigen-demo...` selects the demo app _and its workspace dependencies_, so `pnpm dev` starts `tsdown --watch` in `packages/eigen` and the demo's dev server (`tsx server.ts`) in `apps/demo` together. (Filters match package names; a directory filter would be written `--filter=./apps/demo...`.)
 
 ```json title="turbo.json"
 {
@@ -500,7 +541,7 @@ cd packages/eigen && pnpm publish --dry-run
 
 This shows exactly what files will be published and the package size. Check for:
 
-- Only `dist/`, `dist-cjs/`, `theme.css`, `package.json`, and the README — no `.ts` sources
+- Only `dist/`, `dist-cjs/`, `typescript-plugin/package.json`, `theme.css`, `package.json`, and the README — no `.ts` sources
 - No test files or fixtures
 - No `.env` or credentials
 - Reasonable package size
@@ -513,9 +554,10 @@ Trusted publishing also generates **provenance** automatically — a signed atte
 
 - npm CLI **11.5.1 or later** and Node **22.14.0 or later** in the publishing job
 - `permissions: id-token: write` in the workflow
+- A `repository.url` in each published `package.json` that exactly matches the GitHub repository (Step 2 adds it to `eigen`; `create-eigen` and `eslint-plugin-eigen` need the same field with their own `directory`). Without it, the publish is rejected.
 - A trusted publisher configured on npmjs.com for each package (package settings → _Trusted Publisher_ → GitHub Actions → owner, repository, and workflow file name, e.g. `release.yml`)
 
-Trusted publishers are configured on a package that already exists, so the very first version of each package is published once by hand (`npm login`, then `pnpm publish` in the package directory). After that, revoke any tokens you created; CI no longer needs one.
+The trusted-publisher settings live on the package's page, so the usual approach is to publish the very first version of each package by hand (`npm login`, then `pnpm publish` in the package directory), then configure the publisher and revoke any tokens you created; CI no longer needs one. Check npm's [trusted publishing docs](https://docs.npmjs.com/trusted-publishers) for the current rules before you rely on that order: a newly created configuration must complete its first publish within two days, or it expires.
 
 ### Scoped vs. unscoped
 
@@ -557,7 +599,7 @@ jobs:
         with:
           node-version: 24
           registry-url: "https://registry.npmjs.org"
-          cache: pnpm
+          # No dependency cache: a poisoned cache entry would end up in what we publish
 
       # Trusted publishing needs npm >= 11.5.1
       - run: npm install -g npm@latest
@@ -574,7 +616,7 @@ jobs:
           pr-title: "chore: release"
 ```
 
-There's no `NPM_TOKEN` secret: the `id-token: write` permission is what authenticates the publish. In the repository settings (_Actions → General_), also allow GitHub Actions to create pull requests, or the action can't open the release PR.
+There's no `NPM_TOKEN` secret: the `id-token: write` permission is what authenticates the publish. The job also skips `setup-node`'s dependency cache, following npm's own example workflow: a release job shouldn't restore state that another workflow run could have written. Builds that don't publish can keep the cache. In the repository settings (_Actions → General_), also allow GitHub Actions to create pull requests, or the action can't open the release PR.
 
 This workflow:
 
@@ -597,16 +639,15 @@ npm install
 npm run dev
 ```
 
-Their `package.json`:
+Their `package.json`. The template ships `server.ts`, and the deployment adapter writes the production server during `vite build` ([Part 17](/17-deployment-adapters)):
 
 ```json title="package.json"
 {
   "name": "my-app",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview"
+    "dev": "tsx server.ts",
+    "build": "vite build"
   },
   "dependencies": {
     "eigen": "^0.2.0",
@@ -614,6 +655,7 @@ Their `package.json`:
     "react-dom": "^19.0.0"
   },
   "devDependencies": {
+    "tsx": "^4.0.0",
     "vite": "^8.0.0",
     "typescript": "^6.0.0",
     "eslint-plugin-eigen": "^0.2.0"

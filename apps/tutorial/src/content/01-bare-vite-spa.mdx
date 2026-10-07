@@ -83,7 +83,7 @@ A few of these settings deserve explanation:
 
 **[`moduleResolution: "Bundler"`](https://www.typescriptlang.org/tsconfig/#moduleResolution)** — This tells TypeScript to use resolution rules that match what a bundler like Vite does. It supports `exports` fields in `package.json`, allows extensionless imports, and handles `import` conditions. Without this, TypeScript might resolve imports differently than Vite, causing phantom type errors or missing types.
 
-**[`isolatedModules: true`](https://www.typescriptlang.org/tsconfig/#isolatedModules)** — Vite transforms each file independently (via [Oxc](https://oxc.rs)), without cross-file type information. This flag tells TypeScript to error on patterns that require cross-file analysis, like `const enum` or `export =`. It keeps your code compatible with Vite's transform model.
+**[`isolatedModules: true`](https://www.typescriptlang.org/tsconfig/#isolatedModules)** — Vite transforms each file independently (via [Oxc](https://oxc.rs)), without cross-file type information. This flag tells TypeScript to error on patterns a single-file transform can't compile correctly, like re-exporting a type without `export type` (the transform can't tell it's a type and would emit a runtime re-export) or using an ambient `const enum` declared in a `.d.ts` file. It keeps your code compatible with Vite's transform model.
 
 **`lib` and `types`** — App code runs in the browser, so it gets the DOM libs. `vite/client` adds Vite's client-side globals (`import.meta.env`, `import.meta.hot`, asset imports). App code also gets Node types, because page modules will soon export loaders that run on the server (see [Part 5](/05-typed-loaders)) — the app zone is _isomorphic_, not browser-only.
 
@@ -119,7 +119,9 @@ No `jsx` setting here — plugins don't contain JSX. No DOM in `lib` — tooling
 
 This dual-tsconfig pattern is standard in Vite projects, but it's worth understanding why. The app code targets the browser (or a browser-like environment), uses JSX, and is transformed by Vite's plugin pipeline. The tooling code targets Node, uses Node APIs like `fs` and `path`, and is executed directly by Vite's config loader (which uses Oxc to transpile `.ts` config files).
 
-If you use a single tsconfig with `jsx: "react-jsx"`, TypeScript won't complain about JSX in your plugins (where it shouldn't appear). If you use a single tsconfig with the DOM libs, TypeScript will happily let a plugin reference `window` or `document` — code that type-checks and then crashes in Node. Two configs keep each zone's type environment honest.
+If you use a single tsconfig with the DOM libs, TypeScript will happily let a plugin reference `window` or `document` — code that type-checks and then crashes in Node. Two configs keep each zone's type environment honest.
+
+There's one catch: tools only pick up `tsconfig.json` by default. `tsc --noEmit` checks the app config alone, and editors only auto-discover files named `tsconfig.json`, so they treat the tooling files as loose files with default settings (DOM included). The way to make the tooling config count is to run it explicitly, which is what the `typecheck` script below does. (Vite's own templates wire the two together with project `references`, but that requires `composite` projects and a solution-style root config; for this series the explicit `-p` is simpler.)
 
 ---
 
@@ -161,6 +163,7 @@ Add scripts to `package.json`:
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json",
     "lint": "oxlint",
     "format": "oxfmt",
     "format:check": "oxfmt --check"
@@ -168,7 +171,7 @@ Add scripts to `package.json`:
 }
 ```
 
-`oxlint` checks for lint errors. `oxfmt` formats all files in place. The `--check` flag makes oxfmt exit with a non-zero code if any file would change, which is useful for CI. Use `oxlint --fix` to auto-fix lint issues.
+`typecheck` runs the type checker once per zone — `tsc` on its own only reads `tsconfig.json`. `oxlint` checks for lint errors. `oxfmt` formats all files in place. The `--check` flag makes oxfmt exit with a non-zero code if any file would change, which is useful for CI. Use `oxlint --fix` to auto-fix lint issues.
 
 If you're using VS Code, install the [oxc extension](https://marketplace.visualstudio.com/items?itemName=oxc.oxc-vscode) for inline lint diagnostics and format-on-save.
 
@@ -201,7 +204,7 @@ This is minimal on purpose. Let's understand what's happening:
 
 - **JSX configuration** — Configures Vite's built-in Oxc transform to compile JSX with React's automatic runtime (`jsx()` calls imported from `react/jsx-runtime`).
 - **Fast Refresh** — Injects HMR boundary code into every React component so that edits hot-reload without losing component state.
-- **Oxc-based transforms** — As of v6, `@vitejs/plugin-react` relies on [Oxc](https://oxc.rs) for React Refresh transforms and no longer depends on Babel; its old `babel` option is gone. If you need Babel plugins (React Compiler, `styled-components`), add [`@rolldown/plugin-babel`](https://www.npmjs.com/package/@rolldown/plugin-babel) alongside it — for React Compiler, with the `reactCompilerPreset()` that `@vitejs/plugin-react` exports.
+- **Oxc-based transforms** — As of v6, `@vitejs/plugin-react` relies on [Oxc](https://oxc.rs) for React Refresh transforms and no longer depends on Babel; its old `babel` option is gone. For React Compiler, the plugin has an experimental native `compiler` option (`react({ compiler: true })`, backed by the Rust port in `oxc-transform-react`). If you need Babel plugins (`styled-components`, or React Compiler via Babel), add [`@rolldown/plugin-babel`](https://www.npmjs.com/package/@rolldown/plugin-babel) alongside it — for React Compiler, with the `reactCompilerPreset()` that `@vitejs/plugin-react` exports.
 
 The `react()` plugin is separate from the framework plugin we'll build. This is by design — in the Vite ecosystem, the UI library plugin (React, Vue, Svelte) and the framework plugin (Next.js-like SSR, routing) are independent. [TanStack Start](https://tanstack.com/start)'s config has the same shape: `plugins: [tanstackStart(), react()]`.
 
@@ -268,12 +271,13 @@ Open the Network tab and reload. You'll see a cascade of requests:
 ```
 index.html              ← The HTML entry point
 /@vite/client           ← HMR client (injected by Vite)
+/@react-refresh         ← Fast Refresh runtime (injected by @vitejs/plugin-react)
 /src/main.tsx           ← Your entry module (transformed TSX → JS)
-/node_modules/.vite/deps/react.js         ← Pre-bundled React
-/node_modules/.vite/deps/react-dom_client.js  ← Pre-bundled ReactDOM
+/node_modules/.vite/deps/react_jsx-dev-runtime.js?v=…  ← Pre-bundled JSX runtime
+/node_modules/.vite/deps/react-dom_client.js?v=…       ← Pre-bundled ReactDOM
 ```
 
-Each of these is a separate HTTP request. There is no bundle. The browser makes an `import` request for `main.tsx`, Vite transforms it and responds, the browser parses the response, finds `import { createRoot } from 'react-dom/client'`, and makes another request. The module graph is walked on demand.
+Each of these is a separate HTTP request. There is no bundle. The browser makes an `import` request for `main.tsx`, Vite transforms it and responds, the browser parses the response, finds `import { createRoot } from 'react-dom/client'` (and the `react/jsx-dev-runtime` import the JSX compiled into), and makes more requests. The module graph is walked on demand.
 
 Click on the `/src/main.tsx` request and look at the response. You'll see transformed JavaScript — the TypeScript types have been stripped, the JSX has been compiled, and there may be HMR-related code injected by `@vitejs/plugin-react`. But it's still clearly your source code, not a bundled artifact.
 
@@ -281,7 +285,7 @@ Click on the `/src/main.tsx` request and look at the response. You'll see transf
 
 When the dev server starts, Vite scans your imports and detects that `react` and `react-dom/client` need to be pre-bundled. It runs Rolldown to convert them from CommonJS (React's default format) to ESM, combining each package's internal files into a single module. The results are cached in `node_modules/.vite/deps/`.
 
-Look at the Network tab paths: the pre-bundled dependencies are served from `/node_modules/.vite/deps/`, not from the original `node_modules/react/` directory. They have a content hash in their cache headers, so the browser caches them aggressively. On subsequent page loads, the browser fetches them from its HTTP cache without contacting the dev server.
+Look at the Network tab paths: the pre-bundled dependencies are served from `/node_modules/.vite/deps/`, not from the original `node_modules/react/` directory. Their URLs carry a version hash (`?v=…`) and are served with `Cache-Control: max-age=31536000, immutable`, so the browser caches them aggressively. On subsequent page loads, the browser fetches them from its HTTP cache without contacting the dev server.
 
 Your own source files in `/src/` are _not_ pre-bundled. They're transformed on the fly for each request. This asymmetry is intentional: dependencies rarely change (so pre-bundling once and caching is efficient), while source files change constantly during development (so they're transformed on demand, cached in memory, and re-transformed only when the file changes).
 
@@ -293,7 +297,11 @@ Edit `src/main.tsx` — change the heading text and save. The browser updates in
 [vite] (client) hmr update /src/main.tsx
 ```
 
-But look closely — you'll also see a **page reload**, not a hot update. That's because `main.tsx` has a side effect (the `createRoot(...).render(...)` call), so React Fast Refresh can't safely hot-replace it. The plugin only injects HMR boundaries into modules that exclusively export React components. When a module doesn't qualify, Vite invalidates it and the update bubbles up to the root, triggering a full reload.
+But look closely — the browser does a **page reload**, not a hot update. That's because `main.tsx` isn't a module Fast Refresh can safely hot-replace: it exports no components and has a side effect (the `createRoot(...).render(...)` call). Vite first sends a hot update, then the Fast Refresh runtime in the browser rejects it and invalidates the module, and that invalidation is what triggers the reload. The terminal shows a second line for it:
+
+```
+[vite] (client) hmr invalidate /src/main.tsx No exports
+```
 
 The reload is fast enough that it looks instant, but the distinction matters. Here's what happened under the hood:
 
@@ -301,9 +309,9 @@ The reload is fast enough that it looks instant, but the distinction matters. He
 
 1. Vite's file watcher detected the save.
 2. Vite found the changed module in the module graph.
-3. Vite walked up the dependency tree looking for an **HMR boundary** — a module that has registered an [`import.meta.hot.accept()`](https://vite.dev/guide/api-hmr#hot-accept) handler.
-4. `@vitejs/plugin-react` injects HMR boundaries into modules that only export React components. `main.tsx` has side effects, so it doesn't qualify.
-5. With no boundary found, Vite fell back to a full page reload.
+3. Vite looked for an **HMR boundary** — a module that has registered an [`import.meta.hot.accept()`](https://vite.dev/guide/api-hmr#hot-accept) handler. `@vitejs/plugin-react` had made `main.tsx` self-accepting at transform time because it declares a component (`App`), so `main.tsx` is its own boundary and Vite sent an `update` over the WebSocket (hence "hmr update").
+4. In the browser, the Fast Refresh runtime ran the new module and checked its exports. It has no exports at all, so there's nothing Fast Refresh can swap, and the runtime called `import.meta.hot.invalidate("No exports")`.
+5. Invalidation propagated to `main.tsx`'s importer, `index.html`, which can't accept updates, so Vite fell back to a full page reload.
 
 In the next part, when we add page components in separate files and import them from `main.tsx`, edits to those components _will_ get true HMR — a hot update with no reload and no state loss. The entry point almost always triggers full reloads, but component modules deeper in the tree get fast, stateful updates.
 
@@ -315,7 +323,7 @@ Notice that Vite _does not_ type-check your code. Try adding a type error to `ma
 const x: number = "this is a string"; // Type error!
 ```
 
-Save the file. The browser still updates — Vite happily strips the types and serves the code. The type error only surfaces if you run `npx tsc --noEmit` separately, or if your editor's TypeScript language server shows it.
+Save the file. The browser still updates — Vite happily strips the types and serves the code. The type error only surfaces if you run `pnpm typecheck` (or `npx tsc --noEmit`) separately, or if your editor's TypeScript language server shows it.
 
 This is by design. Vite uses [Oxc](https://oxc.rs) for TypeScript transformation, and Oxc strips types without checking them. Type checking is a separate, parallel concern. This separation keeps the dev server fast — Oxc transforms TypeScript orders of magnitude faster than `tsc` because it doesn't do type analysis.
 

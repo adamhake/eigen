@@ -44,15 +44,20 @@ import { BudgetSpanProcessor, DEFAULT_BUDGETS } from "./budgets";
 
 let sdk: NodeSDK | undefined;
 
-export function startTelemetry(options: { serviceName: string; dev: boolean }) {
-  if (sdk) return; // configureServer can run again on restart — register once
+export function startTelemetry(options: {
+  serviceName: string;
+  dev: boolean;
+  /** Print spans when no collector is configured. Default: `dev` */
+  printSpans?: boolean;
+}) {
+  if (sdk) return; // configResolved runs again when the dev server restarts — register once
   const spanProcessors: SpanProcessor[] = [];
 
   if (process.env.OTEL_EXPORTER_OTLP_ENDPOINT) {
     // Ship to a collector (Jaeger, Grafana Tempo, Honeycomb, ...). The exporter
     // reads OTEL_EXPORTER_OTLP_ENDPOINT / OTEL_EXPORTER_OTLP_HEADERS itself.
     spanProcessors.push(new BatchSpanProcessor(new OTLPTraceExporter()));
-  } else if (options.dev) {
+  } else if (options.printSpans ?? options.dev) {
     // No collector configured: print each finished span to the terminal
     spanProcessors.push(new SimpleSpanProcessor(new ConsoleSpanExporter()));
   }
@@ -69,17 +74,26 @@ export function startTelemetry(options: { serviceName: string; dev: boolean }) {
   // Trace Context + Baggage propagators
   sdk.start();
 }
+
+/** Flush pending spans and stop the SDK — at the end of `vite build`, or on shutdown */
+export async function shutdownTelemetry() {
+  await sdk?.shutdown();
+  sdk = undefined;
+}
 ```
 
 The context manager matters more than it looks. `startActiveSpan` makes a span "current" for everything that runs inside its callback — including code after an `await` — because `AsyncLocalStorage` carries the context across async boundaries. Without a registered SDK, there is no context manager, and every span would be a parentless root.
 
-In production, the Node server calls `startTelemetry({ serviceName: 'my-app', dev: false })` as its very first import, before it imports the server bundle, so auto-instrumentations (like `@opentelemetry/instrumentation-pg`, passed via NodeSDK's `instrumentations` option) can patch libraries before they load.
+In production, the Node server registers the SDK before it loads the server bundle — `startTelemetry({ serviceName: 'my-app', dev: false })` — so that auto-instrumentations (like `@opentelemetry/instrumentation-pg`, passed via NodeSDK's `instrumentations` option) can patch libraries before they load. Two details decide whether that patching actually happens:
+
+- **The library must stay external.** Instrumentations patch a module when Node loads it _by name_. Part 17's adapters bundle every dependency into `entry-server.js` (`noExternal: true`), and a bundled copy of `pg` is never loaded by name. Keep instrumented libraries external (`environments.ssr.resolve.external: ['pg']`) and list them as dependencies of the deployed `package.json`.
+- **ES modules need a loader hook.** The server is ESM, and patching ES modules requires the `import-in-the-middle` hook to be registered before anything is imported. Calling `startTelemetry()` early in the same module graph is too late. Put the registration — `module.register('@opentelemetry/instrumentation/hook.mjs', import.meta.url)` followed by `startTelemetry()` — in its own file and preload it: `node --import ./instrumentation.mjs server.mjs`.
 
 ---
 
 ## The instrumentation plugin
 
-In development, the plugin starts the SDK and wraps every request in a server span:
+In development, the plugin starts the SDK and opens a SERVER span for each request that Vite's middleware stack handles. Which requests are those? Not page renders: since [Part 12](/12-streaming-ssr#updating-the-dev-server), pages are rendered by the H3 handler in `server.ts`, which runs only after the Vite stack has called its final `next()` — and H3 resumes from its own `await`, outside the context this middleware sets up. What the Vite stack does handle is Eigen's own endpoints: the `/_eigen/data` middleware from [Part 14](/14-framework-middleware#wiring-the-endpoints) and the `/_eigen/fn/*` middleware from [Part 15](/15-server-functions), both registered in `eigen()`'s `configureServer`. Pages get their span from `server.ts` [below](#the-request-span-for-pages).
 
 ```typescript title="packages/eigen/observability.ts"
 import type { Plugin } from "vite";
@@ -90,7 +104,7 @@ import {
   ATTR_URL_PATH,
   ATTR_URL_SCHEME,
 } from "@opentelemetry/semantic-conventions";
-import { startTelemetry } from "./telemetry";
+import { shutdownTelemetry, startTelemetry } from "./telemetry";
 
 // Safe at module scope: the API hands out a proxy tracer that starts
 // recording as soon as startTelemetry() registers a provider
@@ -112,24 +126,29 @@ export default function eigenObservability(options: ObservabilityOptions = {}): 
 
   return {
     name: "eigen-observability",
+    // configureServer hooks run in plugin order: 'pre' registers this
+    // middleware before eigen()'s /_eigen/* middlewares, wherever the
+    // plugin is listed
+    enforce: "pre",
 
     configResolved(config) {
       const dev = config.command === "serve";
       if (dev || options.traceBuild) {
-        startTelemetry({ serviceName: options.serviceName ?? "eigen", dev });
+        // Without OTEL_EXPORTER_OTLP_ENDPOINT, build spans print to the terminal too
+        startTelemetry({ serviceName: options.serviceName ?? "eigen", dev, printSpans: true });
       }
     },
 
     configureServer(server) {
-      // Add tracing middleware BEFORE the framework middleware
-      // (pre-middleware, not post-middleware — we want to wrap everything)
       server.middlewares.use((req, res, next) => {
+        // Eigen's endpoints only: not Vite's module and asset requests
+        if (!req.url?.startsWith("/_eigen/")) return next();
+
         // Extract trace context from incoming headers (W3C Trace Context)
         const parentContext = propagation.extract(context.active(), req.headers);
         const method = req.method ?? "GET";
 
-        // Low-cardinality name; render() refines it to "GET /posts/:id"
-        // once the route is known
+        // Low-cardinality name: the HTTP method
         const span = tracer.startSpan(
           method,
           {
@@ -154,8 +173,9 @@ export default function eigenObservability(options: ObservabilityOptions = {}): 
           span.end();
         });
 
-        // Run downstream handlers with this span as the active span.
-        // AsyncLocalStorage carries it into the SSR render — the ModuleRunner
+        // Run downstream handlers with this span as the active span. Eigen's
+        // middleware is called inside next(), so AsyncLocalStorage carries the
+        // span through its awaits and into loadData/runRoute — the ModuleRunner
         // executes entry-server in this same process.
         context.with(trace.setSpan(parentContext, span), () => next());
       });
@@ -179,6 +199,17 @@ export default function eigenObservability(options: ObservabilityOptions = {}): 
       if (error) span.setStatus({ code: SpanStatusCode.ERROR, message: error.message });
       span.end();
       buildSpans.delete(this.environment.name);
+    },
+
+    buildApp: {
+      // Runs once the environment builds are done (enforce: 'pre' puts it
+      // ahead of SSG and the adapters, whose work isn't traced). The
+      // BatchSpanProcessor holds spans in memory; without a flush,
+      // `vite build` exits before they're exported.
+      order: "post",
+      async handler() {
+        if (options.traceBuild) await shutdownTelemetry();
+      },
     },
   };
 }
@@ -225,81 +256,172 @@ export function traceFunction<A extends unknown[], R>(
 }
 ```
 
-Middleware and loaders both run inside Part 14's `runRoute`, so that's where their spans go — which means the `/_eigen/data` endpoint gets the same spans as the HTML render for free:
+Middleware and loaders both run inside Part 14's `runRoute`, so that's where their spans go — which means the `/_eigen/data` endpoint gets the same spans as the HTML render for free. The body stays Part 14's; each phase is wrapped:
 
 ```typescript title="packages/eigen/run-route.ts"
-import { withSpan } from "./tracing";
+import { withSpan } from "./tracing"; // [!code ++]
 
-export async function runRoute(match: RouteMatch, request: Request): Promise<RunRouteResult> {
-  // ...as in Part 14
-  const allMiddleware = [...globalMiddleware, ...(match.route.middleware ?? [])];
-
-  const { context, response } = await withSpan(
-    "eigen.middleware",
-    { "eigen.middleware.count": allMiddleware.length },
-    () =>
-      executeMiddleware(allMiddleware, {
-        request,
-        params: match.params,
-        pathname: new URL(request.url).pathname,
-      }),
-  );
+export async function runRoute(match: RouteMatch, request: Request): Promise<RouteResult> {
+  const { context, response } = await executeMiddleware([...globalMiddleware, ...(match.route.middleware ?? [])], { // [!code --]
+    request, // [!code --]
+    params: match.params, // [!code --]
+    pathname: new URL(request.url).pathname, // [!code --]
+  }); // [!code --]
+  const middleware = [...globalMiddleware, ...(match.route.middleware ?? [])]; // [!code ++]
+  const { context, response } = await withSpan("eigen.middleware", { "eigen.middleware.count": middleware.length }, () => // [!code ++]
+    executeMiddleware(middleware, { request, params: match.params, pathname: new URL(request.url).pathname }), // [!code ++]
+  ); // [!code ++]
   if (response) return { response };
 
-  let data: unknown = null;
-  if (match.route.loader) {
-    const loader = match.route.loader;
-    data = await withSpan("eigen.loader", { "eigen.route": match.route.path }, () =>
-      loader({ params: match.params, ctx: context }),
-    );
-  }
-  return { data, context };
+  try { // [!code --]
+    return { data: await loadRouteData(match, context), context }; // [!code --]
+  } catch (e) { // [!code --]
+    // Loaders may throw redirect() too // [!code --]
+    if (e instanceof RedirectResponse) return { response: e.toResponse() }; // [!code --]
+    throw e; // [!code --]
+  } // [!code --]
+  // One span for the whole stack: layout and page loaders run in parallel // [!code ++]
+  const loaded = await withSpan("eigen.loader", { "eigen.route": match.route.path }, async () => { // [!code ++]
+    try { // [!code ++]
+      return { data: await loadRouteData(match, context) }; // [!code ++]
+    } catch (e) { // [!code ++]
+      // Loaders may throw redirect() too. Handled inside the span, so a // [!code ++]
+      // redirect isn't recorded as an error. // [!code ++]
+      if (e instanceof RedirectResponse) return { response: e.toResponse() }; // [!code ++]
+      throw e; // [!code ++]
+    } // [!code ++]
+  }); // [!code ++]
+  if ("response" in loaded) return loaded; // [!code ++]
+  return { data: loaded.data, context }; // [!code ++]
 }
 ```
 
-The server entry adds the route-match and render spans, and names the request's server span after the matched route:
+For a per-layout breakdown, wrap each `layout.loader(...)` call inside `loadRouteData` in its own `withSpan` — they're children of `eigen.loader` automatically, because it's the active span.
 
-```tsx title="src/entry-server.tsx"
-import { trace } from "@opentelemetry/api";
-import { ATTR_HTTP_ROUTE } from "@opentelemetry/semantic-conventions";
-import { renderToString } from "react-dom/server";
-import { matchRoute } from "eigen/match-route";
-import { routes } from "eigen/routes";
-import { runRoute } from "eigen/run-route";
-import { withSpan } from "eigen/tracing";
+### The request span for pages
 
-export async function render(request: Request): Promise<RenderResult> {
-  const { pathname } = new URL(request.url);
+Page renders need a SERVER span of their own, opened by whatever hands the `Request` to `renderStream`: the H3 dev server, the Node adapter's server, or the platform. A Web-standard helper does that for any `Request → Response` handler:
 
-  // Span: Route matching
-  const match = await withSpan("eigen.route.match", { "url.path": pathname }, (span) => {
-    const m = matchRoute(pathname, routes);
-    span.setAttribute("eigen.route.matched", !!m);
-    return m;
-  });
-  if (!match) return { html: "<h1>404</h1>", status: 404, data: null };
+```typescript title="packages/eigen/tracing.ts"
+import { trace, SpanStatusCode, type Attributes, type Span } from "@opentelemetry/api"; // [!code --]
+import { context, propagation, trace, SpanKind, SpanStatusCode, type Attributes, type Span } from "@opentelemetry/api"; // [!code ++]
+import { // [!code ++]
+  ATTR_HTTP_REQUEST_METHOD, // [!code ++]
+  ATTR_HTTP_RESPONSE_STATUS_CODE, // [!code ++]
+  ATTR_URL_PATH, // [!code ++]
+  ATTR_URL_SCHEME, // [!code ++]
+} from "@opentelemetry/semantic-conventions"; // [!code ++]
 
-  // The active span here is the request's SERVER span (from the plugin
-  // middleware in dev, or the H3 handler in production). Give it the
-  // low-cardinality route template.
-  const serverSpan = trace.getActiveSpan();
-  serverSpan?.setAttribute(ATTR_HTTP_ROUTE, match.route.path);
-  serverSpan?.updateName(`${request.method} ${match.route.path}`);
-
-  // Spans: middleware chain + loader (inside runRoute)
-  const result = await runRoute(match, request);
-  if ("response" in result) return { response: result.response };
-
-  // Span: React SSR rendering
-  const html = await withSpan("eigen.render.ssr", { "eigen.route": match.route.path }, () =>
-    renderToString(<match.route.component params={match.params} data={result.data} />),
+/** A SERVER span around one Request → Response handler */
+export function traceRequest(request: Request, handler: () => Promise<Response>): Promise<Response> {
+  const url = new URL(request.url);
+  // W3C Trace Context from the incoming headers, if a caller sent one
+  const parentContext = propagation.extract(context.active(), Object.fromEntries(request.headers));
+  const span = tracer.startSpan(
+    request.method, // renderStream renames it to e.g. "GET /posts/:id"
+    {
+      kind: SpanKind.SERVER,
+      attributes: {
+        [ATTR_HTTP_REQUEST_METHOD]: request.method,
+        [ATTR_URL_PATH]: url.pathname,
+        [ATTR_URL_SCHEME]: url.protocol.slice(0, -1),
+      },
+    },
+    parentContext,
   );
 
-  return { html, status: 200, data: result.data };
+  return context.with(trace.setSpan(parentContext, span), async () => {
+    try {
+      const response = await handler();
+      span.setAttribute(ATTR_HTTP_RESPONSE_STATUS_CODE, response.status);
+      if (response.status >= 500) span.setStatus({ code: SpanStatusCode.ERROR });
+      return response;
+    } catch (e) {
+      span.recordException(e instanceof Error ? e : String(e));
+      span.setStatus({ code: SpanStatusCode.ERROR });
+      throw e;
+    } finally {
+      // Ends when the Response is ready — the shell, for a streamed page
+      span.end();
+    }
+  });
 }
 ```
 
-We show `renderToString` for brevity; the real pipeline streams (Part 12). With `renderToPipeableStream`, end the render span in `onShellReady` (time to first byte) and, if you want it, record a second span or event at `onAllReady` for the full stream.
+`handler` runs inside `context.with`, so everything `renderStream` does — `runRoute`'s spans included — nests under the request span. In the dev server from Part 12, load the helper through the same module runner as the server entry and wrap the render:
+
+```typescript title="server.ts"
+      const { renderStream } = (await ssrEnv.runner.import("/src/entry-server.tsx")) as {
+        renderStream: (request: Request, options: StreamOptions) => Promise<Response>;
+      };
+      const { traceRequest } = (await ssrEnv.runner.import("eigen/tracing")) as { // [!code ++]
+        traceRequest: (request: Request, handler: () => Promise<Response>) => Promise<Response>; // [!code ++]
+      }; // [!code ++]
+
+      return await renderStream(event.req, { template, waitForAll: isBot(event.req) }); // [!code --]
+      return await traceRequest(event.req, () => // [!code ++]
+        renderStream(event.req, { template, waitForAll: isBot(event.req) }), // [!code ++]
+      ); // [!code ++]
+```
+
+The server entry adds the route-match and render spans to Part 14's `renderStream`, and names the request's server span after the matched route:
+
+```tsx title="src/entry-server.tsx"
+import { trace } from "@opentelemetry/api"; // [!code ++]
+import { ATTR_HTTP_ROUTE } from "@opentelemetry/semantic-conventions"; // [!code ++]
+import { withSpan } from "eigen/tracing"; // [!code ++]
+
+export async function renderStream(
+  request: Request,
+  { template, waitForAll = false }: StreamOptions,
+): Promise<Response> {
+  const pathname = new URL(request.url).pathname;
+  const match = matchRoute(pathname, routes); // [!code --]
+  const match = await withSpan("eigen.route.match", { "url.path": pathname }, (span) => { // [!code ++]
+    const m = matchRoute(pathname, routes); // [!code ++]
+    span.setAttribute("eigen.route.matched", !!m); // [!code ++]
+    return m; // [!code ++]
+  }); // [!code ++]
+
+  let data: RouteData | null = null;
+  if (match) {
+    // The active span is the request's SERVER span (traceRequest, or the // [!code ++]
+    // platform's). Give it the low-cardinality route template. // [!code ++]
+    const serverSpan = trace.getActiveSpan(); // [!code ++]
+    serverSpan?.setAttribute(ATTR_HTTP_ROUTE, match.route.path); // [!code ++]
+    serverSpan?.updateName(`${request.method} ${match.route.path}`); // [!code ++]
+
+    // Spans: middleware chain + loaders (inside runRoute)
+    const result = await runRoute(match, request);
+    if ("response" in result) return result.response;
+    data = result.data;
+  }
+
+  // ...template split and abort timeout as in Part 12
+
+  let reactStream: ReactDOMServerReadableStream;
+  try {
+    reactStream = await renderToReadableStream(<App pathname={pathname} data={data} />, { // [!code --]
+    // Span: React SSR up to the shell // [!code ++]
+    reactStream = await withSpan("eigen.render.ssr", { "eigen.route": match?.route.path ?? "(none)" }, () => // [!code ++]
+      renderToReadableStream(<App pathname={pathname} data={data} />, { // [!code ++]
+        signal: controller.signal,
+        onError(error) {
+          didError = true;
+          console.error("Streaming SSR error:", error);
+        },
+      }), // [!code ++]
+    ); // [!code ++]
+    }); // [!code --]
+  } catch (error) {
+    // ...the 500 response, unchanged
+  }
+
+  // ...the rest is unchanged from Parts 12–14
+}
+```
+
+`renderToReadableStream` resolves once the shell is ready, so `eigen.render.ssr` measures time to first byte. Suspense boundaries keep streaming after that; to time the full render, start a second span before the call and end it when `reactStream.allReady` resolves.
 
 The resulting trace looks like:
 
@@ -344,8 +466,8 @@ The spans above cover framework code. For code the developer writes — say, exp
 ```typescript
 // In the observability plugin — wrap a page's loader export in a span
 transform(code: string, id: string) {
-  // Only instrument server code
-  if (this.environment.name !== 'ssr') return
+  // Only instrument server code (ssr, and edge from Part 19)
+  if (this.environment.config.consumer !== 'server') return
   if (!id.includes('/src/pages/') || !id.endsWith('.tsx')) return
 
   const declaration = /export\s+(const\s+loader\s*=|(?:async\s+)?function\s+loader\b)/
@@ -385,20 +507,20 @@ Each hosting platform has its own observability stack. Because Eigen's runtime o
 <Tabs items={["Node", "Vercel", "Netlify"]}>
 <Tab value="Node">
 
-The Node adapter's server calls `startTelemetry()` from above before importing the server bundle, and wraps its H3 handler in the same SERVER-span logic as the dev middleware (extract context from `event.req.headers`, `startSpan`, `context.with`, end it once the `Response` is produced). Point it at any OTLP collector with the standard environment variables:
+Part 17's Node adapter doesn't do any of this yet. With tracing enabled, it would need three additions: emit an `instrumentation.mjs` that registers the ESM loader hook and calls `startTelemetry()` (see [above](#two-halves-the-api-and-the-sdk)), add the `@opentelemetry/*` packages to the generated `package.json` (today it lists only `h3`), and wrap the routes in its `server.mjs` template with `traceRequest` — `app.all('/**', (event) => traceRequest(event.req, () => renderStream(...)))`. Then point it at any OTLP collector with the standard environment variables:
 
 ```bash
 OTEL_EXPORTER_OTLP_ENDPOINT=https://collector.example.com \
 OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer ..." \
-node server.js
+node --import ./instrumentation.mjs server.mjs
 ```
 
 </Tab>
 <Tab value="Vercel">
 
-Vercel's package registers the provider and wires traces into Vercel's collector (and from there to trace drains or marketplace integrations). The adapter emits an `instrumentation.ts` that the function imports first:
+Vercel's package registers the provider and wires traces into Vercel's collector (and from there to trace drains or marketplace integrations). Part 17 doesn't build a Vercel adapter; one would emit a compiled `instrumentation.js` next to the function and import it at the top of the function entry, before the server bundle:
 
-```typescript title="instrumentation.ts"
+```typescript title="instrumentation.js"
 import { registerOTel } from "@vercel/otel";
 
 registerOTel({ serviceName: "my-app" });
@@ -426,15 +548,18 @@ The observability plugin sits alongside the adapter in the config:
 ```typescript title="vite.config.ts"
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
-import eigen from "./packages/eigen/plugin"; // a package import from Part 40 on
-import { netlifyAdapter } from "eigen/adapters/netlify";
-import eigenObservability from "eigen/observability";
+// File paths until Part 40 (see Part 11): resolve.alias doesn't apply
+// to vite.config.ts itself
+import eigen from "./packages/eigen/plugin";
+import { netlifyAdapter } from "./packages/eigen/adapters/netlify";
+import eigenObservability from "./packages/eigen/observability";
 
 export default defineConfig({
   plugins: [
     eigen(),
     react(),
     netlifyAdapter(),
+    // enforce: 'pre' — its dev middleware runs first wherever it's listed
     eigenObservability({
       serviceName: "my-app",
       traceBuild: true,
@@ -502,35 +627,34 @@ import {
 } from "@opentelemetry/semantic-conventions";
 
 const meter = metrics.getMeter("eigen");
-const requestCounter = meter.createCounter("eigen.requests", {
-  description: "Total HTTP requests",
-});
-const requestDuration = meter.createHistogram("eigen.request.duration", {
-  description: "Request duration",
-  unit: "ms",
+// The stable HTTP semantic-convention metric: name, unit (seconds) and
+// attributes are what dashboards and backends expect out of the box
+const requestDuration = meter.createHistogram("http.server.request.duration", {
+  description: "Duration of HTTP server requests",
+  unit: "s",
 });
 
 // When the response finishes (same place the server span ends)
-requestCounter.add(1, { [ATTR_HTTP_ROUTE]: route, [ATTR_HTTP_REQUEST_METHOD]: method });
-requestDuration.record(durationMs, {
+requestDuration.record(durationMs / 1000, {
+  [ATTR_HTTP_REQUEST_METHOD]: method,
   [ATTR_HTTP_ROUTE]: route,
-  [ATTR_HTTP_RESPONSE_STATUS_CODE]: res.statusCode,
+  [ATTR_HTTP_RESPONSE_STATUS_CODE]: status,
 });
 ```
 
-Metric attributes follow the same cardinality rule as span names: use the route template, never the raw URL.
+A histogram also counts what it records, so it doubles as the request counter — request rate and error rate are queries over the same metric. Metric attributes follow the same cardinality rule as span names: use the route template, never the raw URL.
 
 ---
 
 ## What to observe
 
-1. **Start the dev server** with observability enabled and no `OTEL_EXPORTER_OTLP_ENDPOINT`. Each finished span is printed to the terminal by the `ConsoleSpanExporter` — match the `parentId` fields to see the hierarchy.
+1. **Start the dev server** with observability enabled and no `OTEL_EXPORTER_OTLP_ENDPOINT`. Each finished span is printed to the terminal by the `ConsoleSpanExporter` — match each span's `parentSpanContext.spanId` to another span's `id` to see the hierarchy.
 
 2. **Add a slow database query** to a loader. The performance budget warning fires immediately in the terminal.
 
 3. **Deploy with an OTEL collector.** Set `OTEL_EXPORTER_OTLP_ENDPOINT` and view traces in Jaeger, Grafana Tempo, or your platform's trace viewer. Each request shows the full breakdown: middleware, loaders, rendering.
 
-4. **Compare two routes** in the trace viewer. A static page without a loader has three child spans (match, middleware, render). A data-heavy page adds the loader span and whatever the loader calls (database queries, `fetch`es) nested beneath it.
+4. **Compare two routes** in the trace viewer. A static page without loaders still has the four phase spans (match, middleware, loader, render), but its `eigen.loader` span is near-instant with nothing beneath it. A data-heavy page's loader span holds whatever the loaders call (database queries, `fetch`es).
 
 5. **Swap `startActiveSpan` for `startSpan`** in `withSpan`. The `pg.query` spans jump out from under `eigen.loader` and attach to the request span — the trace still records them, but you lose the attribution.
 
@@ -538,9 +662,9 @@ Metric attributes follow the same cardinality rule as span names: use the route 
 
 ## Key insight
 
-Framework-level observability instruments the code that the framework _generates_, not the code the developer writes. When the plugin creates a server function endpoint, it wraps it in a span. When the rendering pipeline runs a loader, the loader gets its own span. When middleware runs, the chain is traced.
+Framework-level observability primarily instruments the code that the framework _generates_, not the code the developer writes. When the plugin creates a server function endpoint, it wraps it in a span. When the rendering pipeline runs a loader, the loader gets its own span. When middleware runs, the chain is traced.
 
-This is possible because the framework controls the execution model. The `configureServer` hook wraps the HTTP layer. `runRoute` and the server entry wire up the middleware-loader-render pipeline. The `transform` hook can inject instrumentation into user code. And the adapter decides who registers the SDK for the target platform — because the framework only speaks the OpenTelemetry API, that's the only part that changes.
+This is possible because the framework controls the execution model. The `configureServer` hook and `traceRequest` wrap the HTTP layer. `runRoute` and the server entry wire up the middleware-loader-render pipeline. The `transform` hook can inject instrumentation into user code. And the adapter decides who registers the SDK for the target platform — because the framework only speaks the OpenTelemetry API, that's the only part that changes.
 
 The developer gets end-to-end visibility without writing a single line of instrumentation code. That's the framework's value proposition: it generates both the application infrastructure _and_ the observability for that infrastructure.
 

@@ -54,16 +54,21 @@ export interface RouteMatch {
 }
 
 export function matchRoute(pathname: string, routes: RouteDefinition[]): RouteMatch | null {
+  // '/about/' is the same page as '/about'; '/' stays '/'
+  const path = pathname.replace(/\/+$/, "") || "/";
+
   for (const route of routes) {
-    if (route.path === pathname) return { route, params: {} };
+    if (route.path === path) return { route, params: {} };
 
     const routeParts = route.path.split("/");
-    const pathParts = pathname.split("/");
+    const pathParts = path.split("/");
     if (routeParts.length !== pathParts.length) continue;
 
     const params: Record<string, string> = {};
     const match = routeParts.every((part, i) => {
       if (part.startsWith(":")) {
+        // An empty segment ('/posts//comments') is never a param value
+        if (pathParts[i] === "") return false;
         params[part.slice(1)] = pathParts[i];
         return true;
       }
@@ -75,6 +80,8 @@ export function matchRoute(pathname: string, routes: RouteDefinition[]): RouteMa
   return null;
 }
 ```
+
+It's the same algorithm as the inline version from Part 2, now taking the route table as an argument. Two details keep it from producing nonsense matches: a trailing slash is trimmed first (otherwise `/posts/` would split into `["", "posts", ""]` and match `/posts/:id` with an empty `id`), and a param never matches an empty segment.
 
 <RouteMatcherPlayground mode="basic" />
 
@@ -106,6 +113,8 @@ export function serializeForScript(value: unknown): string {
 
 The output is still valid JSON _and_ a valid JavaScript expression — `\u003c` inside a string literal is just `<` — so `window.__EIGEN_DATA__` receives exactly the original value. Every place Eigen writes JSON into HTML from here on goes through `serializeForScript`.
 
+<ScriptEscapingPlayground />
+
 ## Registering the new modules
 
 `match-route.ts` and `serialize.ts` are new files in `packages/eigen/`, so we need to register them in both TypeScript and Vite's resolution before any file can import them. Add them to the existing `paths` object in `tsconfig.json`:
@@ -115,8 +124,6 @@ The output is still valid JSON _and_ a valid JavaScript expression — `\u003c` 
   "compilerOptions": {
     "paths": {
       "eigen/types": ["./packages/eigen/types.ts"],
-<ScriptEscapingPlayground />
-
       "eigen/match-route": ["./packages/eigen/match-route.ts"], // [!code ++]
       "eigen/serialize": ["./packages/eigen/serialize.ts"] // [!code ++]
     }
@@ -129,8 +136,7 @@ The dev server we're about to write (`server.ts`) also imports `eigen/serialize`
 ```json title="tsconfig.node.json"
 {
   "compilerOptions": {
-    "paths": {
-      // [!code ++]
+    "paths": { // [!code ++]
       "eigen/serialize": ["./packages/eigen/serialize.ts"] // [!code ++]
     } // [!code ++]
   }
@@ -197,7 +203,7 @@ export async function render(pathname: string): Promise<RenderResult> {
 }
 ```
 
-When Vite loads this module through the SSR environment, the `import { routes } from 'eigen/routes'` statement triggers the route plugin's [`load` hook](/00-the-mental-model#the-three-core-hooks). Because `this.environment.name === 'ssr'`, the plugin generates server-side code with static imports and loader references. The `render` function receives a URL pathname, matches it to a route, calls the loader (if present), renders the component to an HTML string via [`renderToString`](https://react.dev/reference/react-dom/server/renderToString), and returns the result alongside the serialized data.
+When Vite loads this module through the SSR environment, the `import { routes } from 'eigen/routes'` statement triggers the route plugin's [`load` hook](/00-the-mental-model#the-three-core-hooks). Because `this.environment.name === 'ssr'`, the plugin generates server-side code with static imports and loader references. The `render` function receives a URL pathname, matches it to a route, calls the loader (if present), renders the component to an HTML string via [`renderToString`](https://react.dev/reference/react-dom/server/renderToString), and returns the HTML alongside the loader data. (Serializing that data for the page is the server's job, below.)
 
 ---
 
@@ -212,14 +218,10 @@ The server needs to inject rendered HTML into `index.html`. Add an SSR outlet ma
     <title>Eigen Framework</title>
   </head>
   <body>
-    <div id="root"></div>
-    <!-- [!code --] -->
-    <div id="root"><!--ssr-outlet--></div>
-    <!-- [!code ++] -->
-    <script type="module" src="/src/main.tsx"></script>
-    <!-- [!code --] -->
-    <script type="module" src="/src/entry-client.tsx"></script>
-    <!-- [!code ++] -->
+    <div id="root"></div> <!-- [!code --] -->
+    <div id="root"><!--ssr-outlet--></div> <!-- [!code ++] -->
+    <script type="module" src="/src/main.tsx"></script> <!-- [!code --] -->
+    <script type="module" src="/src/entry-client.tsx"></script> <!-- [!code ++] -->
   </body>
 </html>
 ```
@@ -326,7 +328,7 @@ start();
 
 ### Why `h3/node`?
 
-We import from [`h3/node`](https://h3.dev/guide/api/h3#node-compatibility) rather than `h3`. H3 is a web-standard framework — its core API uses [`Request`](https://developer.mozilla.org/en-US/docs/Web/API/Request), [`Response`](https://developer.mozilla.org/en-US/docs/Web/API/Response), and [`URL`](https://developer.mozilla.org/en-US/docs/Web/API/URL) — but the dev server is inherently Node-bound because Vite runs on Node. The `h3/node` entry point loads H3's Node.js compatibility layer, which includes `fromNodeHandler` for mounting Vite's [Connect](https://github.com/senchalabs/connect)-based middleware into H3.
+We import from `h3/node` rather than `h3`. H3 is a web-standard framework — its core API uses [`Request`](https://developer.mozilla.org/en-US/docs/Web/API/Request), [`Response`](https://developer.mozilla.org/en-US/docs/Web/API/Response), and [`URL`](https://developer.mozilla.org/en-US/docs/Web/API/URL) — but the dev server is inherently Node-bound because Vite runs on Node. `h3/node` re-exports everything in `h3`, but its `serve` runs the app on Node's `http` server. That's what lets [`fromNodeHandler`](https://h3.dev/guide/basics/handler#from-nodejs-handlers) reach the raw Node `req`/`res` objects that Vite's [Connect](https://github.com/senchalabs/connect)-based middleware expects. (`fromNodeHandler` itself is exported from `h3` too; without a Node server underneath, it has no `req`/`res` to hand over.)
 
 The Node coupling is a dev-server concern. This particular handler still leans on Node and Vite — `readFileSync` for the template, `vite.transformIndexHtml`, and the SSR runner — and none of that ships to production. What _is_ portable is the contract underneath it: `render(pathname)` in `entry-server.tsx` returns plain data, and the handler turns it into a web-standard `Response`. In [Part 6](/06-production-builds), the production server keeps that shape but swaps the Vite calls for a pre-built bundle and a template read once at startup; in [Part 17](/17-deployment-adapters), the same `render` contract is wrapped for Netlify, Vercel, and Cloudflare.
 
@@ -373,7 +375,7 @@ The critical difference from client-side module loading: the runner executes the
 
 ### Typing runner results
 
-`runner.import()` returns `Promise<any>`. Vite can't know the shape of an arbitrary module at compile time — the module could export anything. This is a common friction point when building typed frameworks. There are three approaches:
+`runner.import()` is declared as `import<T = any>(url: string): Promise<T>`, so by default it returns `Promise<any>`. Vite can't know the shape of an arbitrary module at compile time — the module could export anything. This is a common friction point when building typed frameworks. There are four approaches:
 
 **Type assertion at the call site** (what we're doing above):
 
@@ -384,6 +386,16 @@ const { render } = (await ssrEnv.runner.import("/src/entry-server.tsx")) as {
 ```
 
 This is simple and local. The framework controls both the server entry and the call site, so the assertion is safe.
+
+**The generic type parameter:**
+
+```typescript
+const { render } = await ssrEnv.runner.import<{
+  render: (pathname: string) => Promise<RenderResult>;
+}>("/src/entry-server.tsx");
+```
+
+This reads more cleanly than the cast, but it's the same unchecked assertion: nothing verifies that the module really exports `render`.
 
 **A typed wrapper function:**
 
@@ -420,7 +432,7 @@ The call to [`vite.transformIndexHtml(url, template)`](https://vite.dev/guide/ap
 - **Rewriting module URLs** — If the HTML references modules with relative paths, Vite rewrites them to absolute paths that its middleware can intercept.
 - **Running plugin [`transformIndexHtml` hooks](https://vite.dev/guide/api-plugin#transformindexhtml)** — Any plugin that defines this hook gets a chance to modify the HTML. Our framework could use this hook to inject preload hints for route-specific chunks.
 
-In production, `transformIndexHtml` isn't called (there's no dev server). Instead, the HTML is pre-built by `vite build`, and the production server reads the static HTML file. Asset URLs are already rewritten to their hashed production paths.
+In production you don't call `vite.transformIndexHtml()` — there's no dev server to call it on. The plugin `transformIndexHtml` hooks already ran once during `vite build`, which writes the finished HTML; the production server reads that static file, with asset URLs already rewritten to their hashed production paths.
 
 ---
 
@@ -493,10 +505,20 @@ describe("matchRoute", () => {
     const result = matchRoute("/", routes);
     expect(result?.route.path).toBe("/");
   });
+
+  it("ignores a trailing slash", () => {
+    expect(matchRoute("/about/", routes)?.route.path).toBe("/about");
+    expect(matchRoute("/posts/42/", routes)?.params).toEqual({ id: "42" });
+  });
+
+  it("never matches a param against an empty segment", () => {
+    expect(matchRoute("/posts/", routes)).toBeNull();
+    expect(matchRoute("/users//posts/99", routes)).toBeNull();
+  });
 });
 ```
 
-Notice the test for segment count mismatch — without that guard, `/posts/42/comments` would partially match `/posts/:id` and produce wrong results. This is the kind of edge case that tests catch before users do.
+Notice the test for segment count mismatch — without that guard, `/posts/42/comments` would partially match `/posts/:id` and produce wrong results. The empty-segment tests cover the same kind of trap: without the trailing-slash trim and the empty check, `/posts/` would match `/posts/:id` with `id: ""`. These are the edge cases that tests catch before users do.
 
 Run with `pnpm vitest run packages/`.
 
@@ -506,7 +528,7 @@ Run with `pnpm vitest run packages/`.
 
 - [Vite SSR Guide](https://vite.dev/guide/ssr) — The official guide to server-side rendering with Vite, including middleware mode and production builds.
 - [H3 Documentation](https://h3.dev/guide) — H3's guide covering routing, middleware, the event API, and runtime adapters.
-- [React `renderToString`](https://react.dev/reference/react-dom/server/renderToString) — React's server rendering API. Note that React recommends streaming APIs (`renderToPipeableStream`) for production — we'll migrate to streaming in [Part 12](/12-streaming-ssr).
+- [React `renderToString`](https://react.dev/reference/react-dom/server/renderToString) — React's server rendering API. Note that React recommends its streaming APIs for production — we'll migrate to `renderToReadableStream` in [Part 12](/12-streaming-ssr).
 - [Nitro Documentation](https://nitro.build/guide) — The production server toolkit built on H3, worth comparing with the hand-built deployment adapters in [Part 17](/17-deployment-adapters).
 - [Vite JavaScript API](https://vite.dev/guide/api-javascript) — Full reference for `createServer`, `transformIndexHtml`, and other programmatic APIs used in custom dev servers.
 - [Vite Environment API for Frameworks](https://vite.dev/guide/api-environment-frameworks) — `RunnableDevEnvironment`, `isRunnableDevEnvironment`, and `runner.import()`.

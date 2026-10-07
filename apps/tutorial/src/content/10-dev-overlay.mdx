@@ -1,9 +1,9 @@
 ---
 title: "Part 10: Dev Overlay"
-description: "Injecting a diagnostic panel via transformIndexHtml, a WebSocket channel for real-time events, and Shadow DOM isolation."
+description: "Injecting a diagnostic panel via transformIndexHtml, streaming real-time events over Vite's HMR channel, and Shadow DOM isolation."
 concepts:
   - "dev-only code injection"
-  - "WebSocket diagnostics"
+  - "custom HMR events"
   - "Shadow DOM isolation"
   - "zero-cost production removal"
 ---
@@ -27,8 +27,8 @@ The dev overlay surfaces all of this in a unified panel, using the same instrume
 The overlay consists of:
 
 1. **Server collector** — a [`configureServer`](https://vite.dev/guide/api-plugin#configureserver) middleware that captures timing data for each request phase and stores events in a buffer.
-2. **[WebSocket](https://developer.mozilla.org/en-US/docs/Web/API/WebSocket) channel** — the server pushes diagnostic events to the browser in real-time via a dedicated WebSocket at `/_eigen/dev-ws` (separate from Vite's HMR WebSocket, which listens at the server's `base` path using the `vite-hmr` subprotocol).
-3. **Client overlay** — a script injected via [`transformIndexHtml`](https://vite.dev/guide/api-plugin#transformindexhtml) that connects to the WebSocket and renders a floating badge. Rendered inside [Shadow DOM](https://developer.mozilla.org/en-US/docs/Web/API/Web_components/Using_shadow_DOM) to isolate from the application's CSS. Completely absent in production builds because the entire plugin uses `apply: 'serve'`.
+2. **Event channel** — the server pushes diagnostic events to the browser in real time as [custom events](https://vite.dev/guide/api-plugin#client-server-communication) on Vite's own HMR [WebSocket](https://developer.mozilla.org/en-US/docs/Web/API/WebSocket). In our middleware-mode dev server ([Part 3](/03-server-side-rendering#vite-middleware-integration)) that socket is the one Vite opens on port `24678`, and `@vite/client` is already connected to it.
+3. **Client overlay** — a module served by the plugin and loaded by a `<script>` tag that [`transformIndexHtml`](https://vite.dev/guide/api-plugin#transformindexhtml) adds to the page. It listens with `import.meta.hot.on()` and renders a floating badge inside [Shadow DOM](https://developer.mozilla.org/en-US/docs/Web/API/Web_components/Using_shadow_DOM) to isolate it from the application's CSS. None of it ships to production: the plugin uses `apply: 'serve'`, so none of its hooks run during `vite build`.
 
 <DevOverlayChannelDiagram />
 
@@ -38,7 +38,6 @@ The overlay consists of:
 
 ```typescript title="plugins/eigen-dev-overlay.ts"
 import type { Plugin, ViteDevServer } from "vite";
-import { WebSocketServer, WebSocket } from "ws";
 
 interface DevEvent {
   type: string;
@@ -46,47 +45,43 @@ interface DevEvent {
   data: Record<string, unknown>;
 }
 
+// The URL the overlay client is served from, and its virtual module ID
+const CLIENT_URL = "/@eigen/dev-overlay";
+const RESOLVED_CLIENT_ID = "\0eigen-dev-overlay";
+
 export default function eigenDevOverlay(): Plugin {
   const eventBuffer: DevEvent[] = [];
-  const clients = new Set<WebSocket>();
+  let devServer: ViteDevServer | undefined;
 
   function emit(event: DevEvent) {
     eventBuffer.push(event);
     if (eventBuffer.length > 200) eventBuffer.shift();
 
-    const data = JSON.stringify(event);
-    for (const client of clients) {
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(data);
-      }
-    }
+    // Broadcast a custom event on the client environment's hot channel:
+    // the WebSocket @vite/client already holds open for HMR. Custom events
+    // are routed by name, so only `import.meta.hot.on("eigen:dev")` sees them.
+    devServer?.environments.client.hot.send("eigen:dev", event);
   }
-
-  // Expose emit globally so other framework code can instrument
-  (globalThis as any).__eigenDevCollector = { emit };
 
   return {
     name: "eigen-dev-overlay",
-    apply: "serve", // Dev only — completely absent in production
+    apply: "serve", // Dev only: none of these hooks run during `vite build`
+
+    configResolved() {
+      // Expose emit globally so other framework code can instrument.
+      // Set in a hook, not the factory, so it only happens for a dev
+      // server, and before any plugin's configureServer runs.
+      (globalThis as any).__eigenDevCollector = { emit };
+    },
 
     configureServer(server: ViteDevServer) {
-      // Set up the dev diagnostics WebSocket
-      const wss = new WebSocketServer({ noServer: true });
+      devServer = server;
 
-      server.httpServer?.on("upgrade", (req, socket, head) => {
-        if (req.url === "/_eigen/dev-ws") {
-          wss.handleUpgrade(req, socket, head, (ws) => {
-            clients.add(ws);
-            // Send buffered events on connect so the overlay
-            // shows recent history, not just future events
-            for (const event of eventBuffer) {
-              ws.send(JSON.stringify(event));
-            }
-            ws.on("close", () => clients.delete(ws));
-          });
-        }
-        // Other upgrade requests (like Vite's HMR socket, identified by
-        // its `vite-hmr` subprotocol) are left for their own listeners
+      // Each overlay says hello when it loads. Replay the buffer to that
+      // client alone, so it shows recent history (including the SSR request
+      // that produced the page it's running on), not just future events.
+      server.environments.client.hot.on("eigen:dev-hello", (_data, client) => {
+        for (const event of eventBuffer) client.send("eigen:dev", event);
       });
 
       // Instrument the request pipeline
@@ -131,113 +126,136 @@ export default function eigenDevOverlay(): Plugin {
       };
     },
 
-    // Inject the overlay client script into the HTML.
-    // NOTE: This is a long inline script for tutorial clarity.
-    // A production framework would serve this as a virtual module
-    // or a separate file loaded via a <script src="..."> tag.
-    transformIndexHtml(html: string) {
-      const overlayScript = `
-        <script type="module">
-          // Connect to the dev diagnostics WebSocket
-          const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-          const ws = new WebSocket(protocol + '//' + location.host + '/_eigen/dev-ws')
+    // Serve the overlay client as a module. Because it goes through Vite's
+    // transform pipeline like any source file, it gets `import.meta.hot`.
+    resolveId(id) {
+      if (id === CLIENT_URL) return RESOLVED_CLIENT_ID;
+    },
+    load(id) {
+      if (id === RESOLVED_CLIENT_ID) return OVERLAY_CLIENT;
+    },
 
-          const events = []
-          ws.onmessage = (e) => {
-            const event = JSON.parse(e.data)
-            events.push(event)
-            if (events.length > 200) events.shift()
-            renderBadge(events)
-          }
-
-          // Reconnect on disconnect
-          ws.onclose = () => setTimeout(() => location.reload(), 2000)
-
-          function renderBadge(events) {
-            // Find the most recent completed request
-            const last = [...events].reverse().find(e => e.type === 'request:end')
-            if (!last) return
-
-            let overlay = document.getElementById('eigen-dev-overlay')
-            if (!overlay) {
-              overlay = document.createElement('div')
-              overlay.id = 'eigen-dev-overlay'
-              const shadow = overlay.attachShadow({ mode: 'open' })
-              shadow.innerHTML = '<div id="root"></div>'
-              document.body.appendChild(overlay)
-            }
-
-            const root = overlay.shadowRoot.getElementById('root')
-            const status = last.data.statusCode
-            const duration = last.data.duration
-            const color = status < 400 ? '#10b981' : '#ef4444'
-
-            root.innerHTML = \`
-              <div style="
-                position: fixed; bottom: 16px; right: 16px; z-index: 99999;
-                background: #1e1e2e; color: #cdd6f4; border: 1px solid #313244;
-                border-radius: 8px; padding: 8px 14px; font-family: ui-monospace, monospace;
-                font-size: 13px; cursor: pointer; user-select: none;
-                box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-                transition: opacity 0.2s;
-              "
-              onclick="this.nextElementSibling.style.display = this.nextElementSibling.style.display === 'none' ? 'block' : 'none'"
-              title="Click to expand · Alt+Shift+D for console output"
-              >
-                <span style="color: \${color}">● \${status}</span>
-                <span style="color: #a6adc8; margin-left: 8px;">\${duration}ms</span>
-                <span style="color: #585b70; margin-left: 8px; font-size: 11px;">Eigen</span>
-              </div>
-              <div style="
-                display: none; position: fixed; bottom: 56px; right: 16px; z-index: 99999;
-                background: #1e1e2e; color: #cdd6f4; border: 1px solid #313244;
-                border-radius: 8px; padding: 16px; font-family: ui-monospace, monospace;
-                font-size: 12px; width: 420px; max-height: 320px; overflow-y: auto;
-                box-shadow: 0 8px 24px rgba(0,0,0,0.4);
-              ">
-                <div style="color: #a6adc8; margin-bottom: 8px; font-size: 11px; text-transform: uppercase; letter-spacing: 1px;">Recent Requests</div>
-                \${events
-                  .filter(e => e.type === 'request:end')
-                  .slice(-8)
-                  .reverse()
-                  .map(e => {
-                    const s = e.data.statusCode
-                    const c = s < 400 ? '#10b981' : s < 500 ? '#f59e0b' : '#ef4444'
-                    return '<div style="padding: 4px 0; border-bottom: 1px solid #313244;">' +
-                      '<span style="color:' + c + '">' + s + '</span> ' +
-                      '<span style="color: #cdd6f4">' + e.data.url + '</span> ' +
-                      '<span style="color: #585b70; float: right">' + e.data.duration + 'ms</span>' +
-                      '</div>'
-                  }).join('')}
-              </div>
-            \`
-          }
-
-          // Alt+Shift+D: dump detailed events to console
-          document.addEventListener('keydown', (e) => {
-            if (e.altKey && e.shiftKey && e.key === 'D') {
-              console.group('[Eigen Dev] Recent events')
-              console.table(
-                events
-                  .filter(e => e.type === 'request:end')
-                  .slice(-10)
-                  .map(e => ({
-                    url: e.data.url,
-                    status: e.data.statusCode,
-                    duration: e.data.duration + 'ms',
-                  }))
-              )
-              console.log('All events:', events)
-              console.groupEnd()
-            }
-          })
-        </script>
-      `;
-      return html.replace("</body>", `${overlayScript}\n</body>`);
+    // Add a <script> tag for it to the page
+    transformIndexHtml() {
+      return [{ tag: "script", attrs: { type: "module", src: CLIENT_URL }, injectTo: "body" }];
     },
   };
 }
+
+// The overlay client. It's a string here for tutorial clarity; a real
+// framework would ship it as a file in its package and load that instead.
+const OVERLAY_CLIENT = `
+const events = []
+let expanded = false
+// URLs come from arbitrary requests; escape them before they go into innerHTML
+const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) => '&#' + c.charCodeAt(0) + ';')
+
+import.meta.hot.on('eigen:dev', (event) => {
+  events.push(event)
+  if (events.length > 200) events.shift()
+  renderBadge()
+})
+
+// Ask the server for its buffered history. If the HMR socket is still
+// connecting, @vite/client sends this once it's open.
+import.meta.hot.send('eigen:dev-hello')
+
+function renderBadge() {
+  // Find the most recent completed request
+  const last = [...events].reverse().find(e => e.type === 'request:end')
+  if (!last) return
+
+  let overlay = document.getElementById('eigen-dev-overlay')
+  if (!overlay) {
+    overlay = document.createElement('div')
+    overlay.id = 'eigen-dev-overlay'
+    const shadow = overlay.attachShadow({ mode: 'open' })
+    shadow.innerHTML = '<div id="root"></div>'
+    document.body.appendChild(overlay)
+  }
+
+  const root = overlay.shadowRoot.getElementById('root')
+  const status = last.data.statusCode
+  const duration = last.data.duration
+  const color = status < 400 ? '#10b981' : '#ef4444'
+
+  // Re-rendered on every event, so the panel's open/closed state lives
+  // in \`expanded\` rather than in the DOM
+  root.innerHTML = \`
+    <div id="badge" style="
+      position: fixed; bottom: 16px; right: 16px; z-index: 99999;
+      background: #1e1e2e; color: #cdd6f4; border: 1px solid #313244;
+      border-radius: 8px; padding: 8px 14px; font-family: ui-monospace, monospace;
+      font-size: 13px; cursor: pointer; user-select: none;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+      transition: opacity 0.2s;
+    "
+    title="Click to expand · Alt+Shift+D for console output"
+    >
+      <span style="color: \${color}">● \${status}</span>
+      <span style="color: #a6adc8; margin-left: 8px;">\${duration}ms</span>
+      <span style="color: #585b70; margin-left: 8px; font-size: 11px;">Eigen</span>
+    </div>
+    <div style="
+      display: \${expanded ? 'block' : 'none'}; position: fixed; bottom: 56px; right: 16px; z-index: 99999;
+      background: #1e1e2e; color: #cdd6f4; border: 1px solid #313244;
+      border-radius: 8px; padding: 16px; font-family: ui-monospace, monospace;
+      font-size: 12px; width: 420px; max-height: 320px; overflow-y: auto;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    ">
+      <div style="color: #a6adc8; margin-bottom: 8px; font-size: 11px; text-transform: uppercase; letter-spacing: 1px;">Recent Requests</div>
+      \${events
+        .filter(e => e.type === 'request:end')
+        .slice(-8)
+        .reverse()
+        .map(e => {
+          const s = e.data.statusCode
+          const c = s < 400 ? '#10b981' : s < 500 ? '#f59e0b' : '#ef4444'
+          return '<div style="padding: 4px 0; border-bottom: 1px solid #313244;">' +
+            '<span style="color:' + c + '">' + s + '</span> ' +
+            '<span style="color: #cdd6f4">' + escapeHtml(e.data.url) + '</span> ' +
+            '<span style="color: #585b70; float: right">' + e.data.duration + 'ms</span>' +
+            '</div>'
+        }).join('')}
+    </div>
+  \`
+  root.querySelector('#badge').onclick = () => {
+    expanded = !expanded
+    renderBadge()
+  }
+}
+
+// Alt+Shift+D: dump detailed events to console
+document.addEventListener('keydown', (e) => {
+  if (e.altKey && e.shiftKey && e.key === 'D') {
+    console.group('[Eigen Dev] Recent events')
+    console.table(
+      events
+        .filter(e => e.type === 'request:end')
+        .slice(-10)
+        .map(e => ({
+          url: e.data.url,
+          status: e.data.statusCode,
+          duration: e.data.duration + 'ms',
+        }))
+    )
+    console.log('All events:', events)
+    console.groupEnd()
+  }
+})
+`;
 ```
+
+Four hooks cooperate:
+
+- **`configResolved`** publishes `emit` as `globalThis.__eigenDevCollector`. Every plugin's `configResolved` runs before any plugin's `configureServer`, so the collector exists by the time other plugins set up their own servers.
+- **`configureServer`** keeps a reference to the dev server, so `emit` can reach `server.environments.client.hot`, the client environment's hot channel. `hot.send("eigen:dev", event)` broadcasts a `{ type: "custom", event: "eigen:dev", data }` message to every connected browser. It also answers each overlay's `eigen:dev-hello` by replaying the buffer to that one `client`. Then it installs the timing middleware, exactly as before.
+- **`resolveId` / `load`** turn `/@eigen/dev-overlay` into a virtual module, the same trick [Part 2](/02-route-discovery-plugin#plugin-hooks) used for `eigen/routes`. When the browser requests that URL, Vite's transform middleware runs it through the plugin pipeline. Import analysis sees `import.meta.hot` in the code and injects the hot context, as it does for any module.
+- **`transformIndexHtml`** returns a tag descriptor instead of rewriting the HTML string. Vite inserts `<script type="module" src="/@eigen/dev-overlay">` before `</body>`. Our custom server calls `vite.transformIndexHtml()` on every page ([Part 3](/03-server-side-rendering#the-custom-dev-server)), so the tag lands in SSR responses too.
+
+The overlay client doesn't manage a connection at all. `import.meta.hot.on("eigen:dev", …)` subscribes to the custom event, and `import.meta.hot.send("eigen:dev-hello")` goes out over `@vite/client`'s socket (queued until it's open). If the dev server restarts, `@vite/client` notices the closed socket, waits for the server to come back, and reloads the page. The new overlay says hello and gets the buffer again.
+
+The panel's open/closed state lives in the `expanded` variable rather than in the DOM. `renderBadge` rewrites the whole shadow tree on every event, so a `display` toggled on the old element would be lost the moment the next request finished.
 
 ---
 
@@ -258,7 +276,29 @@ export function devEmit(event: DevEvent): void {
 }
 ```
 
-The [`import.meta.env.DEV`](https://vite.dev/guide/env-and-mode#env-variables) check is the near-zero-cost guarantee. In production builds, Vite statically replaces `import.meta.env.DEV` with `false`, so the body becomes `return;` and the minifier drops the rest — including the `__eigenDevCollector` lookup. What remains at each call site is a call to an empty function with an object literal argument. That's cheap enough to sprinkle everywhere. For a hot path where even that matters, guard the call site itself — `if (import.meta.env.DEV) devEmit({ ... })` — and the whole statement, arguments included, is eliminated.
+Register it the same way as the other framework modules:
+
+```json title="tsconfig.json"
+{
+  "compilerOptions": {
+    "paths": {
+      // ...entries from previous parts
+      "eigen/dev": ["./packages/eigen/dev.ts"] // [!code ++]
+    }
+  }
+}
+```
+
+```typescript title="vite.config.ts"
+resolve: {
+  alias: {
+    // ...entries from previous parts
+    'eigen/dev': resolve(__dirname, 'packages/eigen/dev.ts'), // [!code ++]
+  },
+},
+```
+
+The [`import.meta.env.DEV`](https://vite.dev/guide/env-and-mode#env-variables) check is the near-zero-cost guarantee. In production builds, Vite statically replaces `import.meta.env.DEV` with `false`, so the body becomes `return;` and Rolldown's dead-code elimination drops the rest, including the `__eigenDevCollector` lookup. That's the bundler's work, not the minifier's, which matters for the server bundle: SSR builds default to `minify: false`, and the lookup is removed there too. At worst, what remains at a call site is a call to an empty function with its arguments evaluated. (Rolldown usually goes further and drops calls to the empty function whose arguments have no side effects.) That's cheap enough to sprinkle everywhere. For a hot path where even that matters, guard the call site itself — `if (import.meta.env.DEV) devEmit({ ... })` — and the whole statement, arguments included, is eliminated.
 
 <Callout type="warn" title="import.meta.env only exists in code Vite transforms">
   `import.meta.env` is injected by Vite's transform pipeline. Framework runtime code (`eigen/*`, resolved through the
@@ -268,10 +308,10 @@ The [`import.meta.env.DEV`](https://vite.dev/guide/env-and-mode#env-variables) c
   shown [below](#extending-the-overlay-later).
 </Callout>
 
-As we build features in later parts, each will emit events:
+Nothing calls `devEmit` yet. Here is what instrumenting other parts of the framework could look like. Each is a small exercise: add the call to the code from that part and watch the event arrive in the overlay's buffer (`Alt+Shift+D`).
 
 ```typescript
-// In loader execution (Part 5)
+// In runLoader (Part 5)
 const start = performance.now();
 const data = await route.loader({ params });
 const duration = performance.now() - start;
@@ -285,7 +325,7 @@ devEmit({
   },
 });
 
-// In middleware chain (Part 14)
+// In the middleware chain (Part 14)
 devEmit({
   type: "middleware:executed",
   timestamp: Date.now(),
@@ -300,7 +340,7 @@ devEmit({
 });
 ```
 
-Each emitted event flows through the WebSocket to the overlay. The badge updates. The expanded panel shows request history. `Alt+Shift+D` dumps everything to the console. The instrumentation is additive — each new framework feature automatically enriches the dev overlay without changing the overlay plugin itself.
+Each emitted event flows over the hot channel to the overlay, and `Alt+Shift+D` dumps it to the console. (The badge and panel only render `request:end` events; showing the others means extending `renderBadge`.) The instrumentation is additive: a new event type enriches the overlay's data stream without changing the collector or the channel.
 
 ---
 
@@ -320,28 +360,30 @@ This is the same technique browser extensions use for their injected UI. It's al
 
 ---
 
-## The WebSocket channel vs. Vite's HMR WebSocket
+## Why Vite's HMR channel, not a separate WebSocket
 
-Vite already runs a WebSocket for HMR communication — at the dev server's `base` path, distinguished by the `vite-hmr` subprotocol. We use a separate WebSocket at `/_eigen/dev-ws` for three reasons:
+The obvious design is a dedicated WebSocket, say at `/_eigen/dev-ws`, attached to `server.httpServer`'s `upgrade` event. In Eigen's dev server that listener would never run. Vite is in middleware mode ([Part 3](/03-server-side-rendering#vite-middleware-integration)), so `server.httpServer` is `null`. The HTTP server is the one H3's `serve()` creates, and Vite's own HMR socket lives on a separate port (`24678`). A second socket would have to be wired up in `server.ts`, against the Node server `serve()` returns, which puts plugin internals in the app's server file.
 
-1. **Protocol separation.** Vite's HMR WebSocket uses a specific message protocol (`{ type: 'update', ... }`) that the `@vite/client` script processes. Mixing custom diagnostic events into this channel would require the client to distinguish HMR updates from overlay events.
+Vite's hot channel avoids all of that:
 
-2. **Client separation.** Vite's WebSocket client is `@vite/client`, which is injected by `transformIndexHtml`. Our WebSocket client is the overlay script, also injected by `transformIndexHtml`. Each has its own connection and its own message handling.
+1. **Messages are routed by name.** HMR payloads (`update`, `full-reload`, …) and `custom` payloads share the socket, but `@vite/client` only hands a custom event to the `import.meta.hot.on()` listeners for that event name. Overlay events can't be mistaken for HMR updates, and HMR never sees them.
 
-3. **Lifecycle independence.** If the overlay disconnects and reconnects, it shouldn't affect HMR. If HMR restarts (due to config changes), it shouldn't drop diagnostic events.
+2. **It works wherever HMR works.** Middleware mode, a standalone `vite` server, a custom `server.hmr.server`, a proxy in front: Vite already resolved where its socket lives, and the custom events follow it. The plugin needs no `ws` dependency and no `upgrade` wiring.
 
-Both WebSockets share the same HTTP server. Each `upgrade` listener claims only its own connections — Vite's by subprotocol and path, ours by the `/_eigen/dev-ws` path — and ignores the rest.
+3. **Reconnects come for free.** `@vite/client` handles a dropped connection and a restarted server. A hand-rolled socket needs its own retry with back-off; the naive version (`onclose` → `location.reload()`) reloads the page forever when the socket can't connect.
+
+The trade-off is coupling: the overlay's events travel only while HMR is enabled. With `server.hmr: false`, there's no channel and the overlay stays silent. A framework that wants diagnostics independent of HMR would attach its own WebSocket server to the app's HTTP server, which is how [Part 28](/28-realtime-websockets) wires up application WebSockets.
 
 ---
 
 ## Extending the overlay later
 
-This Phase I version of the overlay is deliberately minimal: a badge and a request log. As we build more framework features, the overlay will grow:
+This Phase I version of the overlay is deliberately minimal: a badge and a request log. The later parts of the series don't extend it themselves (only [Part 39](/39-developer-experience-cli#integrating-with-the-dev-overlay) sends its framework diagnostics through the collector), but each one has natural instrumentation points if you want to take it further:
 
-- **Part 14** (Middleware) adds middleware execution spans
-- **Part 15** (Server Functions) adds RPC call logging
-- **Part 20** (Observability) connects the same events to [OpenTelemetry](https://opentelemetry.io) exporters
-- **Part 25** (Cache) adds cache hit/miss tracking
+- **[Part 14](/14-framework-middleware)** (Middleware): a span per middleware, with the context keys it added
+- **[Part 15](/15-server-functions)** (Server Functions): one event per RPC call
+- **[Part 20](/20-observability)** (Observability): the same span boundaries feed [OpenTelemetry](https://opentelemetry.io) exporters, so `devEmit` calls can sit next to them
+- **[Part 25](/25-use-cache)** (Cache): cache hit/miss events
 
 The extensibility point is simple: any code that calls `devEmit()` contributes to the overlay's data stream. The overlay client can be upgraded to show richer visualizations (performance waterfalls, cache inspectors, streaming monitors) as the framework evolves. Third-party plugins can participate too:
 
@@ -371,15 +413,17 @@ Application and framework _runtime_ code — loaders, middleware, server functio
 
 4. **Press `Alt+Shift+D`.** The console shows a formatted table of recent requests, plus the raw event buffer for deeper inspection.
 
-5. **Run `vite build`** and search the production bundle for `__eigenDevCollector`. It's not there. The `apply: 'serve'` on the plugin removes the collector, and the `import.meta.env.DEV` guard empties `devEmit`'s body, so production pays at most an empty function call per instrumentation point.
+5. **Watch the channel.** In DevTools → Network, filter by _WS_ and select the `localhost:24678` connection Vite's client opened. Alongside the HMR `connected` message you'll see the overlay's `eigen:dev-hello` go out and `{"type":"custom","event":"eigen:dev",…}` frames come back, one per request.
 
-6. **Open two browser tabs.** Both connect to the same WebSocket and receive the same events. The overlay is per-tab, but the collector is per-server.
+6. **Check the production build.** Add a `devEmit` call to `runLoader` (the first example above), run `npm run build`, and search both outputs: `grep -r __eigenDevCollector dist/` finds nothing. The client bundle is minified, the server bundle isn't, and the lookup is gone from both because Rolldown removed the code after `if (!false) return;`. The plugin itself left no trace either: with `apply: 'serve'`, none of its hooks ran.
+
+7. **Open two browser tabs.** Both receive the same events over their own HMR connections. The overlay is per-tab, but the collector is per-server.
 
 ---
 
 ## Key insight
 
-The dev overlay demonstrates that DX features are _built from the same Vite primitives_ as the framework itself: `configureServer` for the WebSocket and request instrumentation, `transformIndexHtml` for injecting the client script, and `import.meta.env.DEV` for removing dev-only code from production.
+The dev overlay demonstrates that DX features are _built from the same Vite primitives_ as the framework itself: `configureServer` for request instrumentation and the hot channel, `resolveId`/`load` for serving the client as a virtual module, `transformIndexHtml` for injecting its script tag, and `import.meta.env.DEV` for removing dev-only code from production.
 
 The `devEmit` pattern is the foundation for all framework instrumentation. It's a one-line function call that framework code sprinkles into loaders, middleware, cache wrappers, and server functions. In development, these calls feed a real-time diagnostic stream. In production, they collapse to calls into an empty function (or disappear entirely behind an `if (import.meta.env.DEV)` guard). Same source code, different build output — the same principle that drives everything in Eigen.
 
@@ -389,9 +433,10 @@ The `devEmit` pattern is the foundation for all framework instrumentation. It's 
 
 - [Vite Plugin API: `transformIndexHtml`](https://vite.dev/guide/api-plugin#transformindexhtml) — The hook used to inject the overlay client script into the HTML during development.
 - [Shadow DOM (MDN)](https://developer.mozilla.org/en-US/docs/Web/API/Web_components/Using_shadow_DOM) — How Shadow DOM provides CSS and DOM encapsulation for the overlay.
-- [WebSocket API (MDN)](https://developer.mozilla.org/en-US/docs/Web/API/WebSocket) — The browser API for real-time bidirectional communication with the dev server.
+- [Vite Plugin API: Client-server Communication](https://vite.dev/guide/api-plugin#client-server-communication) — Custom events over the HMR channel: `hot.send()` and `hot.on()` on the server, `import.meta.hot.on()` and `import.meta.hot.send()` in the browser.
+- [WebSocket API (MDN)](https://developer.mozilla.org/en-US/docs/Web/API/WebSocket) — The browser API underneath Vite's HMR channel.
 - [Vite Environment Variables](https://vite.dev/guide/env-and-mode#env-variables) — How `import.meta.env.DEV` lets the build remove dev-only code.
-- [OpenTelemetry](https://opentelemetry.io/docs/) — The observability framework that the `devEmit` pattern connects to in Part 20 for production tracing.
+- [OpenTelemetry](https://opentelemetry.io/docs/) — The observability framework [Part 20](/20-observability) uses for production tracing, and a natural second destination for the same instrumentation points.
 
 ---
 

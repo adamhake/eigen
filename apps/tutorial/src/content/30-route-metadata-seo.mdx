@@ -8,7 +8,9 @@ concepts:
   - "sitemap generation"
 ---
 
-## _In this installment, we add the metadata layer — route-specific `<head>` content, dynamic Open Graph tags, JSON-LD structured data, and build-time generation of sitemaps and robots.txt. This is how frameworks enable SEO without requiring developers to manually manage `<head>` tags._
+_In this installment, we add the metadata layer — route-specific `<head>` content, dynamic Open Graph tags, JSON-LD structured data, and build-time generation of sitemaps and robots.txt. This is how frameworks enable SEO without requiring developers to manually manage `<head>` tags._
+
+---
 
 ## The metadata convention
 
@@ -103,13 +105,70 @@ export type MetadataFn<TPath extends string = string, TData = unknown> = (contex
 
 The second type parameter carries the loader's return type, so `data.title` is checked against what the loader actually returns. Without it, `data` would be `unknown` and every property access would be a type error.
 
+### Reading the exports
+
+The route and layout definitions grow two optional fields:
+
+```typescript title="packages/eigen/types.ts"
+import type { MetadataFn, RouteMetadata } from "./metadata"; // [!code ++]
+
+export interface LayoutDefinition {
+  // ...path, component, loader (Part 13)
+  metadata?: RouteMetadata; // [!code ++]
+}
+
+export interface RouteDefinition {
+  // ...path, component, loader, layouts, middleware, ... (Parts 2–18)
+  metadata?: RouteMetadata; // [!code ++]
+  generateMetadata?: MetadataFn; // [!code ++]
+}
+```
+
+The SSR branch of Part 13's `generateRouteCode` already imports every page and layout as a namespace, so it reads the new exports the same way Part 16 added `generateStaticParams`. A module without them yields `undefined`. The client branch doesn't change: metadata is resolved on the server.
+
+```typescript title="packages/eigen/plugins/route-tree.ts"
+      if (isSSR) {
+        // Server: static namespace import, keep the loader
+        declarations.push(
+          `import * as ${name}Mod from '${node.layout.url}'`,
+          `const ${name} = { path: '${node.layout.path}', component: ${name}Mod.default, loader: ${name}Mod.loader }`, // [!code --]
+          `const ${name} = { path: '${node.layout.path}', component: ${name}Mod.default, loader: ${name}Mod.loader, ` + // [!code ++]
+            `metadata: ${name}Mod.metadata }`, // [!code ++]
+        );
+      }
+// ...
+      if (isSSR) {
+        const mod = `RouteMod${n++}`;
+        declarations.push(`import * as ${mod} from '${page.url}'`);
+        routes.push(
+          `  { path: '${page.path}', component: ${mod}.default, loader: ${mod}.loader, ` +
+            `middleware: ${mod}.middleware, generateStaticParams: ${mod}.generateStaticParams, ` +
+            `staticGeneration: ${mod}.staticGeneration, layouts: ${layouts} }`, // [!code --]
+            `staticGeneration: ${mod}.staticGeneration, metadata: ${mod}.metadata, ` + // [!code ++]
+            `generateMetadata: ${mod}.generateMetadata, layouts: ${layouts} }`, // [!code ++]
+        );
+      }
+```
+
+(Keep any fields other parts added to the page entry, such as Part 18's `parse`.)
+
 ---
 
 ## Head injection via `transformIndexHtml` and SSR
 
 ### A placeholder in the template
 
-The plugin uses `transformIndexHtml` to put a marker into `<head>` where per-route tags will go. It goes right after the template's existing `<meta charset>` and viewport tags (the charset declaration must stay within the first 1024 bytes of the document, so we never append it at the end of `<head>`):
+Part 3's `index.html` has only a fixed `<title>`. Give it the charset and viewport tags every page needs, and drop the `<title>`: routes now provide it, and a second `<title>` in the same document is invalid (browsers use the first one, so the template's would win). Set a site-wide default title in the root layout's `metadata` instead (see the merge example below).
+
+```html title="index.html"
+<head>
+  <title>Eigen Framework</title> <!-- [!code --] -->
+  <meta charset="utf-8" /> <!-- [!code ++] -->
+  <meta name="viewport" content="width=device-width, initial-scale=1" /> <!-- [!code ++] -->
+</head>
+```
+
+The plugin uses `transformIndexHtml` to put a marker into `<head>` where per-route tags will go. It goes right after those `<meta>` tags (the charset declaration must stay within the first 1024 bytes of the document, so we never append it at the end of `<head>`):
 
 ```typescript
 transformIndexHtml(html) {
@@ -127,44 +186,49 @@ transformIndexHtml(html) {
 
 Both static `metadata` and `generateMetadata` are resolved per request by the SSR pipeline: after middleware and the loader (via `runRoute` from Part 14), and before any HTML is sent. `RenderResult` gains a `head` field for the tags:
 
-```typescript title="entry-server.tsx"
+```tsx title="src/entry-server.tsx"
 import { renderToString } from 'react-dom/server'
 import { serializeForScript } from 'eigen/serialize'
 import { matchRoute, type RouteMatch } from 'eigen/match-route'
 import { routes } from 'eigen/routes'
 import { runRoute } from 'eigen/run-route'
+import { resolveRouteData, type RouteData } from 'eigen/route-data'
 import type { RouteMetadata } from 'eigen/metadata'
 
 export type RenderResult =
   | { response: Response }
-  | { html: string; status: number; data: unknown; head: string }
+  | { html: string; status: number; data: RouteData | null; head: string }
 
 export async function render(request: Request): Promise<RenderResult> {
   const { pathname } = new URL(request.url)
   const match = matchRoute(pathname, routes)
-  if (!match) return { html: '<h1>404</h1>', status: 404, data: null, head: '' }
+  if (!match) {
+    return { html: renderToString(<App pathname={pathname} data={null} />), status: 404, data: null, head: '' }
+  }
 
-  // Middleware + loader (Part 14). A redirect or auth failure short-circuits.
+  // Middleware + loaders (Part 14). A redirect or auth failure short-circuits.
   const result = await runRoute(match, request)
-  if ('response' in result) return { response: result.response }
-  const { data } = result
+  if ('response' in result) return result
+  // runRoute's RouteData still holds deferred promises; generateMetadata needs values
+  const data = await resolveRouteData(result.data)
 
-  // Layout metadata first (outermost → innermost), then the page on top
-  const meta = await resolveMetadata(match, { params: match.params, data, pathname })
+  // Layout metadata first (outermost → innermost), then the page on top.
+  // generateMetadata describes the page, so it gets the page loader's data.
+  const meta = await resolveMetadata(match, { params: match.params, data: data.page, pathname })
   const head = renderMetadataToHTML(meta)
 
   // Shown with renderToString for brevity — the real pipeline streams (Part 12).
   // Metadata must be resolved before the shell is flushed, because <head> is in the shell.
-  const html = renderToString(<App match={match} data={data} />)
+  const html = renderToString(<App pathname={pathname} data={data} />)
   return { html, status: 200, data, head }
 }
 
-async function resolveMetadata(
+export async function resolveMetadata(
   match: RouteMatch,
   context: { params: Record<string, string>; data: unknown; pathname: string },
 ): Promise<RouteMetadata> {
   let merged: RouteMetadata = {}
-  for (const layout of match.layouts) {
+  for (const layout of match.route.layouts) {
     if (layout.metadata) merged = deepMerge(merged, layout.metadata)
   }
   const page = match.route.generateMetadata
@@ -174,8 +238,8 @@ async function resolveMetadata(
 }
 
 /** Plain-object deep merge: child values win; arrays are replaced, not concatenated */
-function deepMerge<T extends Record<string, unknown>>(parent: T, child: T): T {
-  const out: Record<string, unknown> = { ...parent }
+function deepMerge<T extends object>(parent: T, child: Partial<T>): T {
+  const out = { ...parent } as Record<string, unknown>
   for (const [key, value] of Object.entries(child)) {
     const prev = out[key]
     out[key] =
@@ -271,11 +335,54 @@ The server replaces the placeholder with these tags:
 const result = await render(request);
 if ("response" in result) return result.response;
 
-const finalHtml = template.replace("<!--eigen-head-->", result.head).replace("<!--ssr-outlet-->", result.html);
+// Replacer functions: a string replacement would expand `$&`, `$'` etc.,
+// so a post titled "Save $' today" would splice the template into <head>
+const finalHtml = template
+  .replace("<!--eigen-head-->", () => result.head)
+  .replace("<!--ssr-outlet-->", () => result.html);
 ```
 
+### Client-side navigations
+
+The tags above are rendered once, into the HTML of the first request. After that, Part 22's router swaps pages without loading HTML, so `document.title` would keep the first page's value. Crawlers and link-preview bots always fetch the full HTML, so the OG, canonical and JSON-LD tags only matter there; the title is the one tag a user sees change. The data endpoint resolves it alongside the data:
+
+```typescript title="packages/eigen/route-data.ts"
+export interface RouteData {
+  layouts: Record<string, unknown>;
+  page: unknown;
+  /** The resolved metadata title, on /_eigen/data responses */ // [!code ++]
+  title?: string; // [!code ++]
+}
+```
+
+```tsx title="src/entry-server.tsx"
+export async function loadData(request: Request): Promise<Response> {
+  // ...match and runRoute as in Part 14
+  if ("response" in result) return asClientRedirect(result.response);
+  return Response.json(await resolveRouteData(result.data)); // [!code --]
+  const data = await resolveRouteData(result.data); // [!code ++]
+  const meta = await resolveMetadata(match, { // [!code ++]
+    params: match.params, // [!code ++]
+    data: data.page, // [!code ++]
+    pathname: new URL(pathname, url).pathname, // `pathname` may carry Part 23's query string // [!code ++]
+  }); // [!code ++]
+  return Response.json({ ...data, title: meta.title } satisfies RouteData); // [!code ++]
+}
+```
+
+The response flows through the router unchanged (including Part 23's preload cache), and one effect in the `Router` component applies it after each navigation (import `useEffect` and the `RouteData` type):
+
+```tsx title="packages/eigen/router.tsx"
+useEffect(() => { // [!code ++]
+  const title = (state.data as RouteData | null)?.title; // [!code ++]
+  if (title) document.title = title; // [!code ++]
+}, [state.data]); // [!code ++]
+```
+
+The initial page's data has no `title` (its `<title>` is already in the HTML), so the effect does nothing on hydration.
+
 <Callout title="What about React 19's <title> and <meta> hoisting?">
-React 19 hoists `<title>`, `<meta>` and `<link>` elements rendered anywhere in the component tree into `<head>`. That works well for client-side navigations, but a route-level convention still earns its place: metadata is resolved from loader data *before* the streamed shell is flushed, parent and child values are merged deterministically instead of producing duplicate tags, and build tools (sitemaps, SSG) can read it without rendering. If you also render `<title>` in a component, React's hoisted tag and the framework's tag will both appear — pick one source per tag.
+React 19 hoists `<title>`, `<meta>` and `<link>` elements rendered anywhere in the component tree into `<head>`, and keeps them in sync on client-side navigations. A route-level convention still earns its place: metadata is resolved from loader data *before* the streamed shell is flushed, parent and child values are merged deterministically instead of producing duplicate tags, and build tools (sitemaps, SSG) can read it without rendering. If you also render `<title>` in a component, React's hoisted tag and the framework's tag will both appear — pick one source per tag.
 </Callout>
 
 ---
@@ -324,6 +431,8 @@ function escapeXml(str: string): string {
 
 async function generateSitemap(routes: DiscoveredRoute[], baseUrl: string): Promise<string> {
   const entries: string[] = [];
+  // baseUrl must be an origin ("https://myblog.com"): new URL("/posts/1", "https://x.com/blog")
+  // resolves to https://x.com/posts/1 and drops the /blog prefix
   const addUrl = (path: string) => entries.push(`  <url><loc>${escapeXml(new URL(path, baseUrl).href)}</loc></url>`);
 
   for (const route of routes) {
@@ -373,6 +482,7 @@ With nested layouts (Part 13), metadata from parent layouts merges with child pa
 ```typescript
 // src/pages/layout.tsx — root layout metadata (layouts export static metadata)
 export const metadata: RouteMetadata = {
+  title: "My Blog", // Default for pages that set no title
   openGraph: { siteName: "My Blog", locale: "en_US" },
   twitter: { card: "summary_large_image" },
 };
@@ -388,16 +498,16 @@ export const generateMetadata: MetadataFn<"/posts/:id", PostData> = async ({ dat
 
 The merge is the `deepMerge` in `resolveMetadata` above — child properties override parent properties, parent properties that the child doesn't set are preserved, and arrays (like `openGraph.images`) are replaced rather than concatenated. Layouts export static `metadata`; only pages use `generateMetadata`, because the page loader's data is what the metadata describes.
 
+<MetadataMergePlayground />
+
 ---
 
 ## Key insight
 
-Metadata is a route-level concern that the framework orchestrates. The generated routes module (Part 2) reads `metadata` and `generateMetadata` as optional namespace exports, the SSR pipeline calls `generateMetadata` with loader data (no double-fetching), and the build system generates sitemaps from the route tree. The developer writes metadata as typed objects; the framework renders them to HTML tags, injects them into `<head>`, and generates the SEO artifacts.
+Metadata is a route-level concern that the framework orchestrates. The generated routes module (Parts 2 and 13) reads `metadata` and `generateMetadata` as optional namespace exports, the SSR pipeline calls `generateMetadata` with loader data (no double-fetching), and the build system generates sitemaps from the route tree. The developer writes metadata as typed objects; the framework renders them to HTML tags, injects them into `<head>`, and generates the SEO artifacts.
 
 ---
 
 ## What's next
 
 The next module covers **image optimization** — responsive images, format conversion, blur placeholders, and CDN/DAM integration with services like Cloudinary.
-<MetadataMergePlayground />
-

@@ -38,10 +38,12 @@ export interface RouteSegment {
 
 export interface CompiledRoute {
   path: string;
-  segments: RouteSegment[];
+  segments: RouteSegment[]; // NEW
   component: React.ComponentType<any>;
-  loader?: (args: any) => unknown;
-  searchSchema: import("zod").ZodType | null;
+  /** NEW: the page's `searchParams` schema, loaded on demand (see below) */
+  loadSearchSchema: () => Promise<import("zod").ZodType | null>;
+  // ...plus the fields earlier parts added: loader, middleware, parse,
+  // layouts, generateStaticParams, staticGeneration
 }
 
 /** Parse a route path ('/docs/:slug*', '/users/:id?') into typed segments */
@@ -78,7 +80,14 @@ export function matchRoute(
   pathname: string,
   compiledRoutes: CompiledRoute[],
 ): { route: CompiledRoute; params: Record<string, string> } | null {
-  const pathSegments = pathname.split("/").filter(Boolean).map(decodeURIComponent);
+  let pathSegments: string[];
+  try {
+    pathSegments = pathname.split("/").filter(Boolean).map(decodeURIComponent);
+  } catch {
+    // A malformed escape ('/posts/%E0%A4') makes decodeURIComponent throw
+    // a URIError. No route can match it: report a 404 instead of a 500.
+    return null;
+  }
 
   // Routes are pre-sorted most-specific-first, so the first match wins
   for (const route of compiledRoutes) {
@@ -129,28 +138,27 @@ Optional segments are only allowed in the last position — the route plugin rej
 
 ### Route compilation in the virtual module
 
-The route plugin pre-compiles and sorts routes at code generation time, not at runtime. The generated module is code, not data — components and loaders are module references, so we can't `JSON.stringify` the route objects (functions would silently disappear). Only the segments are serialized; everything else is emitted as expressions:
+The route plugin pre-compiles and sorts routes at code generation time, not at runtime. The generated module is code, not data — components and loaders are module references, so we can't `JSON.stringify` the route objects (functions would silently disappear). Only the segments are serialized; everything else is emitted as expressions.
 
-```typescript
-// In the load() hook
+This isn't a new generator. Both per-environment branches keep everything they emit today (the client's `React.lazy` components, the server's namespace imports with `loader`, `middleware`, `parse`, `layouts`, `generateStaticParams` and `staticGeneration`); they sort the route list first and gain two fields per entry. The snippet shows only that change:
+
+```typescript title="packages/eigen/plugins/eigen-routes.ts (change)"
+// In the load() hook, before either branch builds its entries
 const compiled = routes
   .map((r, i) => ({ r, i, segments: compileRoute(r.path) }))
   .sort((a, b) => compareRoutes(a.segments, b.segments));
 
-const imports = routes.map((r, i) => `import * as RouteMod${i} from ${JSON.stringify(r.componentPath)}`);
-
-const entries = compiled.map(
-  ({ r, i, segments }) => `  {
-    path: ${JSON.stringify(r.path)},
-    segments: ${JSON.stringify(segments)},
-    component: RouteMod${i}.default,
-    loader: RouteMod${i}.loader,
-    searchSchema: RouteMod${i}.searchParams ?? null,
-  }`,
-);
-
-return `${imports.join("\n")}\n\nexport const routes = [\n${entries.join(",\n")}\n]`;
+// Each branch now maps over `compiled` instead of `routes`, and adds:
+const newFields = ({ r, i, segments }: (typeof compiled)[number]) =>
+  `segments: ${JSON.stringify(segments)}, ` +
+  (isClient
+    ? // The same dynamic import React.lazy uses: no extra chunk, and the
+      // page stays code-split
+      `loadSearchSchema: () => import(${JSON.stringify(r.componentPath)}).then((m) => m.searchParams ?? null)`
+    : `loadSearchSchema: async () => RouteMod${i}.searchParams ?? null`);
 ```
+
+(`isClient` is the existing `this.environment.name === "client"` check.)
 
 Now `/posts/new` always matches before `/posts/:id`: the first segments tie (both static), and at the second segment static (`new`) outranks dynamic (`:id`).
 
@@ -244,9 +252,9 @@ export default function ProductsPage({ data, search }: PageProps<"/products"> & 
 
 ### Parsing search params in the router
 
-The route plugin reads the optional `searchParams` export through the same namespace import as everything else — that's the `searchSchema: RouteMod${i}.searchParams ?? null` line in the generated routes module above. Part 7's client-stripping transform removes `loader` but leaves `searchParams` alone, so the schema ships to the browser, where the router needs it.
+The route plugin exposes the optional `searchParams` export as `loadSearchSchema()`, the line generated above. On the server it reads the namespace import. On the client it can't: a static import of the page module would pull every page into the entry chunk and undo Part 2's code splitting, so the schema arrives with the page's own lazy chunk. Part 7's client-stripping transform removes `loader` but leaves `searchParams` alone, so the schema is in that chunk. Since the router has to load the page chunk to render it anyway, awaiting the schema in the intercept handler costs nothing extra.
 
-One shared function parses and validates search params — the router calls it on every navigation, and `runRoute` (Part 14) calls it on the server with `new URL(request.url)` before invoking the loader, passing the result as a third loader argument, `search`, next to `params` and `ctx`:
+One shared function parses and validates search params — the router calls it on every navigation, and `runRoute` (Part 14) calls it on the server with `new URL(request.url)` and `await match.route.loadSearchSchema()` before invoking the loader, passing the result as a third loader argument, `search`, next to `params` and `ctx`:
 
 ```typescript title="packages/eigen/router/search.ts"
 import type { z } from "zod";
@@ -268,7 +276,7 @@ export function parseSearchParams(url: URL, schema: z.ZodType | null): Record<st
 }
 ```
 
-Because the loader now depends on the query string, the client must send it too: the `/_eigen/data` request from Part 22's intercept handler uses `path=${encodeURIComponent(url.pathname + url.search)}`, and the data endpoint builds its `Request` from that full path.
+Because the loader now depends on the query string, the client must send it too. Part 22's intercept handler sent only `url.pathname`; it now sends `path=${encodeURIComponent(url.pathname + url.search)}` (shown below), and the data endpoint builds its `Request` from that full path.
 
 ### Type-safe navigation with search params
 
@@ -370,24 +378,34 @@ src/pages/
 ├── users/[[id]].tsx        → /users/:id?  (optional param)
 ```
 
-Part 2's `fileToRoute` only knows `[name]`, so it gains two replacements that run _before_ the plain-param one (otherwise `[[id]]` would become `[:id]`):
+Part 2's `fileToRoute` converts the filename one segment at a time and only knows `[name]`. Its `.map` gains two checks before the plain-param one. Each returns early, so a param segment never reaches the lowercasing of static segments, and `[...userId]` keeps its casing as `:userId*`:
 
-```typescript
-const name = filename
-  .replace(/\.tsx$/, "")
-  .replace(/\[\.\.\.(\w+)\]/g, (_, p: string) => {
-    paramNames.push(p);
-    return `:${p}*`;
-  })
-  .replace(/\[\[(\w+)\]\]/g, (_, p: string) => {
-    paramNames.push(p);
-    return `:${p}?`;
-  })
-  .replace(/\[(\w+)\]/g, (_, p: string) => {
-    paramNames.push(p);
-    return `:${p}`;
-  });
+```typescript title="packages/eigen/plugins/eigen-routes.ts"
+    .map((segment) => {
+      // [...slug] → :slug* (catch-all) // [!code ++]
+      const catchAll = /^\[\.\.\.(\w+)\]$/.exec(segment); // [!code ++]
+      if (catchAll) { // [!code ++]
+        paramNames.push(catchAll[1]); // [!code ++]
+        return `:${catchAll[1]}*`; // [!code ++]
+      } // [!code ++]
+      // [[id]] → :id? (optional) // [!code ++]
+      const optional = /^\[\[(\w+)\]\]$/.exec(segment); // [!code ++]
+      if (optional) { // [!code ++]
+        paramNames.push(optional[1]); // [!code ++]
+        return `:${optional[1]}?`; // [!code ++]
+      } // [!code ++]
+      // [id] → :id — param names keep their exact casing
+      const param = /^\[(\w+)\]$/.exec(segment);
+      if (param) {
+        paramNames.push(param[1]);
+        return `:${param[1]}`;
+      }
+      // Static segments are lowercased: About.tsx → /about
+      return segment.toLowerCase();
+    });
 ```
+
+The regexes are anchored to the whole segment, so `[[id]]` can't be half-matched as `[` + `[id]` + `]`.
 
 The virtual module generates the appropriate segments:
 
@@ -415,6 +433,8 @@ The param types reflect this. The declaration generator writes these entries fro
 '/users/:id?': { id?: string }    // undefined if visiting /users
 ```
 
+<RouteMatcherPlayground mode="ranked" />
+
 ---
 
 ## Route preloading
@@ -433,12 +453,18 @@ export function preloadRoute(href: string): void {
     return res.json();
   });
 
+  // Only ever remove *this* preload: by the time a timer fires, the entry
+  // may have been taken and replaced by a newer preload of the same href
+  const forget = () => {
+    if (preloadCache.get(href) === promise) preloadCache.delete(href);
+  };
+
   // A failed preload must not poison the cache — the click will refetch
-  promise.catch(() => preloadCache.delete(href));
+  promise.catch(forget);
   preloadCache.set(href, promise);
 
   // Clear after 30 seconds (stale data)
-  setTimeout(() => preloadCache.delete(href), 30_000);
+  setTimeout(forget, 30_000);
 }
 
 /** Take (and remove) a preloaded result, so each preload is used at most once */
@@ -449,26 +475,51 @@ export function takePreloadedData(href: string): Promise<unknown> | undefined {
 }
 ```
 
-Preloading only helps if navigation _uses_ the preloaded data. The intercept handler from Part 22 checks the cache before going to the network:
+Preloading only helps if navigation _uses_ the preloaded data. The router gathers everything a navigation needs in one helper, which checks the cache before going to the network:
+
+```typescript title="packages/eigen/router.tsx"
+import type { RouteMatch } from "eigen/match-route";
+import { takePreloadedData } from "./router/preload";
+import { parseSearchParams } from "./router/search";
+
+interface RouterState {
+  pathname: string;
+  search: Record<string, unknown>; // NEW: parsed, passed to the page as its `search` prop
+  data: RouteData | null;
+}
+
+/** Data and search params for a navigation, ready to commit */
+async function prepareNavigation(url: URL, match: RouteMatch, signal: AbortSignal): Promise<RouterState> {
+  const href = url.pathname + url.search;
+  const preloaded = takePreloadedData(href);
+  const [json, schema] = await Promise.all([
+    // A preload that fails after it was taken falls back to the network
+    preloaded ? preloaded.catch(() => fetchRouteData(href, signal)) : fetchRouteData(href, signal),
+    match.route.loadSearchSchema(),
+  ]);
+  return {
+    pathname: url.pathname,
+    search: parseSearchParams(url, schema),
+    data: parseRouteData(match, json) as RouteData | null, // Part 18
+  };
+}
+```
+
+The intercept handler from Part 22 shrinks to three lines; the filters, `fetchRouteData`'s `res.ok` check and the wait for React's commit are unchanged:
 
 ```typescript title="packages/eigen/router.tsx (intercept handler)"
 event.intercept({
   async handler() {
-    const href = url.pathname + url.search;
-    const newData = await (takePreloadedData(href) ??
-      fetch(`/_eigen/data?path=${encodeURIComponent(href)}`, { signal: event.signal }).then((res) => res.json()));
-
-    startTransition(() => {
-      setLocation({ pathname: url.pathname, search: url.search });
-      setData(newData);
-<RouteMatcherPlayground mode="ranked" />
-
-    });
+    const next = await prepareNavigation(url, match, event.signal);
+    event.signal.throwIfAborted();
+    await commit(next); // resolves after React commits, as in Part 22
   },
+  focusReset: "after-transition",
+  scroll: "after-transition",
 });
 ```
 
-(The router now keeps `search` in state alongside `pathname`, and passes `parseSearchParams(url, match.route.searchSchema)` to the page as its `search` prop.)
+`RouteTree` passes `state.search` to the page. For the first render, the client entry does the same work before `hydrateRoot`: it awaits the matched route's `loadSearchSchema()` (that chunk loads for hydration anyway) and passes `parseSearchParams(new URL(location.href), schema)` to `Router` as `initialSearch`, next to `initialPathname` and `initialData`. The server entry passes the value `runRoute` already parsed.
 
 Preloading strategies (configurable per-link):
 
@@ -539,7 +590,7 @@ const result = pattern.exec({ pathname: "/posts/42" });
 // result.pathname.groups = { id: '42' }
 ```
 
-The framework could use `URLPattern` as the per-route matching engine (its syntax already covers `:id`, `:id?` and `:slug*`), with a polyfill for older browsers. What it doesn't do is _ranking_: `URLPattern` answers "does this one pattern match?", so you still sort routes with `compareRoutes` and test them in order. This is another example of the browser platform absorbing framework responsibilities — partially.
+The framework could use `URLPattern` as the per-route matching engine (its syntax covers `:id` and `:id?`, and catch-alls with a modifier), with a polyfill for older browsers. Mind the modifier: in `URLPattern`, `:slug*` means _zero_ or more segments, so it would match `/docs` too. Eigen's catch-all needs at least one, which is `:slug+`. What it doesn't do is _ranking_: `URLPattern` answers "does this one pattern match?", so you still sort routes with `compareRoutes` and test them in order. This is another example of the browser platform absorbing framework responsibilities — partially.
 
 ---
 

@@ -19,7 +19,7 @@ export function DiagnosticsFlowDiagram() {
       <Box {...collector} label="dev collector" sub="buffers last 200 events" tone="accent" />
 
       <Region x={500} y={124} w={212} h={108} label="browser" />
-      <Box {...terminal} label="terminal" sub="logger.warn" />
+      <Box {...terminal} label="terminal" sub="logger, per level" />
       <Box {...overlay} label="dev overlay" sub="DiagnosticsPanel" />
 
       <Arrow from={right(configure)} to={left(checks)} />

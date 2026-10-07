@@ -68,8 +68,8 @@ import eigen from "./packages/eigen/plugin"; // a package import from Part 40 on
 
 export default defineConfig({
   plugins: [
-    // RSC mode: Eigen keeps routing, middleware and adapters, but leaves
-    // environment inputs and build orchestration to plugin-rsc
+    // RSC mode: Eigen keeps file-based routing, but leaves environment
+    // inputs, the dev request handler and build orchestration to plugin-rsc
     eigen({ rsc: true }),
     rsc({
       entries: {
@@ -90,7 +90,7 @@ export default defineConfig({
 
 The `@vitejs/plugin-rsc` official plugin (maintained by the Vite team in the `vite-plugin-react` repo) handles the low-level RSC bundler requirements: adding the `react-server` condition to the `rsc` environment, tracking `"use client"` and `"use server"` boundaries, generating client reference manifests, wiring up the `react-server-dom` APIs (it vendors `react-server-dom-webpack`), and coordinating the module graphs across environments. We build _on top of_ it rather than reimplementing the RSC protocol.
 
-`eigen({ rsc: true })` is a new option. It tells the framework plugin from Part 11 to step back from the two jobs plugin-rsc now owns: the SSR entry point and build orchestration.
+`eigen({ rsc: true })` is a new option. It tells the framework plugin from Part 11 to step back from the jobs plugin-rsc now owns — the SSR entry point and build orchestration — and to leave out Part 16's SSG plugin, which pre-renders through `entry-server`'s `renderStream` and would fail on an RSC build that has neither `dist/client/index.html` nor that entry.
 
 ```typescript title="packages/eigen/plugin.ts"
 export interface EigenOptions {
@@ -101,6 +101,13 @@ export interface EigenOptions {
 	/** React Server Components mode: @vitejs/plugin-rsc owns entries and the build */ // [!code ++]
 	rsc?: boolean; // [!code ++]
 }
+
+export default function eigen(options: EigenOptions = {}): Plugin[] {
+	return [
+		// ...eigenRoutes, eigenStripLoaders, eigenApi, eigenDevOverlay as before
+		eigenSSG(), // [!code --]
+		// SSG renders through entry-server's renderStream, which RSC mode doesn't build // [!code ++]
+		...(options.rsc ? [] : [eigenSSG()]), // [!code ++]
 
 // ...inside the "eigen" plugin
 			config(userConfig) {
@@ -198,13 +205,35 @@ import { routes } from "eigen/routes";
 
 export async function renderRSC(pathname: string): Promise<ReadableStream> {
   const match = matchRoute(pathname, routes);
-  if (!match) return renderToReadableStream(<h1>404</h1>);
+  // The payload describes the whole document, so the client hydrates `document`
+  const root = (
+    <html lang="en">
+      <body>
+        {/* Server components can be async — they fetch data directly */}
+        {match ? <match.route.component params={match.params} /> : <h1>404</h1>}
+      </body>
+    </html>
+  );
+  return renderToReadableStream(root);
+}
 
-  const Component = match.route.component;
-  // Server components can be async — they fetch data directly
-  const element = <Component params={match.params} />;
+// plugin-rsc's dev and preview servers call the rsc entry's default export
+// as a fetch handler — this is where Phase 1 hands off to Phase 2
+export default async function handler(request: Request): Promise<Response> {
+  const url = new URL(request.url);
+  const isRsc = url.pathname.endsWith(".rsc");
+  const rscStream = await renderRSC(isRsc ? url.pathname.slice(0, -".rsc".length) || "/" : url.pathname);
 
-  return renderToReadableStream(element);
+  // Raw payload for client navigations and for inspection (`/posts/1.rsc`)
+  if (isRsc) {
+    return new Response(rscStream, { headers: { "Content-Type": "text/x-component;charset=utf-8" } });
+  }
+
+  // Phase 2 runs in the ssr environment: load its entry through plugin-rsc
+  const ssr = await import.meta.viteRsc.loadModule<typeof import("./entry-ssr")>("ssr", "index");
+  return new Response(await ssr.renderToHTML(rscStream), {
+    headers: { "Content-Type": "text/html; charset=utf-8" },
+  });
 }
 ```
 
@@ -213,20 +242,22 @@ The output of Phase 1 is an **RSC payload** (React's "Flight" format) — a stre
 ### Phase 2: SSR rendering (ssr environment)
 
 ```tsx title="src/entry-ssr.tsx"
-import { createFromReadableStream } from "@vitejs/plugin-rsc/ssr";
-import { renderToPipeableStream } from "react-dom/server";
+import type { ReactNode } from "react";
+import { createFromReadableStream, getClientEntryUrl } from "@vitejs/plugin-rsc/ssr";
+import { renderToReadableStream } from "react-dom/server.edge";
 
-export async function renderToHTML(rscStream: ReadableStream): Promise<{ pipe: Function }> {
+export async function renderToHTML(rscStream: ReadableStream): Promise<ReadableStream> {
   // Deserialize the RSC payload into a React element tree
   // Client references are resolved to actual component imports
-  const element = await createFromReadableStream(rscStream);
+  const root = await createFromReadableStream<ReactNode>(rscStream);
 
-  // Render the full tree (server + client components) to HTML
-  return renderToPipeableStream(element);
+  // Render the full tree (server + client components) to HTML. The
+  // bootstrap module is what loads entry-client.tsx — without it, Phase 3 never runs.
+  return renderToReadableStream(root, { bootstrapModules: [getClientEntryUrl()] });
 }
 ```
 
-Phase 2 takes the RSC payload, deserializes it into a React tree (resolving client references to actual component code), and renders the whole thing to HTML using the standard `renderToPipeableStream` from Part 12. A stream can only be read once, so the real entry `tee()`s the RSC stream: one branch feeds `createFromReadableStream`, the other is inlined into the HTML as `<script>` chunks (plugin-rsc's examples use the `rsc-html-stream` package) so the client can hydrate without a second request.
+Phase 2 takes the RSC payload, deserializes it into a React tree (resolving client references to actual component code), and renders the whole thing to HTML using the same `renderToReadableStream` from Part 12 (plugin-rsc's examples import its Web-streams build, `react-dom/server.edge`). A stream can only be read once, so the real entry `tee()`s the RSC stream: one branch feeds `createFromReadableStream`, the other is inlined into the HTML as `<script>` chunks (plugin-rsc's examples use the `rsc-html-stream` package) so the client can hydrate without a second request.
 
 ### Phase 3: Client hydration (client environment)
 
@@ -234,11 +265,13 @@ Phase 2 takes the RSC payload, deserializes it into a React tree (resolving clie
 import { createFromReadableStream } from '@vitejs/plugin-rsc/browser'
 import { hydrateRoot } from 'react-dom/client'
 
-// The RSC payload is embedded in the HTML or fetched separately
-const rscStream = /* ... get the RSC payload ... */
-const element = await createFromReadableStream(rscStream)
+// The RSC payload is embedded in the HTML (see above) or fetched separately.
+// The simplest version fetches it — the `.rsc` URL the rsc entry serves:
+const response = await fetch(window.location.pathname.replace(/\/$/, '') + '.rsc')
+const root = await createFromReadableStream<React.ReactNode>(response.body!)
 
-hydrateRoot(document.getElementById('root')!, element)
+// The payload's root is <html>, so the whole document hydrates
+hydrateRoot(document, root)
 ```
 
 The client only hydrates `"use client"` components. Server components are already rendered in the HTML — the client doesn't load or execute their code at all.
@@ -266,36 +299,17 @@ async function PostPage({ params }: { params: { id: string } }) {
 }
 ```
 
-The `defineLoader` pattern from Part 5 and `createServerFn` from Part 15 are still useful for mutations and client-initiated data fetching, but the primary read path is just... React components that are async.
+`createServerFn` from Part 15 (or a `"use server"` function, below) remains the mutation path, and `defineLoader` from Part 5 remains useful for pages that stay on the classic SSR path. But the primary read path is just... React components that are async.
 
 ### The `transform` hook changes role
 
 In our SSR architecture, the `transform` hook strips loaders from client bundles (Part 7). In RSC, the boundary is enforced by _module graph separation_ — the rsc and client environments are distinct graphs with different resolve conditions. The `"use client"` directive tells the RSC environment "stop here, emit a reference." The `transform` hook's role shifts to processing these directives and generating the reference metadata.
 
-### The virtual route module becomes three-way
+### The virtual route module needs no new branch
 
-```typescript
-load(id: string) {
-  if (id !== resolvedVirtualModuleId) return
+It's tempting to give `eigen/routes` a third branch per environment. But in RSC mode only the `rsc` environment imports the route table: `entry-rsc.tsx` matches the route and renders the page. The ssr and client environments never import page modules at all — they receive the rendered tree, and the IDs of the client components in it, through the Flight payload, and plugin-rsc's manifest resolves those IDs to chunks. Importing every page into the ssr graph would actually be harmful: it would pull server-only code (database imports, async components) into an environment without the `react-server` condition.
 
-  const envName = this.environment?.name
-
-  if (envName === 'rsc') {
-    // RSC: import server components directly
-    // "use client" components are automatically handled by @vitejs/plugin-rsc
-    return generateRouteCode(routes, {
-      lazy: false,
-      includeLoaders: false,  // No loaders — components fetch their own data
-    })
-  } else if (envName === 'ssr') {
-    // SSR: import all components for HTML rendering
-    return generateRouteCode(routes, { lazy: false, includeLoaders: false })
-  } else {
-    // Client: lazy import only "use client" components
-    return generateRouteCode(routes, { lazy: true, includeLoaders: false })
-  }
-}
-```
+So [Part 19](/19-edge-runtimes#plugin-behavior-per-environment)'s `load` hook works unchanged. The `rsc` environment's `consumer` is `"server"`, so it gets `generateRouteCode(tree, true)`: static imports, with `"use client"` modules turned into references by plugin-rsc. The `loader` fields stay in the table, unused — components fetch their own data.
 
 ### Build orchestration moves to plugin-rsc
 
@@ -311,7 +325,7 @@ await builder.build(builder.environments.client); // 4. client build, with the
 await builder.build(builder.environments.ssr); // 5. SSR build
 ```
 
-Post-build work still composes: SSG and adapter hooks registered with `order: 'post'` (Parts 16 and 17) run after the plugin's builds finish. A framework that needs to own the sequence itself can pass `customBuildApp: true` and drive the steps through the plugin's API, but for Eigen the default is exactly right.
+The ordering still composes — hooks registered with `order: 'post'` run after plugin-rsc's builds — but Eigen's post-build steps don't carry over as written. SSG and the Part 17 adapters assume the classic server-entry contract (`template.html`, `prerendered.json`, `renderStream`, `loadData`), so `eigen({ rsc: true })` leaves SSG out, and an adapter in RSC mode needs an RSC-aware version that calls the rsc entry's fetch handler instead of `renderStream`. A framework that needs to own the sequence itself can pass `customBuildApp: true` and drive the steps through the plugin's API, but for Eigen the default is exactly right.
 
 ---
 
@@ -373,7 +387,7 @@ type SerializableProps<T> = {
 
 RSC introduces `"use server"` as a way to define server functions that client components can call — this is essentially our `createServerFn` from Part 15, but as a language-level directive:
 
-```tsx title="src/actions/posts.ts"
+```ts title="src/actions/posts.ts"
 "use server";
 
 export async function likePost(postId: string): Promise<{ likes: number }> {
@@ -410,9 +424,9 @@ The mechanism is identical to Part 15: the `rsc` environment keeps the function 
 
 2. **Compare bundle sizes.** In the client bundle, server components are completely absent — not even their import paths appear. Only client components and the RSC runtime are bundled.
 
-3. **Inspect the RSC payload.** Make the RSC entry return the raw stream (`Content-Type: text/x-component`) for URLs ending in `.rsc` — the convention plugin-rsc's examples use — then fetch `/posts/1.rsc` in development. You'll see rows of serialized React elements, client references (module IDs plus export names), and serialized props.
+3. **Inspect the RSC payload.** The rsc entry's handler returns the raw stream (`Content-Type: text/x-component`) for URLs ending in `.rsc` — the convention plugin-rsc's examples use — so fetch `/posts/1.rsc` in development. You'll see rows of serialized React elements, client references (module IDs plus export names), and serialized props.
 
-4. **Try using `useState` in a server component.** TypeScript is happy — `@types/react` has one set of types for every environment — but the request fails: under the `react-server` condition, the `react` package's server build doesn't export `useState`, so in the `rsc` environment the import is `undefined` and the call throws (`useState is not a function`). This is a module-resolution boundary, not a type-level one.
+4. **Try using `useState` in a server component.** TypeScript is happy — `@types/react` has one set of types for every environment — but the request fails: under the `react-server` condition, the `react` package's server build doesn't export `useState`, so in the `rsc` environment the import is `undefined` and the call fails with a `… is not a function` TypeError. This is a module-resolution boundary, not a type-level one.
 
 5. **Watch `@vitejs/plugin-rsc`'s transform output** in `vite-plugin-inspect`. The same `LikeButton.tsx` file produces three different outputs: a client reference stub (rsc), the full component (ssr), and the hydration-ready component (client).
 

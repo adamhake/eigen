@@ -6,6 +6,7 @@ const levels: Array<{ label: string; tone: Tone }> = [
   { label: "framework global error boundary", tone: "accent" },
   { label: "layout.tsx (root)", tone: "default" },
   { label: "error.tsx (root)", tone: "accent" },
+  { label: "Suspense · loading.tsx (root)", tone: "ghost" },
   { label: "dashboard/layout.tsx", tone: "default" },
   { label: "dashboard/error.tsx", tone: "accent" },
   { label: "Suspense · dashboard/loading.tsx", tone: "ghost" },
@@ -15,7 +16,7 @@ const levels: Array<{ label: string; tone: Tone }> = [
 const INSET_X = 18;
 const INSET_TOP = 30;
 const INSET_BOTTOM = 10;
-const OUTER = { x: 4, y: 8, w: 712, h: 380 };
+const OUTER = { x: 4, y: 8, w: 712, h: 420 };
 
 export function BoundaryNestingDiagram() {
   const n = levels.length;
@@ -28,7 +29,7 @@ export function BoundaryNestingDiagram() {
   return (
     <Diagram
       width={720}
-      height={396}
+      height={436}
       caption="Each segment nests as layout › error boundary › loading boundary › children, so a segment's error.tsx catches errors below its layout but never in it, and only the framework's outermost boundary can catch the root layout."
     >
       {levels.map((level, i) => (
@@ -65,7 +66,7 @@ export function SsrErrorPathsDiagram() {
     <Diagram
       width={720}
       height={372}
-      caption="On the server a loader error and a render error both become a sanitized error object, and the page is rendered again with that error handed to the nearest boundary as initialError."
+      caption="On the server a loader error and a render error both become a sanitized error object that names a boundary: the one above the failing loader's segment, or for a render error the innermost boundary whose re-render succeeds. RouteTree hands it to that boundary as initialError."
     >
       <Box {...request} label="Request" />
       <Box {...runRoute} label="runRoute()" sub="middleware, loaders" mono />
@@ -79,7 +80,7 @@ export function SsrErrorPathsDiagram() {
         mono
         tone="accent"
       />
-      <Box {...rerender} label="renderToString(App)" sub="initialError → boundary fallback" mono />
+      <Box {...rerender} label="renderToString(App)" sub="initialError → chosen boundary" mono />
       <Box {...failed} label="500 HTML" sub={"error UI +\n__EIGEN_ERROR__"} />
 
       <Arrow from={right(request)} to={left(runRoute)} />

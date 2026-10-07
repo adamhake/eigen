@@ -264,27 +264,27 @@ export default function DashboardLayout({ children, data }: LayoutProps<Data>) {
 }
 ```
 
+`getUser` and `getNotificationCount` stand in for your data layer. To follow along, stub them in `src/lib/db.ts`, e.g. `export async function getUser() { return { id: "1", name: "Ada" }; }` and `export async function getNotificationCount(userId: string) { return 3; }`.
+
 The sidebar uses `Link`, not plain `<a>` tags — a full page load would rebuild everything, and nothing would persist. `defineLoader('/dashboard', ...)` type-checks because `dashboard/index.tsx` makes `/dashboard` a route path.
 
 The framework types grow a layout shape, and each route now carries its layout stack:
 
 ```typescript title="packages/eigen/types.ts"
 /** Props passed to a layout component */ // [!code ++]
-export interface LayoutProps<TData = unknown> {
-  // [!code ++]
+export interface LayoutProps<TData = unknown> { // [!code ++]
   children: React.ReactNode; // [!code ++]
   data: TData; // [!code ++]
 } // [!code ++]
-// [!code ++]
+
 /** One entry in a route's layout stack (outermost first) */ // [!code ++]
-export interface LayoutDefinition {
-  // [!code ++]
+export interface LayoutDefinition { // [!code ++]
   /** The directory path this layout wraps, e.g. '/dashboard' */ // [!code ++]
   path: string; // [!code ++]
   component: React.ComponentType<LayoutProps>; // [!code ++]
   loader?: RouteDefinition["loader"]; // [!code ++]
 } // [!code ++]
-// [!code ++]
+
 export interface RouteDefinition {
   path: string;
   component: React.ComponentType<Record<string, unknown>>;
@@ -324,11 +324,11 @@ export async function loadRouteData({ route, params }: RouteMatch): Promise<Rout
 }
 
 /** Part 12's resolveDeferred, applied to each loader's result */
-export async function resolveRouteData(data: RouteData): Promise<RouteData> {
+export async function resolveRouteData(data: RouteData, signal?: AbortSignal): Promise<RouteData> {
   const layouts = await Promise.all(
-    Object.entries(data.layouts).map(async ([path, value]) => [path, await resolveDeferred(value)] as const),
+    Object.entries(data.layouts).map(async ([path, value]) => [path, await resolveDeferred(value, signal)] as const),
   );
-  return { layouts: Object.fromEntries(layouts), page: await resolveDeferred(data.page) };
+  return { layouts: Object.fromEntries(layouts), page: await resolveDeferred(data.page, signal) };
 }
 ```
 
@@ -376,9 +376,9 @@ import { loadRouteData, resolveRouteData } from 'eigen/route-data' // [!code ++]
   const data = match ? await loadRouteData(match) : null // [!code ++]
 // ...
       async flush(controller) {
+        const resolved = await resolveDeferred(data, abortController.signal) // [!code --]
+        const resolved = data && (await resolveRouteData(data, abortController.signal)) // [!code ++]
         clearTimeout(timeout)
-        const resolved = await resolveDeferred(data) // [!code --]
-        const resolved = data && (await resolveRouteData(data)) // [!code ++]
 ```
 
 `window.__EIGEN_DATA__` and the `/_eigen/data` response now share the `RouteData` shape: `{ layouts: { '/': ..., '/dashboard': ... }, page: ... }`. Add the `eigen/route-data` alias next to the others.
@@ -439,12 +439,12 @@ export function Router({ initialPathname, initialData }: RouterProps) {
   const [data, setData] = useState<unknown>(initialData); // [!code --]
   // Pathname and data change together, so a route never renders // [!code ++]
   // with another route's layout data // [!code ++]
-  const [state, setState] = useState({
-    // [!code ++]
+  const [state, setState] = useState({ // [!code ++]
     pathname: initialPathname, // [!code ++]
     data: initialData as RouteData | null, // [!code ++]
   }); // [!code ++]
   const [loading, setLoading] = useState(false);
+  const [isPending, startTransition] = useTransition(); // [!code ++]
 
   useEffect(() => {
     const handler = async () => {
@@ -455,7 +455,9 @@ export function Router({ initialPathname, initialData }: RouterProps) {
         const res = await fetch(`/_eigen/data?path=${encodeURIComponent(newPath)}`);
         setData(await res.json()); // [!code --]
         const data = (await res.json()) as RouteData | null; // [!code ++]
-        setState({ pathname: newPath, data }); // [!code ++]
+        // A transition keeps the current tree on screen while a React.lazy // [!code ++]
+        // page or layout that hasn't loaded yet suspends // [!code ++]
+        startTransition(() => setState({ pathname: newPath, data })); // [!code ++]
       } finally {
         setLoading(false);
       }
@@ -473,17 +475,17 @@ export function Router({ initialPathname, initialData }: RouterProps) {
     <Suspense fallback={<div>Loading...</div>}>
       {loading ? ( // [!code --]
         <div>Loading...</div> // [!code --]
-      ) : (
-        // [!code --]
+      ) : ( // [!code --]
         <Component params={match.params} data={data} /> // [!code --]
-      )}{" "}
-      // [!code --]
-      {loading && <div className="eigen-loading">Loading...</div>} // [!code ++]
-      <RouteTree match={match} data={state.data} /> // [!code ++]
+      )} {/* [!code --] */}
+      {(loading || isPending) && <div className="eigen-loading">Loading...</div>} {/* [!code ++] */}
+      <RouteTree match={match} data={state.data} /> {/* [!code ++] */}
     </Suspense>
   );
 }
 ```
+
+Add `useTransition` to the `react` import. The transition matters the first time each route is visited. On the client, pages and layouts are `React.lazy` components, and a lazy component whose chunk hasn't loaded yet suspends. Committed as an ordinary update, that suspension would make the `Router`'s `<Suspense>` swap the whole visible tree, layouts included, for its fallback until the chunk arrives. Inside a transition, React keeps showing the current tree, and `isPending` keeps the loading indicator up until the new route can render.
 
 The server renders the same `Router` (through `<App>`), so `RouteTree` produces identical provider, layout, and Suspense structure on both sides of hydration.
 
@@ -588,6 +590,16 @@ function generateRouteDeclarations(
 		}) // [!code ++]
 		.join("\n"); // [!code ++]
 
+	const layoutTypes = [ // [!code ++]
+		"  /** A module's loader return type, or undefined if it has no loader */", // [!code ++]
+		"  type LoaderData<M> = M extends { loader: (...args: any[]) => infer R } ? Awaited<R> : undefined", // [!code ++]
+		"", // [!code ++]
+		"  /** Maps layout paths to their loader data types */", // [!code ++]
+		"  export interface LayoutDataMap {", // [!code ++]
+		layoutEntries, // [!code ++]
+		"  }", // [!code ++]
+	].join("\n"); // [!code ++]
+
 	const dts = `// Auto-generated by eigen — do not edit
 // ...the 'eigen/routes' module as before
 
@@ -597,13 +609,7 @@ declare module 'eigen/route-types' {
 ${paramEntries}
   }
 
-  /** A module's loader return type, or undefined if it has no loader */ // [!code ++]
-  type LoaderData<M> = M extends { loader: (...args: any[]) => infer R } ? Awaited<R> : undefined // [!code ++]
-// [!code ++]
-  /** Maps layout paths to their loader data types */ // [!code ++]
-  export interface LayoutDataMap { // [!code ++]
-${layoutEntries} // [!code ++]
-  } // [!code ++]
+${layoutTypes} // [!code ++]
 }
 `;
 ```
@@ -614,7 +620,7 @@ Collect the layouts with a small walk over the tree (`node.layout` plus each chi
 
 ## What to observe
 
-1. **Add a `console.log('DashboardLayout mounted')` in the layout's `useEffect`.** Navigate between `/dashboard/settings` and `/dashboard/analytics` using the sidebar links. The log fires once — the layout persists. Then temporarily change `RouteTree` to render `<Layout key={pathname} ...>` and watch it fire on every navigation: that's what per-route wrapper components would do.
+1. **Add a `console.log('DashboardLayout mounted')` in the layout's `useEffect`.** Navigate between `/dashboard/settings` and `/dashboard/analytics` using the sidebar links. The log fires once — the layout persists. Then temporarily change `RouteTree` to render `<Layout key={match.route.path} ...>` and watch it fire on every navigation: that's what per-route wrapper components would do.
 
 2. **Check the virtual module in `vite-plugin-inspect`.** Compare the client and SSR versions of `\0eigen/routes`: the same shared `layoutN` objects, with `React.lazy` components on the client and namespace imports with loaders on the server.
 

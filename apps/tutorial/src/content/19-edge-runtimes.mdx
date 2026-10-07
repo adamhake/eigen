@@ -20,7 +20,7 @@ _This is the twentieth installment in a series where we build a toy Next.js on t
   Cloudflare Workers, Deno). A single environment targets a specific runtime.
 </Callout>
 
-So far, Eigen has two environments: `client` (browser) and `ssr` (Node.js). But modern deployment platforms don't just run Node. Cloudflare Workers, Deno Deploy, Vercel Edge Functions, and Netlify Edge all run JavaScript in lightweight V8 isolates with Web API globals (`Request`, `Response`, `fetch`) instead of Node APIs (`http.IncomingMessage`, `fs`, `Buffer`).
+So far, Eigen has two environments: `client` (browser) and `ssr` (Node.js). But modern deployment platforms don't just run Node. Cloudflare Workers, Deno Deploy, Vercel's Edge runtime, and Netlify Edge Functions all run JavaScript in lightweight V8 isolates with Web API globals (`Request`, `Response`, `fetch`) instead of Node APIs (`http.IncomingMessage`, `fs`, `Buffer`).
 
 These edge runtimes have different constraints: no filesystem access, limited CPU time, restricted `node:` built-ins, and different module resolution. A framework that deploys to the edge needs Vite to process server code for this target — which means a third environment with its own resolve conditions, its own module graph, and its own build output.
 
@@ -84,69 +84,81 @@ The `dev.createEnvironment` factory is the seam that decides _where_ an environm
 The `conditions` array is critical. When Vite resolves an import like `import { renderToReadableStream } from 'react-dom/server'`, it checks the package's `exports` map against these conditions. `react-dom`'s `package.json` exports different `./server` entry points for different conditions:
 
 - `"node"` → Node.js build (Node-specific internals; exports both `renderToPipeableStream` and, in React 19, `renderToReadableStream`)
-- `"workerd"` / `"worker"` / `"edge-light"` → edge builds (Web APIs only — no `node:` imports, no `renderToPipeableStream`)
-- `"browser"` → Browser build
+- `"workerd"` / `"edge-light"` → `server.edge.js`, the edge build (Web APIs only — no `node:` imports, no `renderToPipeableStream`)
+- `"worker"` / `"browser"` → `server.browser.js`, the browser build
 
 The `react` package itself has one more: a `"react-server"` condition that selects the RSC server build (we'll use this in Part 21).
 
-By putting `workerd`, `worker` and `edge-light` first, the edge environment gets Web API-compatible builds of React and other packages.
+The order of the `conditions` array doesn't matter. Resolution walks the package's `exports` object in _its_ key order and picks the first key that's in the active set. Because `workerd` and `edge-light` are in the set, packages whose `exports` list those keys before `browser` and `default` — as `react-dom` does — resolve to their edge builds. A package that lists `browser` first resolves to its browser build here, which is usually also Web-API-only.
 
 ---
 
 ## The edge entry point
 
-Edge runtimes use Web standard APIs. The route matching (Part 3's `eigen/match-route`) and the middleware → loader pipeline (Part 14's `runRoute`) are plain TypeScript with no Node dependencies, so the edge entry reuses them unchanged. Since Part 12, the Node server renders with Web streams too — so the rendering code is the same on both sides, and only the module shape differs:
+Edge runtimes use Web standard APIs. Everything the server entry does — route matching (Part 3's `eigen/match-route`), the middleware → loader pipeline (Part 14's `runRoute`), and `renderStream` itself, which renders with Web streams since Part 12 — is plain TypeScript with no Node dependencies. So the edge entry doesn't re-implement any of it: it imports the same `renderStream`, `loadData`, `callServerFn` and `isBot` that [Part 16](/16-static-site-generation) made the server entry's public surface, and only the module shape differs.
+
+One thing a Worker can't do is read the template from disk. Part 17's adapters inline it into the generated file at build time; an entry that lives in source needs the same string through an import. A small virtual module provides it:
+
+```typescript title="packages/eigen/plugins/eigen-template.ts"
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import type { Plugin, ResolvedConfig, ViteDevServer } from "vite";
+
+/** `eigen/template`: the HTML template as a string, for runtimes without a filesystem */
+export default function eigenTemplate(): Plugin {
+  let config: ResolvedConfig;
+  let server: ViteDevServer | undefined;
+
+  return {
+    name: "eigen-template",
+    configResolved(resolved) {
+      config = resolved;
+    },
+    configureServer(devServer) {
+      server = devServer;
+    },
+    resolveId(id) {
+      if (id === "eigen/template") return "\0eigen/template";
+    },
+    async load(id) {
+      if (id !== "\0eigen/template") return;
+      let html: string;
+      if (server) {
+        // Dev: index.html through transformIndexHtml, as in Part 12's dev server
+        html = await server.transformIndexHtml("/", readFileSync(resolve(config.root, "index.html"), "utf-8"));
+      } else {
+        // Build: buildApp builds the client first, so its index.html — with
+        // the hashed script and stylesheet tags — is already on disk
+        const clientOutDir = resolve(config.root, config.environments.client.build.outDir);
+        html = readFileSync(resolve(clientOutDir, "index.html"), "utf-8");
+      }
+      return { code: `export default ${JSON.stringify(html)}`, moduleType: "js" };
+    },
+  };
+}
+```
+
+Add `eigenTemplate()` to the array `eigen()` returns, and declare the module next to `eigen/routes` (`declare module 'eigen/template' { const template: string; export default template }`). The build branch reads the client output before Part 16's SSG step removes `dist/client/index.html` — the edge build runs inside `eigen()`'s `order: 'pre'` hook, and SSG only runs afterwards.
 
 <Tabs items={["Edge (Web APIs)", "Node SSR (for comparison)"]}>
 <Tab value="Edge (Web APIs)">
 
 ```tsx title="src/entry-edge.tsx"
-import { renderToReadableStream } from "react-dom/server";
-import { matchRoute } from "eigen/match-route";
-import { runRoute } from "eigen/run-route";
-import { routes } from "eigen/routes";
-import { serializeForScript } from "eigen/serialize";
+import template from "eigen/template";
+import { callServerFn, isBot, loadData, renderStream } from "./entry-server";
 
 // A Worker is a module whose default export has a fetch handler:
 // (request: Request) => Promise<Response>. No server, no port.
 export default {
+  // With Workers static assets (Part 17), requests for files in
+  // dist/client are answered before they reach this handler
   async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-    const match = matchRoute(url.pathname, routes);
-
-    if (!match) {
-      return new Response("<h1>404</h1>", {
-        status: 404,
-        headers: { "Content-Type": "text/html" },
-      });
-    }
-
-    // Middleware + loader, exactly as on Node (Part 14)
-    const result = await runRoute(match, request);
-    if ("response" in result) return result.response;
-    const { data } = result;
-
-    const Component = match.route.component;
-
-    // Web Streams, same as the Node server since Part 12. A real entry would
-    // render the full document from the template (Part 6); this shows the moving parts.
-    const stream = await renderToReadableStream(<Component params={match.params} data={data} />, {
-      bootstrapScriptContent: `window.__EIGEN_DATA__ = ${serializeForScript(data)}`,
-      onError(error: unknown) {
-        console.error("Edge SSR error:", error);
-      },
-    });
-
-    // For bots, wait for all content
-    const isBot = /bot|crawler|spider/i.test(request.headers.get("user-agent") ?? "");
-    if (isBot) {
-      await stream.allReady;
-    }
-
-    return new Response(stream, {
-      status: 200,
-      headers: { "Content-Type": "text/html" },
-    });
+    const { pathname } = new URL(request.url);
+    if (pathname === "/_eigen/data") return loadData(request);
+    if (pathname.startsWith("/_eigen/fn/")) return callServerFn(request);
+    // Middleware, layouts, loaders, streaming and deferred data:
+    // the same pipeline as on Node (Parts 12–16)
+    return renderStream(request, { template, waitForAll: isBot(request) });
   },
 };
 ```
@@ -154,33 +166,22 @@ export default {
 </Tab>
 <Tab value="Node SSR (for comparison)">
 
-```tsx title="server.ts (simplified)"
+```typescript title="server.prod.ts (simplified)"
+import { readFileSync } from "node:fs";
 import { H3, serve } from "h3";
-import { renderToReadableStream } from "react-dom/server";
-import { matchRoute } from "eigen/match-route";
-import { runRoute } from "eigen/run-route";
-import { routes } from "eigen/routes";
-import { serializeForScript } from "eigen/serialize";
+
+const template = readFileSync("dist/server/template.html", "utf-8");
+const { renderStream, loadData, callServerFn, isBot } = (await import(
+  "./dist/server/entry-server.js"
+)) as typeof import("./src/entry-server");
 
 const app = new H3();
 
-// H3 handlers already speak Request/Response (Part 3), and React 19's
-// Node build exports renderToReadableStream (Part 12) — so the body of
-// this handler is the same Web-streams code as the Worker's fetch()
-app.all("/**", async (event) => {
-  const request = event.req;
-  const match = matchRoute(event.url.pathname, routes);
-  if (!match) return new Response("<h1>404</h1>", { status: 404 });
-
-  const result = await runRoute(match, request);
-  if ("response" in result) return result.response;
-
-  const Component = match.route.component;
-  const stream = await renderToReadableStream(<Component params={match.params} data={result.data} />, {
-    bootstrapScriptContent: `window.__EIGEN_DATA__ = ${serializeForScript(result.data)}`,
-  });
-  return new Response(stream, { headers: { "Content-Type": "text/html" } });
-});
+// Static files and pre-rendered pages as in Part 16, then the same three
+// calls as the Worker. H3 handlers already speak Request/Response (Part 3).
+app.get("/_eigen/data", (event) => loadData(event.req));
+app.post("/_eigen/fn/**", (event) => callServerFn(event.req));
+app.all("/**", (event) => renderStream(event.req, { template, waitForAll: isBot(event.req) }));
 
 // The real difference: a long-running process that owns a port
 serve(app, { port: 3000 });
@@ -189,7 +190,9 @@ serve(app, { port: 3000 });
 </Tab>
 </Tabs>
 
-Because Eigen chose H3 back in Part 3 and Web streams in Part 12, the code is Web-standard on both sides — `Request` in, `renderToReadableStream`, `Response` out. What differs is everything _around_ that code: the Node server is a long-running process that calls `serve()` on a port, while a Worker is just a module with a `fetch` export that the platform invokes per request. And the two are built differently: the edge environment resolves `react-dom/server` and every other dependency through the `workerd`/`worker`/`edge-light` conditions and bundles them all (`noExternal: true`), while the `ssr` build resolves the `node` builds and leaves `node_modules` external. Same source, different resolve conditions and bundling — that's what an environment is.
+This is the same handler Part 17's Cloudflare adapter generates as `worker.js`, moved into source so that the edge environment can build it. With an edge build in place, that adapter can point Wrangler's `main` at `dist/edge/entry-edge.js` instead of generating a wrapper around the Node-targeted server bundle.
+
+Because Eigen chose H3 back in Part 3 and Web streams in Part 12, both sides call the same `renderStream` — `Request` in, `renderToReadableStream` inside, `Response` out. What differs is everything _around_ that code: the Node server is a long-running process that calls `serve()` on a port, while a Worker is just a module with a `fetch` export that the platform invokes per request. And the two are built differently: the edge environment resolves `react-dom/server` and every other dependency through the `workerd`/`edge-light` conditions and bundles them all (`noExternal: true`), while the `ssr` build resolves the `node` builds and leaves `node_modules` external. Same source, different resolve conditions and bundling — that's what an environment is.
 
 <EdgeVsNodeBuildDiagram />
 
@@ -202,7 +205,7 @@ Our framework types need to support both Node and edge handlers. This is where a
 ```typescript title="packages/eigen/handler-types.ts"
 import type { ApiContext } from "eigen/api-types";
 
-/** Node.js handler (Express/Hono/Fastify style) */
+/** Node.js handler (Express / raw `node:http` style) */
 export interface NodeHandler {
   (req: import("http").IncomingMessage, res: import("http").ServerResponse): Promise<void> | void;
 }
@@ -276,28 +279,25 @@ export function edgePolyfills(): Plugin {
 }
 ```
 
-The virtual route module also needs to generate edge-appropriate code:
+The virtual route module has a subtler problem. [Part 13](/13-nested-layouts#generating-the-nested-virtual-module)'s `load` hook picks the server table with `this.environment.name === "ssr"` — so the edge environment, whose name is `edge`, gets the _client_ table: `React.lazy` components and no loaders. The question the hook really asks is "does this environment run on a server?", and Vite answers that directly with the environment's `consumer`:
 
-```typescript
-// In the load() hook — three-way branch
-load(id: string) {
-  if (id !== resolvedVirtualModuleId) return
-
-  const routes = discoverRoutes(pagesDir)
-  const envName = this.environment?.name
-
-  if (envName === 'edge') {
-    // Edge: static imports, loaders included, no React.lazy
-    // (same as SSR, but resolve conditions differ)
-    return generateRouteCode(routes, { lazy: false, includeLoaders: true })
-  } else if (envName === 'ssr') {
-    return generateRouteCode(routes, { lazy: false, includeLoaders: true })
-  } else {
-    // Client: lazy imports, no loaders
-    return generateRouteCode(routes, { lazy: true, includeLoaders: false })
-  }
-}
+```typescript title="packages/eigen/plugins/eigen-routes.ts"
+		load(id: string) {
+			if (id === resolvedVirtualModuleId) {
+				const tree = buildRouteTree(pagesDir, pagesUrl);
+				// ssr and edge both need static imports and loaders; // [!code ++]
+				// only the browser gets the lazy, loader-free table // [!code ++]
+				const isServer = this.environment.config.consumer === "server"; // [!code ++]
+				return {
+					code: generateRouteCode(tree, this.environment.name === "ssr"), // [!code --]
+					code: generateRouteCode(tree, isServer), // [!code ++]
+					moduleType: "js",
+				};
+			}
+		},
 ```
+
+Same generated code for both server environments; what differs is how each environment resolves the imports inside it.
 
 ---
 
@@ -326,7 +326,7 @@ The output structure:
 <Files>
   <Folder name="dist" defaultOpen>
     <Folder name="client" defaultOpen comment="Browser bundles + static assets">
-      <File name="index.html" />
+      <File name="index.html" comment="Only if / was pre-rendered (Part 16)" />
       <Folder name="assets" />
       <Folder name=".vite" defaultOpen>
         <File name="manifest.json" />
@@ -334,6 +334,8 @@ The output structure:
     </Folder>
     <Folder name="server" defaultOpen comment="Node.js server bundle">
       <File name="entry-server.js" />
+      <File name="template.html" comment="Saved by SSG (Part 16)" />
+      <File name="prerendered.json" />
     </Folder>
     <Folder name="edge" defaultOpen comment="Edge worker bundle">
       <File name="entry-edge.js" comment="Self-contained, no node_modules" />

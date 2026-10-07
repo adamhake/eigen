@@ -21,7 +21,7 @@ But there's a gap. When loader data travels from server to client, it passes thr
 Server: loader returns { user: { name: "Adam", joinedAt: new Date() } }
    ↓  serializeForScript (JSON.stringify + HTML escaping, Part 3)
 HTML:  window.__EIGEN_DATA__ = {"user":{"name":"Adam","joinedAt":"2026-03-07T..."}}
-   ↓  JSON.parse (implicit, via browser)
+   ↓  evaluated as a JS object literal by the browser
 Client: data is { user: { name: "Adam", joinedAt: "2026-03-07T..." } }
 ```
 
@@ -66,8 +66,8 @@ export function parseWith<TSchema extends StandardSchemaV1>(
 ): StandardSchemaV1.InferOutput<TSchema> {
   const result = schema["~standard"].validate(data);
   if (result instanceof Promise) {
-    // Hydration can't await — async refinements belong on the server
-    throw new TypeError("Async schemas are not supported in parse()");
+    // Validation stays synchronous — async refinements belong on the server
+    throw new TypeError("Async schemas are not supported in parseWith()");
   }
   if (result.issues) throw new SchemaValidationError(result.issues);
   return result.value;
@@ -177,51 +177,86 @@ Why two exports instead of one object? Part 7's transform strips the `loader` ex
 
 ## Validating during hydration
 
-The `parse` function exported alongside the loader is used on the client to validate `window.__EIGEN_DATA__` — and, just as importantly, the JSON that comes back from `/_eigen/data` on every client-side navigation (Part 5). Both pass through one helper in the router:
+The `parse` function exported alongside the loader is used on the client to validate `window.__EIGEN_DATA__` — and, just as importantly, the JSON that comes back from `/_eigen/data` on every client-side navigation (Part 5). Both hold [Part 13](/13-nested-layouts#the-layout-loader-pipeline)'s `RouteData`, `{ layouts, page }`, and `parse` describes the page loader's output — so it applies to `page` only.
 
-```tsx title="packages/eigen/router.tsx"
-import type { RouteMatch } from "eigen/match-route";
+### Reaching `parse` from the client
 
-function parseRouteData(match: RouteMatch | null, raw: unknown): unknown {
-  if (!match?.route.parse) return raw; // Route has no schema — trust the types
-  try {
-    return match.route.parse(raw);
-  } catch (e) {
-    console.error(`Data validation failed for ${match.route.path}:`, e);
-    throw e; // Surface it (error boundary) instead of rendering mistyped data
-  }
-}
+On the server, `eigen/routes` imports each page as a namespace. The client branch of `generateRouteCode` ([Part 13](/13-nested-layouts#generating-the-nested-virtual-module)) has no module object to read an export from — only `React.lazy(() => import(page.url))`. A second dynamic import of the same URL fixes that without undoing code-splitting: it resolves to the same chunk `React.lazy` loads, so the browser fetches it once.
 
-// Initial hydration:
-const [data, setData] = useState(() =>
-  parseRouteData(matchRoute(window.location.pathname, routes), window.__EIGEN_DATA__),
-);
-
-// After fetching /_eigen/data on navigation:
-setData(parseRouteData(matchRoute(newPath, routes), await res.json()));
+```typescript title="packages/eigen/plugins/route-tree.ts"
+      } else {
+        routes.push(
+          `  { path: '${page.path}', component: React.lazy(() => import('${page.url}')), layouts: ${layouts} }`, // [!code --]
+          `  { path: '${page.path}', component: React.lazy(() => import('${page.url}')), ` + // [!code ++]
+            `loadParse: () => import('${page.url}').then((m) => m.parse), layouts: ${layouts} }`, // [!code ++]
+        );
+      }
 ```
 
-### The route definition with parse functions
-
-`RouteDefinition` gains an optional `parse`:
+The server branch doesn't need it: `defineValidatedLoader` has already parsed the data there. `RouteDefinition` gains the optional field:
 
 ```typescript title="packages/eigen/types.ts"
 export interface RouteDefinition {
-  // ...path, component, loader, middleware (Parts 2–14)
-  parse?: (data: unknown) => unknown;
+  // ...path, component, loader, layouts, middleware, ... (Parts 2–16)
+  /** Client only: resolves to the page's `parse` export, if it has one */
+  loadParse?: () => Promise<((data: unknown) => unknown) | undefined>;
 }
 ```
 
-The virtual module already imports each page as a namespace, so it just reads one more optional export. A page without `parse` simply yields `undefined` — no missing-export error:
+A page without `parse` resolves to `undefined` — reading a missing export from a module namespace isn't an error.
 
-```typescript
-// In load() for eigen/routes — generated code is plain JS
-`import * as RouteMod${i} from '${r.componentPath}'`
-// Route entry
-`{ path: '${r.path}', component: RouteMod${i}.default, loader: RouteMod${i}.loader, parse: RouteMod${i}.parse }`;
+### Applying it
+
+One helper, next to the other `RouteData` functions, runs the schema over the page's slice of the data:
+
+```typescript title="packages/eigen/route-data.ts"
+/** Part 18: validate the page's data with its `parse` export, if it has one */
+export async function parseRouteData(match: RouteMatch | null, data: RouteData | null): Promise<RouteData | null> {
+  const parse = await match?.route.loadParse?.();
+  if (!match || !data || !parse) return data; // No schema — trust the types
+  try {
+    return { ...data, page: parse(data.page) };
+  } catch (e) {
+    console.error(`Data validation failed for ${match.route.path}:`, e);
+    throw e; // Surface it instead of rendering mistyped data
+  }
+}
 ```
 
-And for the client — importantly, the `parse` function is _not_ server-only. It needs to be in the client bundle because it runs during hydration and navigation. Part 7's `eigenStripLoaders` plugin (`plugins/eigen-strip-loaders.ts`, an AST-based `enforce: 'pre'` transform) already does the right thing: in every export form, it strips the server-only exports (`loader`, `middleware`, `generateStaticParams`, `generateMetadata`) and prunes the imports they used, but keeps `default` and `parse`. Nothing to change — as long as `parse` lives in its own export statement, as above.
+Hydration has to wait for it. The server rendered the parsed data (a real `Date`), so the client's first render must use parsed data too, or hydration would mismatch. The client entry from [Part 11](/11-framework-plugin#one-app-shell-for-both-entries) awaits it before calling `hydrateRoot`:
+
+```tsx title="src/entry-client.tsx"
+import { hydrateRoot } from "react-dom/client";
+import { matchRoute } from "eigen/match-route"; // [!code ++]
+import { parseRouteData, type RouteData } from "eigen/route-data"; // [!code ++]
+import { routes } from "eigen/routes"; // [!code ++]
+import { App } from "./app";
+
+const root = document.getElementById("root");
+if (!root) throw new Error("Root element not found");
+hydrateRoot(root, <App pathname={window.location.pathname} data={window.__EIGEN_DATA__} />); // [!code --]
+const pathname = window.location.pathname; // [!code ++]
+// Top-level await: hydration needs the page's chunk anyway, so this costs no extra request // [!code ++]
+const data = await parseRouteData(matchRoute(pathname, routes), window.__EIGEN_DATA__ as RouteData | null); // [!code ++]
+hydrateRoot(root, <App pathname={pathname} data={data} />); // [!code ++]
+```
+
+And the router's `popstate` handler from Part 13 parses the `/_eigen/data` response before committing it, so the new route never renders unvalidated data:
+
+```tsx title="packages/eigen/router.tsx"
+import type { RouteData } from "eigen/route-data"; // [!code --]
+import { parseRouteData, type RouteData } from "eigen/route-data"; // [!code ++]
+
+// ...inside the popstate handler, after Part 14's redirect check
+const data = (await res.json()) as RouteData | null; // [!code --]
+const raw = (await res.json()) as RouteData | null; // [!code ++]
+const data = await parseRouteData(matchRoute(newPath, routes), raw); // [!code ++]
+setState({ pathname: newPath, data });
+```
+
+### Keeping `parse` in the client bundle
+
+Importantly, the `parse` function is _not_ server-only. It needs to be in the client bundle because it runs during hydration and navigation. Part 7's `eigenStripLoaders` plugin (`packages/eigen/plugins/eigen-strip-loaders.ts`, an AST-based `enforce: 'pre'` transform) already does the right thing: in every export form, it strips the server-only exports (`loader`, `middleware`, `generateStaticParams`, `generateMetadata`) and prunes the imports they used, but keeps `default` and `parse`. Nothing to change — as long as `parse` lives in its own export statement, as above.
 
 <Callout type="info" title="Parse survives stripping">
   The loader contains server-only code (database queries, API keys). The parse function contains only the zod schema —

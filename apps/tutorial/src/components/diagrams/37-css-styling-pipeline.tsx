@@ -16,31 +16,25 @@ export function CssManifestFlowDiagram() {
     <Diagram
       width={720}
       height={280}
-      caption="At build time Vite records each module's CSS files in the SSR manifest; at request time the matched route's module ID looks them up, so the <head> links the page's stylesheets before the shell streams."
+      caption="At build time Vite records each chunk's CSS files and imported chunks in the manifest, which the server build inlines; at request time the matched route's module IDs start a walk through it, so the <head> links the page's stylesheets before the shell streams."
     >
       <Region x={8} y={8} w={704} h={110} label="build time" />
       <Box {...page} label="Dashboard.tsx" sub="imports .module.css" mono />
       <Box {...viteBuild} label="vite build" sub="client env" />
-      <Box {...manifest} label="ssr-manifest.json" sub="moduleId → /assets/*.css" mono />
+      <Box {...manifest} label="manifest.json" sub="chunk → css + imports" mono />
       <Arrow from={right(page)} to={left(viteBuild)} />
       <Arrow from={right(viteBuild)} to={left(manifest)} label="writes" />
 
       <Region x={8} y={156} w={704} h={112} label="request time" tone="accent" />
       <Box {...request} label="Request" sub="GET /dashboard" />
-      <Box {...match} label="matchRoute" sub="route.moduleId" mono />
-      <Box {...collect} label="collectCss()" sub="manifest lookup" mono tone="accent" />
+      <Box {...match} label="matchRoute" sub="route moduleIds" mono />
+      <Box {...collect} label="collectCss()" sub="walk imports" mono tone="accent" />
       <Box {...head} label="SSR <head>" sub="<link> tags" mono />
       <Arrow from={right(request)} to={left(match)} />
       <Arrow from={right(match)} to={left(collect)} label="ids" />
       <Arrow from={right(collect)} to={left(head)} tone="accent" label="hrefs" />
 
-      <Arrow
-        from={bottom(manifest, -79)}
-        to={top(collect)}
-        dashed
-        label="read once at startup"
-        labelOffset={[0, -15]}
-      />
+      <Arrow from={bottom(manifest, -79)} to={top(collect)} dashed label="inlined at build" labelOffset={[0, -15]} />
     </Diagram>
   );
 }

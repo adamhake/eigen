@@ -29,12 +29,11 @@ Before writing any framework code, understand what Vite 8's build pipeline alrea
 import { defineConfig } from "vite";
 
 export default defineConfig({
+  build: {
+    // Browser targets for the Lightning CSS minifier (the default in Vite 8)
+    cssTarget: ["chrome100", "firefox100", "safari15"],
+  },
   css: {
-    // Options for Lightning CSS (the default minifier in Vite 8).
-    // Targets are encoded as (major << 16) | (minor << 8) | patch.
-    lightningcss: {
-      targets: { chrome: 100 << 16, firefox: 100 << 16, safari: 15 << 16 },
-    },
     // CSS Modules configuration (applies with the default PostCSS transformer)
     modules: {
       localsConvention: "camelCaseOnly",
@@ -42,6 +41,8 @@ export default defineConfig({
   },
 });
 ```
+
+Minification targets come from `build.cssTarget`, which takes precedence over `css.lightningcss.targets` for the minify step. `css.lightningcss` (including `targets`, encoded as `(major << 16) | (minor << 8) | patch`) only affects transforms once you set `css.transformer: 'lightningcss'`.
 
 <Callout type="info" title="What the framework doesn't need to build">
   A common mistake in framework development is re-implementing what the bundler already provides. Vite 8 handles CSS
@@ -55,50 +56,97 @@ The framework adds value in the places where build tooling ends and runtime beha
 
 ## Critical CSS extraction
 
-When Vite builds a production app, it emits a **manifest** that maps each module to its CSS dependencies. During SSR, the framework uses this manifest to figure out which stylesheets a given page needs, then inlines the critical ones in the `<head>` — so the page renders styled on first paint.
+When Vite builds a production app, it emits a **manifest** that records which CSS files each chunk needs. During SSR, the framework uses it to work out which stylesheets the requested page needs and links them in the `<head>`, so the page renders styled on first paint.
 
 <CssManifestFlowDiagram />
 
-### The SSR manifest
+### The build manifest
 
-[Part 6](/06-production-builds)'s `.vite/manifest.json` maps _entry and chunk_ files to their outputs. For per-module CSS lookup, Vite can also emit an SSR manifest — but only when you ask for it on the client build:
+[Part 6](/06-production-builds#the-manifest-file)'s `.vite/manifest.json` already has the information. Each page is its own dynamic-entry chunk, keyed by its source path. Its `css` array lists the stylesheets Rolldown extracted from it, and its `imports` array names the chunks it statically depends on. A component shared by several pages (say `Card.tsx`, which imports `Card.module.css`) ends up in a shared chunk, and its CSS is listed on _that_ chunk, not on the pages that use it:
 
-```typescript title="packages/eigen/plugin.ts (inside config())"
-environments: {
-  client: {
-    build: {
-      outDir: 'dist/client',
-      manifest: true,
-      ssrManifest: true, // ← writes .vite/ssr-manifest.json
-    },
-  },
-},
-```
-
-The SSR manifest maps source module IDs (relative to the project root) to the built files they end up in, including their CSS:
-
-```json title="dist/client/.vite/ssr-manifest.json"
+```json title="dist/client/.vite/manifest.json (excerpt)"
 {
-  "src/pages/Home.tsx": ["/assets/Home-a1b2c3.css"],
-  "src/pages/Dashboard.tsx": ["/assets/Dashboard-d4e5f6.css", "/assets/shared-789abc.css"]
+  "index.html": {
+    "file": "assets/index-a1b2c3d4.js",
+    "isEntry": true,
+    "css": ["assets/index-e5f6g7h8.css"]
+  },
+  "src/pages/Dashboard.tsx": {
+    "file": "assets/Dashboard-d4e5f6.js",
+    "src": "src/pages/Dashboard.tsx",
+    "isDynamicEntry": true,
+    "imports": ["index.html", "_Card-x1y2z3.js"],
+    "css": ["assets/Dashboard-9k8j7h.css"]
+  },
+  "_Card-x1y2z3.js": {
+    "file": "assets/Card-x1y2z3.js",
+    "name": "Card",
+    "css": ["assets/Card-789abc.css"]
+  }
 }
 ```
 
+So a page's CSS is the `css` of its own chunk plus the `css` of every chunk it imports, transitively. The entry chunk (`index.html`) can be skipped: the built `dist/client/index.html` already links its stylesheet ([Part 6](/06-production-builds#the-manifest-file)).
+
+Vite can also emit an _SSR manifest_ (`build.ssrManifest`), which maps every source module to its chunk and that chunk's CSS. Vue's SSR pairs it with the list of modules that actually rendered. React has no such list, and the SSR manifest doesn't follow a chunk's imports, so looking up only the page's module ID would miss the shared `Card` stylesheet. Walking the build manifest's `imports` doesn't have that gap.
+
 ### Collecting styles during render
 
-React has no hook that reports "these modules rendered" (Vue's `ssrContext.modules` has no React equivalent), so the framework works from what it already knows before rendering: the matched route. The page module and its layouts ([Part 13](/13-nested-layouts)) determine the shell's CSS. Part 37 adds one field to each entry in the generated `eigen/routes` module — `moduleId`, the page's path relative to the project root (e.g. `'src/pages/posts/[id].tsx'`), which is exactly the key format the SSR manifest uses.
+React has no hook that reports "these modules rendered" (Vue's `ssrContext.modules` has no React equivalent), so the framework works from what it already knows before rendering: the matched route. The page module and its layouts ([Part 13](/13-nested-layouts)) determine the shell's CSS. Part 37 adds a `moduleId` to each page and layout entry in the generated `eigen/routes` module. It's the file's path relative to the project root (e.g. `'src/pages/posts/[id].tsx'`), which is the key format the manifest uses. Part 13's `url`s are root-relative URLs already, so `moduleId` is the URL without its leading slash. In the server branch of the route generator:
+
+```typescript title="packages/eigen/plugins/route-tree.ts"
+        declarations.push(
+          `import * as ${name}Mod from '${node.layout.url}'`,
+          `const ${name} = { path: '${node.layout.path}', component: ${name}Mod.default, loader: ${name}Mod.loader }`, // [!code --]
+          `const ${name} = { path: '${node.layout.path}', moduleId: '${node.layout.url.slice(1)}', component: ${name}Mod.default, loader: ${name}Mod.loader }`, // [!code ++]
+        );
+// ...
+        routes.push(
+          `  { path: '${page.path}', component: ${mod}.default, loader: ${mod}.loader, layouts: ${layouts} }`, // [!code --]
+          `  { path: '${page.path}', moduleId: '${page.url.slice(1)}', component: ${mod}.default, loader: ${mod}.loader, layouts: ${layouts} }`, // [!code ++]
+        );
+```
+
+The types gain the matching optional field. It's optional because the client's route table doesn't carry it:
+
+```typescript title="packages/eigen/types.ts"
+export interface LayoutDefinition {
+  path: string;
+  moduleId?: string; // [!code ++]
+  component: React.ComponentType<LayoutProps>;
+  loader?: RouteDefinition["loader"];
+}
+
+export interface RouteDefinition {
+  path: string;
+  moduleId?: string; // [!code ++]
+  // ...unchanged
+}
+```
+
+The lookup walks the manifest from those IDs:
 
 ```typescript title="packages/eigen/css.ts"
-export type SsrManifest = Record<string, string[]>;
+import type { Manifest } from "vite";
 
-/** Look up the CSS files for a set of source module IDs. */
-export function collectCss(moduleIds: Iterable<string>, manifest: SsrManifest): string[] {
+/**
+ * Stylesheets for a set of root-relative module IDs: each module's chunk
+ * plus every chunk it statically imports. The entry chunk is skipped,
+ * because the built index.html already links its CSS.
+ */
+export function collectCss(moduleIds: Iterable<string>, manifest: Manifest, base = "/"): string[] {
   const css = new Set<string>();
-  for (const id of moduleIds) {
-    for (const file of manifest[id] ?? []) {
-      if (file.endsWith(".css")) css.add(file);
-    }
-  }
+  const seen = new Set<string>();
+
+  const visit = (key: string) => {
+    const chunk = manifest[key];
+    if (!chunk || chunk.isEntry || seen.has(key)) return;
+    seen.add(key);
+    for (const file of chunk.css ?? []) css.add(base + file);
+    for (const imported of chunk.imports ?? []) visit(imported);
+  };
+
+  for (const id of moduleIds) visit(id);
   return [...css];
 }
 
@@ -107,62 +155,122 @@ export function cssLinkTags(hrefs: string[]): string {
 }
 ```
 
-The server entry calls it inside `render(request)` ([Part 14](/14-framework-middleware)), after matching and before the shell streams ([Part 12](/12-streaming-ssr)) — the `<head>` has to contain the links before the first byte is sent:
+Register `eigen/css` in `resolve.alias` and tsconfig `paths` like the other runtime modules.
 
-```tsx title="src/entry-server.tsx (excerpt)"
+### Getting the manifest into the server bundle
+
+The server entry can't read `dist/client/.vite/manifest.json` from disk at startup: in dev that file doesn't exist (or is a stale leftover from the last build), and an edge adapter ([Part 17](/17-deployment-adapters)) has no file system to read it from. The build order solves this. [Part 11](/11-framework-plugin)'s `buildApp` builds the client first, so by the time the server environment builds, the manifest is on disk and a virtual module can inline it:
+
+```typescript title="packages/eigen/plugins/client-manifest.ts"
 import { readFileSync } from "node:fs";
-import { collectCss, cssLinkTags, type SsrManifest } from "eigen/css";
+import { resolve } from "node:path";
+import type { Plugin } from "vite";
 
-// Production: read once at startup (the dev server uses the module graph instead — see below)
-const ssrManifest: SsrManifest = JSON.parse(readFileSync("dist/client/.vite/ssr-manifest.json", "utf-8"));
+const VIRTUAL_ID = "eigen/client-manifest";
+const RESOLVED_ID = "\0eigen/client-manifest";
 
-// ...inside render(request), once `match` is known:
-const moduleIds = [
-  "src/entry-client.tsx", // global CSS imported by the client entry
-  match.route.moduleId, // the page itself
-  // ...plus each layout file in the route's layout chain (Part 13),
-  // recorded as root-relative IDs the same way
-];
-const cssLinks = cssLinkTags(collectCss(moduleIds, ssrManifest));
-const head = template.replace("<!--ssr-css-->", cssLinks);
-// ...then stream the React tree after `head` as in Part 12
+/** The client build's manifest, inlined into the server bundle */
+export function eigenClientManifestPlugin(): Plugin {
+  return {
+    name: "eigen:client-manifest",
+    enforce: "pre", // claim the ID before Vite's resolver (see Part 40)
+
+    resolveId(id) {
+      if (id === VIRTUAL_ID) return RESOLVED_ID;
+    },
+
+    load(id) {
+      if (id !== RESOLVED_ID) return;
+      // Dev has no manifest: the dev server walks the module graph instead (below)
+      if (this.environment.mode === "dev") return { code: "export default {}", moduleType: "js" };
+
+      const { root, environments } = this.environment.config;
+      const file = resolve(root, environments.client.build.outDir, ".vite/manifest.json");
+      return { code: `export default ${readFileSync(file, "utf-8")}`, moduleType: "js" };
+    },
+  };
+}
 ```
 
-Components that a page loads with `React.lazy()` are separate chunks; their CSS isn't in this list, and Vite's client runtime loads it alongside the chunk when it's requested.
+Add it to the array `eigen()` returns, and declare the module next to the other virtual-module declarations: `declare module 'eigen/client-manifest' { const manifest: import('vite').Manifest; export default manifest }`.
+
+### Wiring it into `renderStream`
+
+The links have to be in the `<head>` before the first byte is sent, so they're decided in `renderStream` ([Part 12](/12-streaming-ssr), taking a `Request` since [Part 14](/14-framework-middleware)), after matching and before the shell streams. First, give the template a place for them:
+
+```html title="index.html"
+  <head>
+    <title>Eigen Framework</title>
+    <!--ssr-css--> <!-- [!code ++] -->
+  </head>
+```
+
+The server entry fills it. In production the lookup uses the inlined manifest. In dev, only the dev server has the module graph (the entry runs inside the module runner, with no access to the `ViteDevServer`), so the dev server passes the lookup in as an option:
+
+```tsx title="src/entry-server.tsx (excerpt)"
+import clientManifest from "eigen/client-manifest"; // [!code ++]
+import { collectCss, cssLinkTags } from "eigen/css"; // [!code ++]
+
+export interface StreamOptions {
+  template: string;
+  waitForAll?: boolean;
+  /** Dev only: CSS for root-relative module IDs, from the dev server's module graph */ // [!code ++]
+  collectDevCss?: (moduleIds: string[]) => Promise<string[]>; // [!code ++]
+}
+
+export async function renderStream(
+  request: Request,
+  { template, waitForAll = false, collectDevCss }: StreamOptions, // [!code ++]
+): Promise<Response> {
+  // ...match the route and run middleware + loaders, as in Part 14
+
+  // The page and its layout chain: the modules that make up the shell // [!code ++]
+  const moduleIds = match // [!code ++]
+    ? [...match.route.layouts.map((layout) => layout.moduleId), match.route.moduleId].filter((id) => id !== undefined) // [!code ++]
+    : []; // [!code ++]
+  const cssHrefs = import.meta.env.DEV // [!code ++]
+    ? ((await collectDevCss?.(moduleIds)) ?? []) // [!code ++]
+    : collectCss(moduleIds, clientManifest, import.meta.env.BASE_URL); // [!code ++]
+
+  // Split the template at the outlet marker, with the CSS links already in its <head>
+  const [htmlBefore, htmlAfter] = template.split("<!--ssr-outlet-->"); // [!code --]
+  const [htmlBefore, htmlAfter] = template // [!code ++]
+    .replace("<!--ssr-css-->", cssLinkTags(cssHrefs)) // [!code ++]
+    .split("<!--ssr-outlet-->"); // [!code ++]
+  // ...then render and stream exactly as in Part 12
+}
+```
+
+`import.meta.env.DEV` is replaced at build time, so the server bundle keeps only the manifest branch. Nothing changes for the production server, SSG, or the adapters: they call `renderStream` exactly as before.
+
+Components that a page loads with `React.lazy()` are separate chunks that the walk doesn't reach (they're `dynamicImports`, not `imports`). Vite's client runtime loads their CSS alongside the chunk when it's requested.
 
 ### Inlining vs. linking
 
-For maximum performance, you can **inline** critical CSS directly in a `<style>` tag instead of linking to external files. This eliminates the round-trip for the stylesheet but increases the HTML payload size:
+Instead of linking, you can **inline** the route's CSS in a `<style>` tag. This removes the stylesheet round-trip before first paint but makes every HTML response bigger:
 
 ```typescript title="packages/eigen/css.ts (continued)"
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
-export async function inlineCriticalCss(cssFiles: string[], distDir: string): Promise<string> {
-  const contents = await Promise.all(cssFiles.map((file) => readFile(resolve(distDir, file.slice(1)), "utf-8")));
-
-  // Inline critical styles, lazy-load full stylesheets
-  const inlined = `<style>${contents.join("\n")}</style>`;
-  // Lazy-load full stylesheets — note that inline `onload` handlers
-  // may be blocked by strict Content Security Policies. In production,
-  // consider using a small loader script with a nonce instead.
-  const preloads = cssFiles
-    .map((file) => `<link rel="preload" href="${file}" as="style" onload="this.rel='stylesheet'">`)
-    .join("\n");
-
-  return inlined + "\n" + preloads;
+/** Inline whole stylesheets in place of <link> tags (hrefs as returned by collectCss) */
+export async function inlineCss(hrefs: string[], clientDir: string, base = "/"): Promise<string> {
+  const contents = await Promise.all(hrefs.map((href) => readFile(resolve(clientDir, href.slice(base.length)), "utf-8")));
+  return `<style>${contents.join("\n")}</style>`;
 }
 ```
 
+This inlines whole files and emits no `<link>` for them, so each rule arrives once. It doesn't extract an above-the-fold subset. The cost is caching: inlined bytes are re-sent with every HTML response, while a linked file is downloaded once and reused on every later page that needs it. What's usually called "critical CSS" is the subset approach. Tools like [Beasties](https://github.com/danielroe/beasties) (the successor to Critters) find the rules the initial markup actually uses, inline only those, and load the full stylesheet asynchronously. That's a build-time step for pre-rendered pages, not something to run per request. `inlineCss` reads from disk, so it only fits a Node server.
+
 <Callout type="tip" title="When to inline vs. link">
-  Inline CSS for the initial shell (above the fold). Link external stylesheets for lazily-loaded routes. The manifest
-  gives you the information to make this decision per-route — shell components get inlined, dynamic imports get preload
-  hints.
+  Inline when a route's CSS is small and most visits land on it cold, as with marketing pages. Link when users move
+  between pages that share stylesheets, so the browser cache does the work. Either way, the route lookup is the same;
+  only the tag that carries the CSS changes.
 </Callout>
 
 ### Collecting CSS in development
 
-There is no manifest in dev. Instead, the SSR environment's module graph already knows every module the page imported — the module runner loaded them to render it. Walking the graph from the page's module finds its stylesheets:
+There is no manifest in dev. Instead, the SSR environment's module graph already knows every module the page imported, because the module runner loaded them to render it. Walking the graph from the page and its layouts finds their stylesheets:
 
 ```typescript title="packages/eigen/dev-css.ts"
 import type { EnvironmentModuleNode, ViteDevServer } from "vite";
@@ -171,7 +279,7 @@ const CSS_RE = /\.(css|less|sass|scss|styl|stylus|pcss|postcss)(?:$|\?)/;
 
 export async function collectDevCss(
   server: ViteDevServer,
-  entryUrls: string[], // e.g. ['/src/entry-server.tsx', '/src/pages/posts/[id].tsx']
+  moduleIds: string[], // root-relative, e.g. ['src/pages/layout.tsx', 'src/pages/posts/[id].tsx']
 ): Promise<string[]> {
   const graph = server.environments.ssr.moduleGraph;
   const seen = new Set<EnvironmentModuleNode>();
@@ -184,17 +292,31 @@ export async function collectDevCss(
     for (const dep of mod.importedModules) visit(dep);
   };
 
-  for (const url of entryUrls) visit(await graph.getModuleByUrl(url));
+  // The global stylesheet, through the eigen/styles virtual module (below)
+  visit(graph.getModuleById("\0eigen/styles"));
+  for (const id of moduleIds) visit(await graph.getModuleByUrl(`/${id}`));
   return [...css];
 }
 ```
 
-The dev server emits these as `<link rel="stylesheet">` tags with the same `cssLinkTags` helper — Vite serves a plain stylesheet when a `<link>` requests a CSS file — so the first paint is styled in dev just like in production. Once the client hydrates, Vite's own CSS injection takes over and handles HMR.
+The walk starts from the page and its layouts, not from `/src/entry-server.tsx`: on the server, `eigen/routes` imports _every_ page, so a walk from the entry would collect every page's CSS. The dev server ([Part 12](/12-streaming-ssr#updating-the-dev-server)) passes it in:
+
+```typescript title="server.ts"
+import { collectDevCss } from "./packages/eigen/dev-css"; // [!code ++]
+
+      return await renderStream(event.req, {
+        template,
+        waitForAll: isBot(event.req),
+        collectDevCss: (ids) => collectDevCss(vite, ids), // [!code ++]
+      });
+```
+
+The links use the same `cssLinkTags` helper. Vite serves a plain stylesheet when a `<link>` requests a CSS file, so the first paint is styled in dev just like in production. Once the client loads, Vite's own CSS injection adds a `<style>` tag per module and handles HMR. The SSR `<link>`s stay in the document, so in dev each stylesheet applies twice. That's harmless while the rules are identical. After an edit, though, the stale link still applies rules you deleted. Production frameworks remove their dev-only SSR links once the client has taken over, for example after hydration when `import.meta.hot` is set. Eigen leaves this out.
 
 <Callout type="info" title="Why not `transformIndexHtml`?">
   `transformIndexHtml` runs once per HTML file — at build time that's a single pass over `index.html`, with no knowledge
-  of which route a future request will hit. Per-route CSS has to be decided at request time, in `render(request)`, which
-  is where both the manifest lookup and the dev module-graph walk live.
+  of which route a future request will hit. Per-route CSS has to be decided at request time, in `renderStream`, which
+  is where both the manifest lookup and the dev module-graph walk are called from.
 </Callout>
 
 ---
@@ -242,7 +364,7 @@ function generateDts(classNames: string[]): string {
 }
 ```
 
-The keys already reflect `css.modules.localsConvention` (with `'camelCaseOnly'`, `.page-header` arrives as `pageHeader`). TypeScript resolves `import styles from './Dashboard.module.css'` to the sibling `Dashboard.module.css.d.ts`, which takes precedence over the generic `*.module.css` declaration in `vite/client`. Two caveats: a user-supplied `css.modules.getJSON` replaces this one when configs merge, and with `css.transformer: 'lightningcss'` the callback never runs, because `postcss-modules` isn't involved.
+The keys already reflect `css.modules.localsConvention` (with `'camelCaseOnly'`, `.page-header` arrives as `pageHeader`). TypeScript resolves `import styles from './Dashboard.module.css'` to the sibling `Dashboard.module.css.d.ts`, which takes precedence over the generic `*.module.css` declaration in `vite/client`. Two caveats: Vite merges a plugin's `config()` result over the user's config, so this plugin's `getJSON` overrides any user-supplied one (read the user's callback from the `config(config)` argument and call it too if you need both), and with `css.transformer: 'lightningcss'` the callback never runs, because `postcss-modules` isn't involved.
 
 Now your imports are fully typed:
 
@@ -361,7 +483,7 @@ This **requires** a synchronous, single-pass render — you need to know all the
 
 ### RSC makes it worse
 
-React Server Components run on the server and produce a serializable payload — not HTML. The RSC payload cannot contain runtime JavaScript (which is what CSS-in-JS libraries inject). A Server Component cannot call `styled()` or `css()` because those functions create client-side style sheets.
+React Server Components run on the server and produce a serializable payload — not HTML. The RSC payload cannot contain runtime JavaScript (which is what CSS-in-JS libraries inject). Runtime CSS-in-JS libraries need React context and hooks (for the theme and for a render-time style registry that collects the generated rules), and Server Components support neither, so a Server Component can't render a `styled()` component.
 
 ### Zero-runtime alternatives
 
@@ -373,15 +495,14 @@ The Vite 8 ecosystem favors zero-runtime CSS solutions that extract styles at bu
 | **Tailwind CSS v4** | Utility classes, scanned at build time             | Vite plugin          |
 | **Vanilla Extract** | TypeScript-authored styles, compiled to CSS        | Vite plugin          |
 | **Panda CSS**       | Utility + recipe patterns, extracted at build time | PostCSS plugin       |
-| **Lightning CSS**   | CSS nesting + custom properties, native transforms | Built into Vite 8    |
 
-These all produce static CSS files — no runtime style injection, no streaming conflicts, no RSC incompatibility.
+These all produce static CSS files (and Lightning CSS, a transformer rather than an authoring approach, minifies whatever they emit) — no runtime style injection, no streaming conflicts, no RSC incompatibility.
 
 <Callout type="info" title="The industry trajectory">
   The React ecosystem is moving toward build-time CSS extraction. In Next.js's App Router, runtime CSS-in-JS libraries
   work only in Client Components (via a style registry built on `useServerInsertedHTML`) and not in Server Components.
-  Remix has always favored CSS Modules and Tailwind. Vite 8's architecture — with Rolldown bundling and Lightning CSS
-  transforms — makes build-time CSS the path of least resistance.
+  Remix has always favored CSS Modules and Tailwind. Vite 8's architecture — with Rolldown bundling, Lightning CSS
+  minification, and opt-in Lightning CSS transforms — makes build-time CSS the path of least resistance.
 </Callout>
 
 ---
@@ -403,6 +524,7 @@ export function eigenStylesPlugin(options: { globalCss?: string } = {}): Plugin 
 
   return {
     name: "eigen:styles",
+    enforce: "pre", // claim the ID before Vite's resolver (see Part 40)
 
     resolveId(id) {
       if (id === VIRTUAL_STYLES) return RESOLVED_STYLES;
@@ -423,7 +545,7 @@ Both entries import it:
 import "eigen/styles";
 ```
 
-On the client, the global CSS becomes part of the entry chunk's stylesheet — which is why the production lookup above includes `'src/entry-client.tsx'` among the module IDs. On the server, the import is a no-op at runtime but puts the stylesheet into the SSR module graph, so the dev-time walk (starting from `/src/entry-server.tsx` and the page) finds it. Either way, the result is injected at the `<!--ssr-css-->` placeholder in `render(request)`.
+On the client, the global CSS becomes the entry chunk's stylesheet, which the built `dist/client/index.html` already links ([Part 6](/06-production-builds#the-manifest-file)). That's why the production lookup skips the entry chunk: only route-specific CSS has to be looked up. On the server, the import is a no-op at runtime but puts the stylesheet into the SSR module graph, where `collectDevCss` starts its walk (`\0eigen/styles`). In dev, the result is injected at the `<!--ssr-css-->` placeholder along with the route's own stylesheets.
 
 This abstraction lets application developers write their global styles in one place without thinking about the underlying CSS collection strategy — the framework handles the dev/production split internally.
 
@@ -438,13 +560,13 @@ Build time (Vite 8 / Rolldown):
   ├── CSS Modules → scoped class names + .d.ts types
   ├── Tailwind v4 → utility CSS extraction
   ├── Lightning CSS → minification + vendor prefixes
-  └── Manifest → module → CSS file mapping
+  └── Manifest → chunk → CSS files + imported chunks
 
 SSR render time (Eigen):
   ├── Match the route → page + layout module IDs
-  ├── Look up CSS in the SSR manifest (dev: walk the module graph)
-  ├── Inline critical CSS in <head>
-  └── Preload remaining stylesheets
+  ├── Walk the manifest from them (dev: walk the module graph)
+  ├── Link (or inline) the route's CSS at <!--ssr-css-->
+  └── Lazy chunks load their own CSS on the client
 
 Client hydration:
   └── Styles already in DOM — no flash of unstyled content

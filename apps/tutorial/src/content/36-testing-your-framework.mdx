@@ -24,23 +24,28 @@ This means we can test the framework's core logic without starting a dev server,
 
 ## Setting up Vitest
 
-Vitest is the natural choice for testing Vite-based projects — it shares Vite's transform pipeline, understands TypeScript natively, and resolves virtual modules the same way Vite does.
+Vitest is the natural choice for testing Vite-based projects — it runs tests through Vite's own transform pipeline, understands TypeScript natively, and resolves aliases and virtual modules the same way Vite does, as long as it sees the same config. The examples use Vitest 4 or later.
 
 ```bash
 npm i -D vitest
 ```
 
 ```typescript title="vitest.config.ts"
-import { defineConfig } from "vitest/config";
+import { defineConfig, mergeConfig } from "vitest/config";
+import viteConfig from "./vite.config";
 
-export default defineConfig({
-  test: {
-    globals: true,
-    environment: "node",
-    include: ["**/__tests__/**/*.test.ts", "**/*.test.ts"],
-  },
-});
+// Extend the app's Vite config instead of replacing it
+export default mergeConfig(
+  viteConfig,
+  defineConfig({
+    test: {
+      environment: "node",
+    },
+  }),
+);
 ```
+
+When a `vitest.config.ts` exists, Vitest reads it _instead of_ `vite.config.ts`. A config that only says `defineConfig({ test: … })` would drop the framework plugin and the `eigen/*` aliases, and the inline tests from earlier parts that import `eigen/middleware` or `eigen/match-route` would fail with "Failed to resolve import". `mergeConfig` keeps them. (Putting the `test` block straight into `vite.config.ts` works too.) There's no `include` here: Vitest's default finds every `*.test.ts` and `*.test.tsx` file.
 
 Add a test script to `package.json`:
 
@@ -68,7 +73,7 @@ A framework's test suite naturally falls into four layers:
 | **Integration** | Full render pipeline (middleware → loader → component → HTML) | ~100ms each | `render(new Request('http://localhost/posts/42'))` returns HTML with post title |
 | **E2E**         | Browser behavior (navigation, hydration, interactivity)       | ~1s each    | Click link, see new page without full reload                                    |
 
-The inline test sections throughout the series focused on unit tests. This chapter builds upward through plugin and integration tests.
+The inline test sections throughout the series focused on unit tests. This chapter builds upward through plugin and integration tests, and ends with the browser layer.
 
 ---
 
@@ -94,66 +99,65 @@ Plugin hooks are harder to test than pure functions because they interact with V
 
 ### Approach 1: Extract and test the logic
 
-The simplest approach — extract the hook's logic into a testable function, and test that function directly. This is what we did for `fileToRoute` and `matchRoute`.
+The simplest approach — extract the hook's logic into a testable function, and test that function directly. This is what we did for `fileToRoute` and `matchRoute`, and the route plugin's code generation is already shaped this way: since [Part 13](/13-nested-layouts#generating-the-nested-virtual-module), the `load` hook only calls `generateRouteCode(tree, isSSR)` from `packages/eigen/plugins/route-tree.ts`. Test that function with a hand-built `RouteNode` (the shape from [Part 35](/35-error-boundaries-loading#file-conventions)), so the test exercises the same code the plugin runs:
 
-```typescript title="plugins/eigen-routes.ts"
-// Export the logic for testing
-export function generateClientRouteModule(routes: DiscoveredRoute[]): string {
-  const imports = routes.map((r, i) => `const Page${i} = React.lazy(() => import('${r.componentPath}'))`).join("\n");
-
-  const routeArray = routes.map((r, i) => `  { path: '${r.path}', component: Page${i} }`).join(",\n");
-
-  return `import React from 'react'\n${imports}\nexport const routes = [\n${routeArray}\n]`;
-}
-
-export function generateServerRouteModule(routes: DiscoveredRoute[]): string {
-  // Namespace imports: a page without a `loader` export simply yields
-  // `RouteMod0.loader === undefined` instead of a missing-export error
-  const imports = routes.map((r, i) => `import * as RouteMod${i} from '${r.componentPath}'`).join("\n");
-
-  const routeArray = routes
-    .map((r, i) => `  { path: '${r.path}', component: RouteMod${i}.default, loader: RouteMod${i}.loader }`)
-    .join(",\n");
-
-  return `${imports}\nexport const routes = [\n${routeArray}\n]`;
-}
-```
-
-```typescript title="plugins/__tests__/route-codegen.test.ts"
+```typescript title="packages/eigen/plugins/__tests__/route-codegen.test.ts"
 import { describe, it, expect } from "vitest";
-import { generateClientRouteModule, generateServerRouteModule } from "../eigen-routes";
+import { generateRouteCode, type RouteNode } from "../route-tree";
 
-const routes = [
-  { path: "/", componentPath: "/src/pages/Home.tsx", file: "Home.tsx", paramNames: [] },
-  { path: "/posts/:id", componentPath: "/src/pages/posts/[id].tsx", file: "posts/[id].tsx", paramNames: ["id"] },
-];
+const dir = (path: string, rest: Partial<RouteNode>): RouteNode => ({
+  path,
+  layout: null,
+  error: null,
+  loading: null,
+  notFound: null,
+  pages: [],
+  children: [],
+  ...rest,
+});
 
-describe("generateClientRouteModule", () => {
+// pages/layout.tsx, pages/Home.tsx, pages/posts/[id].tsx
+const tree = dir("/", {
+  layout: { path: "/", url: "/src/pages/layout.tsx", file: "/app/src/pages/layout.tsx" },
+  pages: [{ path: "/", url: "/src/pages/Home.tsx" }],
+  children: [dir("/posts", { pages: [{ path: "/posts/:id", url: "/src/pages/posts/[id].tsx" }] })],
+});
+
+describe("generateRouteCode (client)", () => {
+  const code = generateRouteCode(tree, false);
+
   it("uses React.lazy for code splitting", () => {
-    const code = generateClientRouteModule(routes);
     expect(code).toContain("React.lazy");
-    expect(code).toContain("import('/src/pages/Home.tsx')");
+    expect(code).toContain("import('/src/pages/posts/[id].tsx')");
   });
 
-  it("does not include loader references", () => {
-    const code = generateClientRouteModule(routes);
+  it("does not include loader or middleware references", () => {
     expect(code).not.toContain("loader");
+    expect(code).not.toContain("middleware");
   });
 });
 
-describe("generateServerRouteModule", () => {
+describe("generateRouteCode (SSR)", () => {
+  const code = generateRouteCode(tree, true);
+
   it("uses static namespace imports", () => {
-    const code = generateServerRouteModule(routes);
-    expect(code).toContain("import * as RouteMod0 from '/src/pages/Home.tsx'");
+    expect(code).toMatch(/import \* as RouteMod\d+ from '\/src\/pages\/Home\.tsx'/);
     expect(code).not.toContain("React.lazy");
   });
 
-  it("includes loader references", () => {
-    const code = generateServerRouteModule(routes);
-    expect(code).toContain("loader: RouteMod1.loader");
+  it("includes loader and middleware references", () => {
+    expect(code).toMatch(/loader: RouteMod\d+\.loader/);
+    expect(code).toMatch(/middleware: RouteMod\d+\.middleware/); // Part 14
+  });
+
+  it("declares each layout once and shares it between routes", () => {
+    // Layout persistence (Part 13) depends on this object identity
+    expect(code.match(/const layout\d+ =/g)).toHaveLength(1);
   });
 });
 ```
+
+The variable names carry counters (`RouteMod1`, `layout0`), so the assertions match patterns rather than exact names; a refactor that renumbers them shouldn't fail the suite. `globalMiddleware` is emitted by the `load` hook itself, because it needs the project root, so it's covered by the module-runner tests below.
 
 This tests the code generation logic without any Vite involvement. The trade-off: you're not testing the hook integration (does `resolveId` correctly intercept the virtual module ID? does `load` check the environment correctly?). For most cases, this coverage is sufficient — the glue code is thin enough to verify by inspection.
 
@@ -161,7 +165,7 @@ This tests the code generation logic without any Vite involvement. The trade-off
 
 For higher confidence, create a minimal Vite project in your test fixtures (its `vite.config.ts` uses `eigen()` from [Part 11](/11-framework-plugin)) and build both environments with Vite's builder API — the same `createBuilder` that `vite build` uses under the hood:
 
-```typescript title="plugins/__tests__/plugin-integration.test.ts"
+```typescript title="packages/eigen/plugins/__tests__/plugin-integration.test.ts"
 import { describe, it, expect } from "vitest";
 import { createBuilder, type ViteBuilder } from "vite";
 import { fileURLToPath } from "node:url";
@@ -188,9 +192,12 @@ describe("eigen-routes plugin (integration)", () => {
     const clientChunks = chunksOf(await builder.build(builder.environments.client));
     const ssrChunks = chunksOf(await builder.build(builder.environments.ssr));
 
-    // Client: every page is a React.lazy() dynamic import → its own chunk
+    // Client: every page is a React.lazy() dynamic import → its own chunk.
+    // Assert by source module, not by count: layouts are lazy chunks too.
     const pageChunks = clientChunks.filter((c) => c.isDynamicEntry);
-    expect(pageChunks.length).toBe(2); // Home.tsx and posts/[id].tsx
+    expect(pageChunks.map((c) => c.facadeModuleId)).toEqual(
+      expect.arrayContaining([expect.stringContaining("Home.tsx"), expect.stringContaining("[id].tsx")]),
+    );
 
     // Client: the loader (and its server-only marker string) is gone
     const clientCode = clientChunks.map((c) => c.code).join("\n");
@@ -216,7 +223,7 @@ This is slower (~500ms per test) but tests the full plugin lifecycle. Use it spa
 
 Transform hooks are the highest-risk code in a framework — a bug silently corrupts application code. Snapshot tests provide a safety net by recording the exact output of every transform.
 
-```typescript title="plugins/__tests__/transforms.test.ts"
+```typescript title="packages/eigen/plugins/__tests__/transforms.test.ts"
 import { describe, it, expect } from "vitest";
 
 // Import your transform function
@@ -292,70 +299,68 @@ Snapshots become brittle when transforms produce non-deterministic output (times
 
 ## Integration tests: the full render pipeline
 
-Integration tests verify that the pieces work together — middleware runs, loaders fetch data, components render HTML.
+Integration tests verify that the pieces work together — middleware runs, loaders fetch data, components render HTML. To catch a regression in the framework, they have to run the framework's own code: `runRoute`, `executeMiddleware`, `loadRouteData`, the generated `eigen/routes` and the router, not a re-implementation written in the test file.
 
-```typescript title="src/__tests__/render.integration.test.ts"
-import { describe, it, expect } from "vitest";
+`render(request)` from [Part 14](/14-framework-middleware#the-middleware-execution-engine) is the natural entry point, but `entry-server.tsx` imports the `eigen/routes` virtual module and the `eigen/*` aliases, so it only loads inside a Vite module graph. The test gets one the same way the dev server does: it starts Vite on the fixture app in middleware mode and imports the server entry through the SSR environment's `ModuleRunner` ([Part 3](/03-server-side-rendering)).
 
-// Test the render function from entry-server.tsx directly.
-// This requires the virtual module to be available,
-// so we either mock it or run through Vite.
+The fixture from the build test grows one page for the middleware case:
 
-// Approach: test with a simplified render function that mirrors
-// the real render(request) contract from Part 14, using a mock route table
+```tsx title="packages/eigen/plugins/__tests__/fixtures/basic-app/src/pages/dashboard.tsx"
+import { defineLoader } from "eigen/helpers";
+import { defineMiddleware } from "eigen/middleware";
 
-type Ctx = { request: Request; params: Record<string, string>; pathname: string } & Record<string, unknown>;
+// No cookie → redirect; otherwise put a user on the context
+const requireCookie = defineMiddleware((ctx) =>
+  ctx.request.headers.get("cookie")
+    ? { user: { name: "Alice" } }
+    : new Response(null, { status: 302, headers: { Location: "/login" } }),
+);
 
-interface Route {
-  path: string;
-  component: (props: any) => string; // Simplified: return HTML string
-  loader?: (args: { params: Record<string, string>; ctx: Ctx }) => Promise<unknown>;
-  middleware?: Array<(ctx: Ctx) => Promise<Record<string, unknown> | Response | void>>;
+export const middleware = [requireCookie];
+
+export const loader = defineLoader("/dashboard", ({ ctx }) => ({
+  viewer: (ctx as typeof ctx & { user: { name: string } }).user.name,
+}));
+
+export default function Dashboard({ data }: { data: { viewer: string } }) {
+  return <p>Viewer: {data.viewer}</p>;
 }
+```
 
-type RenderResult = { response: Response } | { html: string; status: number; data: unknown };
+Its `posts/[id].tsx` loader returns ``{ title: `Post ${params.id}`, marker: 'FIXTURE_LOADER_MARKER' }`` and renders the title in an `<h1>`. The fixture's `entry-server.tsx` is the app's own; what the test exercises is everything it imports from the framework.
 
-async function render(request: Request, routes: Route[]): Promise<RenderResult> {
-  const pathname = new URL(request.url).pathname;
+```typescript title="packages/eigen/plugins/__tests__/render.integration.test.ts"
+import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { createServer, isRunnableDevEnvironment, type RunnableDevEnvironment, type ViteDevServer } from "vite";
+import { fileURLToPath } from "node:url";
 
-  // Match
-  for (const route of routes) {
-    const routeParts = route.path.split("/");
-    const pathParts = pathname.split("/");
-    if (routeParts.length !== pathParts.length) continue;
+// The contract of render() from Part 14 (head added in Part 30)
+type RenderResult = { response: Response } | { html: string; status: number; data: unknown; head: string };
+type Render = (request: Request) => Promise<RenderResult>;
 
-    const params: Record<string, string> = {};
-    const match = routeParts.every((part, i) => {
-      if (part.startsWith(":")) {
-        params[part.slice(1)] = pathParts[i];
-        return true;
-      }
-      return part === pathParts[i];
-    });
+let server: ViteDevServer;
+let render: Render;
 
-    if (match) {
-      // Run middleware — a Response short-circuits the request
-      let ctx: Ctx = { request, params, pathname };
-      for (const mw of route.middleware ?? []) {
-        const result = await mw(ctx);
-        if (result instanceof Response) return { response: result };
-        if (result) ctx = { ...ctx, ...result };
-      }
+beforeAll(async () => {
+  server = await createServer({
+    root: fileURLToPath(new URL("./fixtures/basic-app", import.meta.url)),
+    // No HTTP listener; ws: false also skips the HMR WebSocket, so the
+    // tests don't fight a running `vite dev` for its port
+    server: { middlewareMode: true, ws: false },
+    appType: "custom",
+    logLevel: "silent",
+  });
+  const env = server.environments.ssr;
+  if (!isRunnableDevEnvironment(env)) throw new Error("SSR environment is not runnable");
+  ({ render } = (await (env as RunnableDevEnvironment).runner.import("/src/entry-server.tsx")) as { render: Render });
+});
 
-      // Run loader with the accumulated context
-      const data = route.loader ? await route.loader({ params, ctx }) : null;
-
-      // Render
-      const html = route.component({ params, data });
-      return { html, status: 200, data };
-    }
-  }
-
-  return { html: "<h1>404</h1>", status: 404, data: null };
-}
+afterAll(async () => {
+  await server.close();
+});
 
 // Test helpers: build a Request, and unwrap the HTML branch
-const req = (path: string) => new Request(new URL(path, "http://localhost"));
+const req = (path: string, init?: RequestInit) => new Request(new URL(path, "http://localhost"), init);
 
 function expectPage(result: RenderResult) {
   if ("response" in result) throw new Error(`Expected a page, got ${result.response.status}`);
@@ -363,77 +368,40 @@ function expectPage(result: RenderResult) {
 }
 
 describe("render pipeline", () => {
-  const routes: Route[] = [
-    {
-      path: "/",
-      component: () => "<h1>Home</h1>",
-    },
-    {
-      path: "/posts/:id",
-      loader: async ({ params }) => ({
-        title: `Post ${params.id}`,
-        body: "Content",
-      }),
-      component: ({ data }) => `<article><h1>${data.title}</h1><p>${data.body}</p></article>`,
-    },
-    {
-      path: "/dashboard",
-      middleware: [
-        async (ctx) => {
-          // Simulate auth check: no cookie → redirect
-          if (!ctx.request.headers.get("cookie")) {
-            return new Response(null, { status: 302, headers: { Location: "/login" } });
-          }
-          return { user: { name: "Alice", role: "admin" } };
-        },
-      ],
-      loader: async ({ ctx }) => ({
-        viewer: (ctx.user as { name: string }).name,
-        stats: { views: 100 },
-      }),
-      component: ({ data }) => `<div>${data.viewer} — Views: ${data.stats.views}</div>`,
-    },
-  ];
-
   it("renders a static page", async () => {
-    const result = expectPage(await render(req("/"), routes));
+    const result = expectPage(await render(req("/")));
     expect(result.status).toBe(200);
-    expect(result.html).toBe("<h1>Home</h1>");
   });
 
   it("renders a dynamic page with loader data", async () => {
-    const result = expectPage(await render(req("/posts/42"), routes));
+    const result = expectPage(await render(req("/posts/42")));
     expect(result.status).toBe(200);
     expect(result.html).toContain("Post 42");
-    expect(result.data).toEqual({ title: "Post 42", body: "Content" });
+    // Part 13's RouteData shape: { layouts, page }
+    expect(result.data).toMatchObject({ page: { title: "Post 42" } });
   });
 
   it("returns 404 for unmatched routes", async () => {
-    const result = expectPage(await render(req("/nonexistent"), routes));
+    const result = expectPage(await render(req("/nonexistent")));
     expect(result.status).toBe(404);
   });
 
   it("passes middleware context to the loader", async () => {
-    const request = new Request("http://localhost/dashboard", {
-      headers: { cookie: "session=abc" },
-    });
-    const result = expectPage(await render(request, routes));
+    const result = expectPage(await render(req("/dashboard", { headers: { cookie: "session=abc" } })));
     expect(result.status).toBe(200);
-    expect(result.html).toContain("Alice — Views: 100");
+    expect(result.html).toContain("Alice");
   });
 
   it("short-circuits when middleware returns a Response", async () => {
-    const result = await render(req("/dashboard"), routes);
-    expect("response" in result).toBe(true);
-    if ("response" in result) {
-      expect(result.response.status).toBe(302);
-      expect(result.response.headers.get("Location")).toBe("/login");
-    }
+    const result = await render(req("/dashboard"));
+    if (!("response" in result)) throw new Error("Expected the middleware's response");
+    expect(result.response.status).toBe(302);
+    expect(result.response.headers.get("Location")).toBe("/login");
   });
 });
 ```
 
-These tests exercise the full pipeline — matching, middleware, loading, rendering — without any HTTP server or browser. Because the loader reads `ctx.user`, the "passes middleware context" test fails if middleware stops running before the loader or its context stops reaching it. They're the best tool for catching integration bugs like "middleware context doesn't reach loaders" or "loader data isn't passed to components."
+These tests exercise the full pipeline — matching, middleware, loading, rendering — without any HTTP server or browser, through the same modules the app runs. Because the loader reads `ctx.user`, the "passes middleware context" test fails if `runRoute` stops running middleware before the loaders or stops handing its context to them. They're the best tool for catching integration bugs like "middleware context doesn't reach loaders" or "loader data isn't passed to components." (`toContain("Alice")` rather than `"Viewer: Alice"`: React separates adjacent text nodes with `<!-- -->` in server HTML.) Starting Vite costs a few hundred milliseconds, once per file, so keep the `beforeAll` setup shared and the individual tests cheap.
 
 ---
 
@@ -494,9 +462,9 @@ The "schema drift" test catches a real-world scenario: the server adds a field (
 
 ## Testing with the SSR module runner
 
-For the highest-fidelity plugin tests, load modules through the SSR environment's `ModuleRunner` — the same mechanism the dev server uses since [Part 3](/03-server-side-rendering) — so they pass through the full plugin pipeline:
+The same setup tests the plugin's output directly: import the virtual module itself through the SSR environment's `ModuleRunner`, so it passes through the full plugin pipeline:
 
-```typescript title="plugins/__tests__/ssr-load.test.ts"
+```typescript title="packages/eigen/plugins/__tests__/ssr-load.test.ts"
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { createServer, isRunnableDevEnvironment, type RunnableDevEnvironment, type ViteDevServer } from "vite";
 import { fileURLToPath } from "node:url";
@@ -508,7 +476,7 @@ describe("virtual module via the SSR module runner", () => {
   beforeAll(async () => {
     server = await createServer({
       root: fileURLToPath(new URL("./fixtures/basic-app", import.meta.url)),
-      server: { middlewareMode: true },
+      server: { middlewareMode: true, ws: false },
       appType: "custom",
       logLevel: "silent",
     });
@@ -533,6 +501,11 @@ describe("virtual module via the SSR module runner", () => {
     expect(paths).toContain("/");
   });
 
+  it("exports the global middleware list (Part 14)", async () => {
+    const mod = await ssrEnv.runner.import("eigen/routes");
+    expect(Array.isArray(mod.globalMiddleware)).toBe(true);
+  });
+
   it("includes loaders in SSR module", async () => {
     const mod = await ssrEnv.runner.import("eigen/routes");
     const routeWithLoader = mod.routes.find((r: any) => r.loader !== undefined);
@@ -544,25 +517,132 @@ describe("virtual module via the SSR module runner", () => {
 });
 ```
 
-This spins up a real Vite dev server (in middleware mode, so no HTTP listener) and loads modules through the full pipeline. It's slower than unit tests but provides complete confidence that your plugin integrates correctly with Vite.
+This spins up a real Vite dev server (in middleware mode, so no HTTP listener; `ws: false` also skips the HMR socket) and loads modules through the full pipeline. It's slower than unit tests but provides complete confidence that your plugin integrates correctly with Vite.
+
+---
+
+## Browser and end-to-end tests
+
+Everything so far runs in Node. The bugs this framework is most prone to don't: hydration mismatches, the `React.lazy` and Suspense handshake from [Part 4](/04-hydration), client-side navigation through the Navigation API, error boundaries catching on the client. Those need a real browser, at two levels.
+
+**Component tests in a browser.** Vitest's browser mode runs ordinary test files in a real browser through Playwright. Split the suite into projects, so Node tests and browser tests each run in their environment from one `vitest run`:
+
+```bash
+npm i -D @vitest/browser-playwright vitest-browser-react
+npx playwright install chromium
+```
+
+```typescript title="vitest.config.ts"
+import { defineConfig, mergeConfig } from "vitest/config";
+import { playwright } from "@vitest/browser-playwright";
+import viteConfig from "./vite.config";
+
+export default mergeConfig(
+  viteConfig,
+  defineConfig({
+    test: {
+      projects: [
+        {
+          // extends: inherit the plugins and aliases from the root config
+          // (the default since Vitest 5; required in Vitest 4)
+          extends: true,
+          test: { name: "node", environment: "node", include: ["**/*.test.ts"] },
+        },
+        {
+          extends: true,
+          test: {
+            name: "browser",
+            include: ["**/*.browser.test.tsx"],
+            browser: { enabled: true, provider: playwright(), headless: true, instances: [{ browser: "chromium" }] },
+          },
+        },
+      ],
+    },
+  }),
+);
+```
+
+A browser test renders real components with `vitest-browser-react`. Part 35's error boundary is a good candidate: `getDerivedStateFromError` is the client-only half of its behavior, which no Node test can reach:
+
+```tsx title="src/__tests__/error-boundary.browser.test.tsx"
+import { expect, it } from "vitest";
+import { render } from "vitest-browser-react";
+import { RouteErrorBoundary } from "eigen/error-boundary";
+
+function Boom(): never {
+  throw new Error("boom");
+}
+
+it("catches a render error and shows the fallback with phase 'render'", async () => {
+  const screen = await render(
+    <RouteErrorBoundary fallback={({ error, phase }) => <p>{`${phase}: ${error.message}`}</p>} params={{}} pathname="/x">
+      <Boom />
+    </RouteErrorBoundary>,
+  );
+  await expect.element(screen.getByText("render: boom")).toBeInTheDocument();
+});
+```
+
+**End-to-end tests against the built app.** Hydration and navigation are properties of the whole app, so test them with [Playwright](https://playwright.dev) against a production build. Playwright starts the server itself:
+
+```typescript title="playwright.config.ts"
+import { defineConfig } from "@playwright/test";
+
+export default defineConfig({
+  testDir: "e2e",
+  use: { baseURL: "http://localhost:3000" },
+  // Build both environments, then start the production server from Part 6
+  webServer: { command: "npm run build && npm start", url: "http://localhost:3000" },
+});
+```
+
+```typescript title="e2e/navigation.spec.ts"
+import { test, expect } from "@playwright/test";
+
+test("hydrates without errors and navigates without a full reload", async ({ page }) => {
+  // Hydration mismatches surface as console errors (Part 35's onRecoverableError logs them)
+  const errors: string[] = [];
+  page.on("console", (msg) => msg.type() === "error" && errors.push(msg.text()));
+  page.on("pageerror", (error) => errors.push(error.message));
+
+  await page.goto("/posts/42");
+  await expect(page.getByRole("heading", { name: "Post 42" })).toBeVisible();
+  // Clicking before hydration would be an ordinary page load; the app's root
+  // component sets this attribute in a useEffect, which only runs once hydrated
+  await page.waitForFunction(() => document.documentElement.dataset.hydrated === "true");
+
+  // A full page load would replace `window` and lose this marker
+  await page.evaluate(() => ((window as any).__sameDocument = true));
+  await page.getByRole("link", { name: "Home" }).click();
+  await expect(page).toHaveURL("/");
+  expect(await page.evaluate(() => (window as any).__sameDocument)).toBe(true);
+
+  expect(errors).toEqual([]);
+});
+```
+
+Keep this layer thin: one test per behavior that only a browser can show, with everything else pushed down to the faster layers.
 
 ---
 
 ## Organizing the test suite
 
 ```
-plugins/
+packages/eigen/plugins/
   __tests__/
     eigen-routes.test.ts          # Unit: fileToRoute, discoverRoutes
     route-codegen.test.ts         # Unit: generated module code
     eigen-strip-loaders.test.ts   # Unit + Snapshot: transform output
     eigen-server-fns.test.ts      # Unit: ID generation, transform
     plugin-integration.test.ts    # Integration: real Vite builds
+    ssr-load.test.ts              # Integration: virtual modules via the module runner
+    render.integration.test.ts    # Integration: full render pipeline
     fixtures/
       basic-app/                  # Minimal Vite project for integration tests
         src/
           pages/
             Home.tsx
+            dashboard.tsx
             posts/[id].tsx
           entry-client.tsx
           entry-server.tsx
@@ -575,11 +655,15 @@ src/
     middleware.test.ts             # Unit: middleware execution engine
     schemas.test.ts               # Unit: validation schemas
     serialization.test.ts         # Unit: JSON round-trip behavior
-    render.integration.test.ts    # Integration: full render pipeline
+    route-types.test-d.ts         # Types: generated route types (vitest --typecheck)
+    error-boundary.browser.test.tsx  # Browser: client-side boundary behavior
+
+e2e/
+  navigation.spec.ts              # E2E (Playwright): hydration, client navigation
 ```
 
 <Callout type="info" title="Test file colocation">
-Tests live close to the code they test — plugin tests in `plugins/__tests__/`, runtime tests in `src/__tests__/`. The `__tests__` folder is a Jest convention; Vitest's default `include` (`**/*.{test,spec}.?(c|m)[jt]s?(x)`) finds these files by their `.test.ts` suffix wherever they live. Grouping them like this makes it easy to find tests and keeps them close to the code they verify. The fixture directory contains a minimal app that plugin integration tests build against.
+Tests live close to the code they test — plugin tests in `packages/eigen/plugins/__tests__/`, runtime tests in `src/__tests__/`. The `__tests__` folder is a Jest convention; Vitest's default `include` (`**/*.{test,spec}.?(c|m)[jt]s?(x)`) finds these files by their `.test.ts` suffix wherever they live; once the suite is split into projects, each project's `include` picks its share by suffix instead. (Playwright's `e2e/*.spec.ts` files would match the default too, which is one more reason to give the projects explicit `include`s.) Grouping them like this makes it easy to find tests and keeps them close to the code they verify. The fixture directory contains a minimal app that plugin integration tests build against.
 </Callout>
 
 ---
@@ -598,13 +682,14 @@ Tests live close to the code they test — plugin tests in `plugins/__tests__/`,
 - Generated code (virtual modules) via snapshots
 - The render pipeline end-to-end
 - Schema validation with edge cases (missing fields, wrong types, transforms)
+- Type-level guarantees — the generated route types are the framework's headline feature (Parts 5 and 35). Vitest has type tests built in: `expectTypeOf` assertions in `*.test-d.ts` files, checked by the TypeScript compiler when you run `vitest --typecheck`. For example, `expectTypeOf(defineLoader).parameter(0).toEqualTypeOf<RoutePaths>()` fails as soon as `defineLoader` accepts a path that isn't a route.
 
 **Rarely test:**
 
 - Vite configuration objects (the config is the test)
 - File watcher integration (test discovery logic separately, trust `chokidar`)
 - HMR behavior (test the invalidation logic, not the WebSocket transport)
-- TypeScript type inference (use `tsd` or `expect-type` if you need to, but type tests are brittle)
+- TypeScript's own inference for application code (test the types the framework promises, not every type an app happens to infer)
 
 ---
 

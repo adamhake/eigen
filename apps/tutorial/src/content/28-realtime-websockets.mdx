@@ -177,11 +177,11 @@ export function getRealtimeHandler(channel: string): RealtimeHandlerModule | und
 
 The plugin attaches the realtime server to Vite's HTTP server and loads handlers through the SSR module runner, so editing a handler takes effect on the next message without a restart:
 
-```typescript title="plugins/eigen-realtime.ts"
+```typescript title="packages/eigen/plugins/eigen-realtime.ts"
 import type { Plugin } from "vite";
 import { isRunnableDevEnvironment } from "vite";
-import { attachRealtime } from "../packages/eigen/realtime-server";
-import type { RealtimeHandlerModule } from "../packages/eigen/realtime-types";
+import { attachRealtime } from "../realtime-server";
+import type { RealtimeHandlerModule } from "../realtime-types";
 
 export default function eigenRealtime(): Plugin {
   return {
@@ -272,11 +272,14 @@ export const dashboardChannel = defineChannel<{
 }>();
 
 export const chatChannel = defineChannel<{
-  message: { userId: string; text: string; timestamp: number };
+  // Clients send { userId, text }; the server stamps `timestamp` before relaying
+  message: { userId: string; text: string; timestamp?: number };
   typing: { userId: string; isTyping: boolean };
   presence: { online: string[] };
 }>();
 ```
+
+One schema types both directions — `on` for what arrives and `send` for what goes out — so a field only the server fills in is optional.
 
 (`schemas.ts` has no `onMessage` export, so `getRealtimeHandler('schemas')` finds a module with nothing to call — clients on such a channel just listen.)
 
@@ -373,7 +376,12 @@ export function useChannel<TEvents extends Record<string, unknown>>(
       };
 
       ws.onmessage = (event) => {
-        const message = JSON.parse(event.data) as { type: string; payload: unknown };
+        let message: { type: string; payload: unknown };
+        try {
+          message = JSON.parse(event.data);
+        } catch {
+          return; // malformed frame — ignore, as the server does
+        }
         listenersRef.current.get(message.type)?.forEach((fn) => fn(message.payload));
       };
 
@@ -494,7 +502,7 @@ Both listen for `upgrade` events on the shared HTTP server, and each routes by i
 
 3. **Kill the dev server and restart it.** The client reconnects automatically with exponential backoff (2s, 4s, 8s, …). Then navigate away from the dashboard: the socket closes and _stays_ closed — no reconnect after unmount.
 
-4. **Check the Network tab's WS filter.** You'll see two sockets: Vite's (`vite-hmr` protocol, at `/`) and ours (`/_eigen/ws?channel=dashboard`).
+4. **Check the Network tab's WS filter.** You'll see two sockets: Vite's (`vite-hmr` protocol, at `/?token=…`) and ours (`/_eigen/ws?channel=dashboard`).
 
 5. **Check the Types** — hover over the `on` callback's payload parameter. TypeScript knows the exact shape based on the channel schema.
 
@@ -507,9 +515,11 @@ Real-time communication introduces a fundamentally different model from the requ
 <Callout type="warn" title="Deployment constraint">
   WebSockets require a deployment target that can hold a connection open: long-running Node.js or Deno servers, or
   Cloudflare Workers (with Durable Objects to coordinate a room across connections). Request/response serverless
-  functions (AWS Lambda, Vercel Functions) can't hold a socket; on AWS, API Gateway's WebSocket APIs keep the connection
-  and invoke a function per message instead. For platforms without WebSocket support, the framework can fall back to SSE
-  (Part 27's transport) or long-polling.
+  functions (AWS Lambda) can't hold a socket; on AWS, API Gateway's WebSocket APIs keep the connection and invoke a
+  function per message instead. Vercel Functions accept WebSockets (beta, on Fluid compute), but a connection lasts at
+  most the function's max duration and a reconnect can land on a different instance, so clients must reconnect and
+  broadcasts need the shared pub/sub described above. For platforms without WebSocket support, the framework can fall
+  back to SSE (Part 27's transport) or long-polling.
 </Callout>
 
 This is a deployment constraint, not a Vite constraint. The framework code is the same everywhere; the deployment adapter determines whether WebSockets are available.

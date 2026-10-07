@@ -9,7 +9,7 @@ concepts:
   - "error serialization across SSR"
 ---
 
-## _This module builds Eigen's error and loading state system — route-scoped error boundaries that preserve type safety, file-based `error.tsx` and `loading.tsx` conventions with generated types, granular error recovery, streaming-aware loading states, and pending UI for client-side navigations._
+_This module builds Eigen's error and loading state system — route-scoped error boundaries that know which loader failed, file-based `error.tsx`, `loading.tsx` and `not-found.tsx` conventions, granular error recovery, streaming-aware loading states, and pending UI for client-side navigations._
 
 ## The design challenge
 
@@ -27,18 +27,19 @@ Error handling in a framework has several dimensions that a simple `try/catch` d
 
 ## File conventions
 
-Eigen discovers error and loading components alongside pages and layouts:
+Eigen discovers error, loading and not-found components alongside pages and layouts:
 
 <Files>
   <Folder name="src" defaultOpen>
     <Folder name="pages" defaultOpen>
-      <File name="error.tsx" comment="Global error boundary (catches everything)" />
-      <File name="loading.tsx" comment="Global loading fallback" />
+      <File name="error.tsx" comment="Catches errors below the root layout" />
+      <File name="loading.tsx" comment="Root loading fallback" />
       <File name="not-found.tsx" comment="Global 404 page" />
       <File name="layout.tsx" />
       <Folder name="dashboard" defaultOpen>
         <File name="error.tsx" comment="Dashboard-scoped error boundary" />
         <File name="loading.tsx" comment="Dashboard-scoped loading state" />
+        <File name="not-found.tsx" comment="404 inside the dashboard layout" />
         <File name="layout.tsx" />
         <File name="index.tsx" />
         <Folder name="analytics" defaultOpen>
@@ -51,38 +52,109 @@ Eigen discovers error and loading components alongside pages and layouts:
   </Folder>
 </Files>
 
-The hierarchy works like CSS cascade — the most specific error boundary catches first. If `analytics/error.tsx` doesn't exist, the error bubbles up to `dashboard/error.tsx`, then to the root `error.tsx`.
+The hierarchy works like CSS cascade — the most specific error boundary catches first. If `analytics/error.tsx` doesn't exist, the error bubbles up to `dashboard/error.tsx`, then to the root `error.tsx`. (The root `error.tsx` sits inside the root layout, so errors in the root layout itself need one more boundary, which we'll get to below.)
+
+These files wrap routes; they aren't routes themselves. The flat `discoverRoutes` that feeds `RoutePaths` already skips `layout.tsx` ([Part 13](/13-nested-layouts#extending-route-discovery)); without the same rule for the new names, `dashboard/error.tsx` would become a `/dashboard/error` route:
+
+```typescript title="packages/eigen/plugins/eigen-routes.ts"
+		// layout.tsx files wrap routes; they aren't routes themselves // [!code --]
+		.filter((f) => !/(^|\/)layout\.tsx$/.test(f)); // [!code --]
+		// Segment files wrap routes; they aren't routes themselves // [!code ++]
+		.filter((f) => !/(^|\/)(layout|error|loading|not-found)\.tsx$/.test(f)); // [!code ++]
+```
+
+The tree builder from Part 13 records them per directory, next to the layout, along with the directory's URL path:
+
+```typescript title="packages/eigen/plugins/route-tree.ts"
+export interface RouteNode {
+  /** URL path of this directory ('/', '/dashboard', '/posts/:id') */ // [!code ++]
+  path: string; // [!code ++]
+  /** The layout.tsx in this directory, if any */
+  layout: LayoutEntry | null;
+  /** Import URLs of this directory's error.tsx, loading.tsx and not-found.tsx */ // [!code ++]
+  error: string | null; // [!code ++]
+  loading: string | null; // [!code ++]
+  notFound: string | null; // [!code ++]
+  /** Page files directly in this directory */
+  pages: Array<{ path: string; url: string }>;
+  /** Subdirectories */
+  children: RouteNode[];
+}
+
+function scanDirectory(pagesDir: string, pagesUrl: string, relDir: string): RouteNode {
+  const prefix = relDir ? `${relDir}/` : "";
+  const node: RouteNode = { layout: null, pages: [], children: [] }; // [!code --]
+  const node: RouteNode = { // [!code ++]
+    path: fileToRoute(`${prefix}index.tsx`).path, // [!code ++]
+    layout: null, // [!code ++]
+    error: null, // [!code ++]
+    loading: null, // [!code ++]
+    notFound: null, // [!code ++]
+    pages: [], // [!code ++]
+    children: [], // [!code ++]
+  }; // [!code ++]
+
+  const entries = readdirSync(join(pagesDir, relDir), { withFileTypes: true });
+  for (const entry of entries) {
+    const relFile = prefix + entry.name;
+    if (entry.isDirectory()) {
+      node.children.push(scanDirectory(pagesDir, pagesUrl, relFile));
+    } else if (entry.name === "layout.tsx") {
+      node.layout = {
+        path: node.path, // [!code ++]
+        url: `${pagesUrl}/${relFile}`,
+        file: join(pagesDir, relFile),
+      };
+    } else if (entry.name === "error.tsx") { // [!code ++]
+      node.error = `${pagesUrl}/${relFile}`; // [!code ++]
+    } else if (entry.name === "loading.tsx") { // [!code ++]
+      node.loading = `${pagesUrl}/${relFile}`; // [!code ++]
+    } else if (entry.name === "not-found.tsx") { // [!code ++]
+      node.notFound = `${pagesUrl}/${relFile}`; // [!code ++]
+    } else if (entry.name.endsWith(".tsx")) {
+      node.pages.push({ path: fileToRoute(relFile).path, url: `${pagesUrl}/${relFile}` });
+    }
+  }
+
+  return node;
+}
+```
+
+(`node.path` is the same expression the layout entry used before, so `layout.path` doesn't change.)
 
 ---
 
 ## Typed error component props
 
-When the route plugin discovers an `error.tsx` file, it generates typed props for that error component based on its position in the route tree:
+The props each convention file receives live in a new framework module. Register `eigen/error-types` in `resolve.alias` and tsconfig `paths`, like the other framework modules:
 
 ```typescript title="packages/eigen/error-types.ts"
-import type { RouteParams } from "eigen/types";
+import type { RouteParamsMap, RoutePaths } from "eigen/route-types";
 
-export interface ErrorBoundaryProps<TPath extends string = string> {
+export interface ErrorBoundaryProps<TPath extends RoutePaths = RoutePaths> {
   /** The error that was caught */
   error: Error;
-  /** Reset the error boundary and retry rendering */
+  /**
+   * Render errors: clear the error and render the children again.
+   * Loader errors: same as retryLoader (there is no data to render them with).
+   */
   reset: () => void;
   /** The route params at the time of the error */
-  params: RouteParams<TPath>;
+  params: RouteParamsMap[TPath];
   /** The pathname that errored */
   pathname: string;
-  /** Which phase the error occurred in */
-  phase: "loader" | "render" | "stream";
+  /** Which phase the error occurred in (streaming errors surface as 'render', see below) */
+  phase: "loader" | "render";
   /**
-   * Re-run the route's loaders and, if they succeed, clear the error
+   * Re-run the route's loaders; the boundary clears once they succeed
    * (available when phase is 'loader')
    */
   retryLoader?: () => Promise<void>;
 }
 
-export interface LoadingProps<TPath extends string = string> {
+export interface LoadingProps<TPath extends RoutePaths = RoutePaths> {
   /** The route params being loaded */
-  params: RouteParams<TPath>;
+  params: RouteParamsMap[TPath];
   /** The pathname being loaded */
   pathname: string;
 }
@@ -93,17 +165,7 @@ export interface NotFoundProps {
 }
 ```
 
-The generated declarations give each error component its route-specific types:
-
-```typescript title="node_modules/.eigen/eigen-error-types.d.ts"
-declare module "eigen/error-types" {
-  // Dashboard error component knows about dashboard params
-  export interface DashboardErrorProps extends ErrorBoundaryProps<"/dashboard"> {}
-
-  // Analytics error component knows about analytics params
-  export interface AnalyticsErrorProps extends ErrorBoundaryProps<"/dashboard/analytics"> {}
-}
-```
+The generic is supplied by the author, the same way `defineLoader('/posts/:id', ...)` takes its path in [Part 5](/05-typed-loaders#level-3-the-defineloader-helper): TypeScript checks that the path is a real key of `RouteParamsMap` and types `params` from it, but nothing ties the annotation to where the file lives. A `dashboard/error.tsx` that says `ErrorBoundaryProps<'/posts/:id'>` type-checks. Closing that gap takes the per-route generated modules from Part 5's [Level 4](/05-typed-loaders#level-4-conceptual-generated-per-route-types), which would export a pre-typed `ErrorProps` next to `Props`.
 
 ---
 
@@ -195,40 +257,187 @@ Option B: Error boundary OUTSIDE the layout
 
 Eigen follows Next.js's model: the error boundary wraps the **segment content**, not the layout. If the analytics page's loader fails, the dashboard layout (sidebar, navigation) still renders — only the content area shows the error. This preserves navigation context so the user can click away to a working page.
 
-But if the _layout's_ loader fails, the error boundary above it catches it, replacing the entire layout and its children with the error UI.
+But if the _layout's_ loader fails, the layout has nothing to render with, so the error boundary above it catches it, replacing the entire layout and its children with the error UI. For that to work, the pipeline has to know _which_ loader failed — we'll add that below.
 
-The virtual module generates this nesting (each segment: layout → error boundary → loading boundary → children, the same order Next.js uses):
+For `/dashboard/analytics`, each segment nests as layout → error boundary → loading boundary → children, the same order Next.js uses. This is the element tree `RouteTree` produces — conceptually; it isn't generated as a component:
 
-```typescript
-// Generated component for /dashboard/analytics
-function DashboardAnalyticsRoute(props) {
-  return (
-    <GlobalErrorBoundary>                    {/* Framework default: the only boundary that can catch RootLayout's own errors */}
-      <RootLayout>
-        <RootErrorBoundary>                  {/* pages/error.tsx: errors below RootLayout */}
-          <DashboardLayout>
-            <DashboardErrorBoundary>         {/* dashboard/error.tsx: dashboard content errors */}
-              <Suspense fallback={<DashboardLoading />}>
-                <AnalyticsErrorBoundary>     {/* analytics/error.tsx: analytics errors */}
-                  <Suspense fallback={<AnalyticsLoading />}>
-                    <AnalyticsPage />
-                  </Suspense>
-                </AnalyticsErrorBoundary>
-              </Suspense>
-            </DashboardErrorBoundary>
-          </DashboardLayout>
-        </RootErrorBoundary>
-      </RootLayout>
-    </GlobalErrorBoundary>
-  )
-}
+```tsx
+<GlobalErrorBoundary>                       {/* Framework default: the only boundary that can catch RootLayout's own errors */}
+  <RootLayout>
+    <RootErrorBoundary>                     {/* pages/error.tsx: errors below RootLayout */}
+      <Suspense fallback={<RootLoading />}>
+        <DashboardLayout>
+          <DashboardErrorBoundary>          {/* dashboard/error.tsx: dashboard content errors */}
+            <Suspense fallback={<DashboardLoading />}>
+              <AnalyticsErrorBoundary>      {/* analytics/error.tsx: analytics errors */}
+                <Suspense fallback={<AnalyticsLoading />}>
+                  <AnalyticsPage />
+                </Suspense>
+              </AnalyticsErrorBoundary>
+            </Suspense>
+          </DashboardErrorBoundary>
+        </DashboardLayout>
+      </Suspense>
+    </RootErrorBoundary>
+  </RootLayout>
+</GlobalErrorBoundary>
 ```
 
 <BoundaryNestingDiagram />
 
+An error boundary only catches errors in its _children_, so a segment's `error.tsx` can never catch an error thrown by the layout of that same segment — `DashboardLayout` failing is handled by `RootErrorBoundary`, and `RootLayout` failing can only be handled by a boundary outside it. That's why the framework adds a last-resort `GlobalErrorBoundary` (Next.js exposes the same slot as `global-error.tsx`). Since it replaces the root layout, its fallback can't rely on anything the root layout provides — navigation, providers, styles — and has to stand on its own.
+
 <ErrorBoundaryPlayground />
 
-An error boundary only catches errors in its _children_, so a segment's `error.tsx` can never catch an error thrown by the layout of that same segment — `DashboardLayout` failing is handled by `RootErrorBoundary`, and `RootLayout` failing can only be handled by a boundary outside it. That's why the framework adds a last-resort `GlobalErrorBoundary` (Next.js exposes the same slot as `global-error.tsx`); since it replaces the root layout, its fallback must render a complete page shell on its own.
+### Generating segments
+
+[Part 13](/13-nested-layouts#rendering-the-stack-and-why-layouts-persist) explained why the stack is rendered from data by one `RouteTree` component rather than generated as a wrapper component per route: distinct wrapper types would unmount every layout on navigation. The boundaries follow the same rule. The virtual module gains one _segment_ object per directory that has a layout, an `error.tsx` or a `loading.tsx`, and every route lists its segments next to its layouts:
+
+```typescript title="packages/eigen/plugins/route-tree.ts"
+export function generateRouteCode(tree: RouteNode, isSSR: boolean): string {
+  const declarations: string[] = [];
+  const routes: string[] = [];
+  const notFoundRoutes: string[] = []; // [!code ++]
+  let n = 0;
+
+  // Fallbacks are imported statically on both sides: a fallback that had to // [!code ++]
+  // load its own chunk would suspend exactly when it's needed // [!code ++]
+  function importDefault(url: string | null): string { // [!code ++]
+    if (!url) return "undefined"; // [!code ++]
+    const name = `SegmentMod${n++}`; // [!code ++]
+    declarations.push(`import ${name} from '${url}'`); // [!code ++]
+    return name; // [!code ++]
+  } // [!code ++]
+
+  function walk(node: RouteNode, layoutStack: string[]) { // [!code --]
+  function walk(node: RouteNode, layoutStack: string[], segmentStack: string[]) { // [!code ++]
+    let layoutName = "undefined"; // [!code ++]
+    if (node.layout) {
+      const name = `layout${n++}`;
+      // ...layout declarations unchanged from Part 13
+      layoutStack = [...layoutStack, name];
+      layoutName = name; // [!code ++]
+    }
+
+    if (node.layout || node.error || node.loading) { // [!code ++]
+      const name = `segment${n++}`; // [!code ++]
+      declarations.push( // [!code ++]
+        `const ${name} = { path: '${node.path}', layout: ${layoutName}, ` + // [!code ++]
+          `error: ${importDefault(node.error)}, loading: ${importDefault(node.loading)} }`, // [!code ++]
+      ); // [!code ++]
+      segmentStack = [...segmentStack, name]; // [!code ++]
+    } // [!code ++]
+    const stacks = `layouts: [${layoutStack.join(", ")}], segments: [${segmentStack.join(", ")}]`; // [!code ++]
+
+    if (node.notFound) { // [!code ++]
+      // Used for unmatched URLs under this directory (see Not-found handling) // [!code ++]
+      notFoundRoutes.push(`  { path: '${node.path}', component: ${importDefault(node.notFound)}, ${stacks} }`); // [!code ++]
+    } // [!code ++]
+
+    for (const page of node.pages) {
+      // ...unchanged from Part 13, except that each route object ends
+      // with `${stacks}` instead of `layouts: ${layouts}`
+    }
+
+    for (const child of node.children) walk(child, layoutStack); // [!code --]
+    for (const child of node.children) walk(child, layoutStack, segmentStack); // [!code ++]
+  }
+
+  walk(tree, []); // [!code --]
+  walk(tree, [], []); // [!code ++]
+
+  return [
+    isSSR ? "" : `import React from 'react'`,
+    ...declarations,
+    `export const routes = [\n${routes.join(",\n")}\n]`,
+    `export const notFoundRoutes = [\n${notFoundRoutes.join(",\n")}\n]`, // [!code ++]
+  ].join("\n");
+}
+```
+
+A segment's `layout` is the same module-level layout object the route's `layouts` array holds, so `loadRouteData` and the Part 30 metadata step keep using `layouts` unchanged. The types grow to match (and the `eigen/routes` declaration gains `export const notFoundRoutes: RouteDefinition[]`):
+
+```typescript title="packages/eigen/types.ts"
+import type { ComponentType } from "react"; // [!code ++]
+import type { ErrorBoundaryProps, LoadingProps } from "./error-types"; // [!code ++]
+
+/** One directory on a route's path that wraps it in something (outermost first) */ // [!code ++]
+export interface SegmentDefinition { // [!code ++]
+  /** The directory's path, e.g. '/dashboard' */ // [!code ++]
+  path: string; // [!code ++]
+  /** The directory's layout.tsx — the same object as in `layouts` */ // [!code ++]
+  layout?: LayoutDefinition; // [!code ++]
+  error?: ComponentType<ErrorBoundaryProps<any>>; // [!code ++]
+  loading?: ComponentType<LoadingProps<any>>; // [!code ++]
+} // [!code ++]
+
+export interface RouteDefinition {
+  // ...path, component, loader, layouts, middleware as before
+  segments: SegmentDefinition[]; // [!code ++]
+}
+```
+
+`RouteTree` then walks `segments` where Part 13 walked `layouts`, adding the boundary and the Suspense fallback inside each layout. The outermost wrapper is the framework's `GlobalErrorBoundary`, the same `RouteErrorBoundary` class with a built-in fallback:
+
+```tsx title="packages/eigen/router.tsx"
+import { Suspense, type ReactNode } from "react";
+import type { RouteMatch } from "eigen/match-route";
+import type { RouteData } from "eigen/route-data";
+import type { SerializedRouteError } from "eigen/route-errors";
+import { GlobalError, RouteErrorBoundary, type RouteErrorBoundaryProps } from "eigen/error-boundary";
+import { LayoutDataProvider } from "eigen/layout-context";
+
+interface RouteTreeProps {
+  match: RouteMatch;
+  data: RouteData | null;
+  pathname: string;
+  /** An error the framework already caught; `boundary` says which boundary shows it */
+  routeError?: SerializedRouteError;
+  reloadData: () => Promise<void>;
+}
+
+function RouteTree({ match, data, pathname, routeError, reloadData }: RouteTreeProps) {
+  const { route, params } = match;
+  const Page = route.component;
+  let element: ReactNode = <Page params={params} pathname={pathname} data={data?.page ?? null} />;
+
+  const boundary = (path: string | null, fallback: RouteErrorBoundaryProps["fallback"], children: ReactNode) => (
+    <RouteErrorBoundary
+      fallback={fallback}
+      params={params}
+      pathname={pathname}
+      initialError={routeError?.boundary === path ? routeError : undefined}
+      reloadData={reloadData}
+    >
+      {children}
+    </RouteErrorBoundary>
+  );
+
+  // Innermost segment first; each one nests as layout › error › Suspense › children
+  for (let i = route.segments.length - 1; i >= 0; i--) {
+    const segment = route.segments[i];
+    if (segment.loading) {
+      const Loading = segment.loading;
+      element = <Suspense fallback={<Loading params={params} pathname={pathname} />}>{element}</Suspense>;
+    }
+    if (segment.error) element = boundary(segment.path, segment.error, element);
+    if (segment.layout) {
+      const { path, component: Layout } = segment.layout;
+      const layoutData = data?.layouts[path] ?? null;
+      element = (
+        <LayoutDataProvider key={path} path={path} data={layoutData}>
+          <Layout data={layoutData}>{element}</Layout>
+        </LayoutDataProvider>
+      );
+    }
+  }
+
+  // GlobalErrorBoundary: the only boundary outside the root layout
+  return boundary(null, GlobalError, element);
+}
+```
+
+Each segment's wrappers depend only on its own directory, so two routes that share `/dashboard` produce the same element types at the same positions down to the dashboard layout's children — the persistence from Part 13 still holds. The page also receives `pathname`, which the not-found components below use.
 
 ---
 
@@ -237,34 +446,45 @@ An error boundary only catches errors in its _children_, so a segment's `error.t
 React has no built-in error boundary component — a boundary is any class component that implements `static getDerivedStateFromError` (and optionally `componentDidCatch`); function components can't be boundaries. Eigen's boundary adds the framework's route context:
 
 ```tsx title="packages/eigen/error-boundary.tsx"
-import { Component, type ComponentType, type ErrorInfo, type ReactNode } from "react";
+import { Component, type ComponentType, type ReactNode } from "react";
 import type { ErrorBoundaryProps } from "eigen/error-types";
+import { toBoundaryError, type SerializedRouteError } from "eigen/route-errors";
 
-type Phase = "loader" | "render" | "stream";
+type Phase = "loader" | "render";
 
-interface Props {
+export interface RouteErrorBoundaryProps {
   fallback: ComponentType<ErrorBoundaryProps<any>>;
   params: Record<string, string>;
   pathname: string;
-  /** A loader error the framework already caught (during SSR or from /_eigen/data) */
-  initialError?: { error: Error; phase: Phase };
-  /** Re-runs the current route's loaders and updates its data (provided by the router) */
+  /** An error the framework already caught: during SSR, or from /_eigen/data */
+  initialError?: SerializedRouteError;
+  /** Re-runs the current route's loaders and commits the result (provided by the router) */
   reloadData?: () => Promise<void>;
-  onError?: (error: Error, phase: Phase) => void;
   children: ReactNode;
 }
 
 interface State {
   error: Error | null;
   phase: Phase;
+  /** The props the current error state was derived from */
+  prevPathname: string | null;
+  prevInitialError: SerializedRouteError | undefined;
 }
 
-export class RouteErrorBoundary extends Component<Props, State> {
-  constructor(props: Props) {
-    super(props);
-    this.state = props.initialError
-      ? { error: props.initialError.error, phase: props.initialError.phase }
-      : { error: null, phase: "render" };
+export class RouteErrorBoundary extends Component<RouteErrorBoundaryProps, State> {
+  state: State = { error: null, phase: "render", prevPathname: null, prevInitialError: undefined };
+
+  static getDerivedStateFromProps(props: RouteErrorBoundaryProps, state: State): Partial<State> | null {
+    // A new pathname or a new framework error replaces whatever this boundary
+    // was showing. Resetting here, instead of remounting with key={pathname},
+    // keeps the layouts below this boundary mounted across navigations (Part 13).
+    if (props.pathname === state.prevPathname && props.initialError === state.prevInitialError) return null;
+    return {
+      prevPathname: props.pathname,
+      prevInitialError: props.initialError,
+      error: props.initialError ? toBoundaryError(props.initialError) : null,
+      phase: props.initialError?.phase ?? "render",
+    };
   }
 
   static getDerivedStateFromError(error: unknown): Partial<State> {
@@ -272,30 +492,22 @@ export class RouteErrorBoundary extends Component<Props, State> {
     return { error: error instanceof Error ? error : new Error(String(error)), phase: "render" };
   }
 
-  componentDidCatch(error: Error, info: ErrorInfo) {
-    this.props.onError?.(error, this.state.phase);
-
-    // Report to error tracking (PostHog, Sentry, etc.)
-    if (typeof window !== "undefined" && (window as any).posthog) {
-      (window as any).posthog.captureException(error, {
-        route: this.props.pathname,
-        phase: this.state.phase,
-        componentStack: info.componentStack,
-      });
-    }
-  }
-
   reset = () => {
-    this.setState({ error: null, phase: "render" });
+    // Rendering the children again only helps after a render error; after a
+    // loader error there's no data to render them with, so reload instead
+    if (this.state.phase === "loader") return void this.retryLoader();
+    this.setState({ error: null });
   };
 
   retryLoader = async () => {
+    if (!this.props.reloadData) return;
     try {
-      // Fetch fresh loader data for this URL; the router re-renders the route with it
-      await this.props.reloadData?.();
-      this.setState({ error: null, phase: "render" });
+      // The router re-runs the loaders and commits pathname, data and error
+      // together: success clears initialError (and with it this fallback),
+      // a new loader error arrives as a new initialError
+      await this.props.reloadData();
     } catch (error) {
-      // Still failing — stay in the error state with the new error
+      // The request itself failed (offline, ...): stay in the error state
       this.setState({ error: error instanceof Error ? error : new Error(String(error)), phase: "loader" });
     }
   };
@@ -310,16 +522,29 @@ export class RouteErrorBoundary extends Component<Props, State> {
           params={this.props.params}
           pathname={this.props.pathname}
           phase={this.state.phase}
-          retryLoader={this.state.phase === "loader" ? this.retryLoader : undefined}
+          retryLoader={this.state.phase === "loader" && this.props.reloadData ? this.retryLoader : undefined}
         />
       );
     }
     return this.props.children;
   }
 }
+
+/** GlobalErrorBoundary's fallback: it replaces the root layout, so it relies on nothing the layout provides */
+export function GlobalError({ error }: ErrorBoundaryProps) {
+  return (
+    <div role="alert">
+      <h1>Something went wrong</h1>
+      <p>{error.message}</p>
+      <a href="/">Go to the home page</a>
+    </div>
+  );
+}
 ```
 
-The generated route component renders each boundary with `key={pathname}`. Without the key, a boundary that caught an error on `/posts/1` would keep showing it after the user navigates to `/posts/2`, because the same component instance is reused.
+Without the pathname check, a boundary that caught an error on `/posts/1` would keep showing it after the user navigates to `/posts/2`, because the same component instance is reused. Next.js resets its boundaries the same way, from `getDerivedStateFromProps`. A `key={pathname}` on each boundary would also reset them, but it remounts the whole subtree on every navigation, layouts included.
+
+The boundary doesn't report errors itself; that happens once, at the root, in the client entry below.
 
 ---
 
@@ -327,117 +552,301 @@ The generated route component renders each boundary with `key={pathname}`. Witho
 
 Loader errors happen _before_ the component renders — the data fetch failed. Render errors happen _during_ rendering — a component threw while rendering (null reference, bad data shape, etc.).
 
-The framework distinguishes these. There's an important catch on the server: **React's error boundaries don't run during server rendering.** `getDerivedStateFromError` is a client-side mechanism — when a component throws inside `renderToString`, the whole call throws. So the SSR pipeline handles both phases itself and hands the result to the boundary as `initialError`:
+### Recording which loader failed
+
+[Part 14](/14-framework-middleware#the-middleware-execution-engine)'s `loadRouteData` runs the stack with one `Promise.all`: the first rejection wins, carries no hint of which loader threw, and throws away the results of the loaders that succeeded. Both are needed now — the failing segment picks the boundary, and the successful layout loaders feed the layouts that still render above it. So `loadRouteData` settles every loader, and a failure becomes a `LoaderError` that carries both:
+
+```typescript title="packages/eigen/route-data.ts"
+import type { RouteMatch } from "./match-route";
+import { resolveDeferred } from "./deferred";
+import { RedirectResponse } from "./middleware"; // [!code ++]
+import type { EigenContext } from "./types";
+
+export interface RouteData {
+  /** Loader data per layout, keyed by layout path ('/', '/dashboard', ...) */
+  layouts: Record<string, unknown>;
+  /** The page's own loader data */
+  page: unknown;
+}
+
+/** A loader failed. `segment` is the failing layout's path, or null for the page's own loader. */ // [!code ++]
+export class LoaderError extends Error { // [!code ++]
+  constructor( // [!code ++]
+    readonly segment: string | null, // [!code ++]
+    /** What the other loaders returned */ // [!code ++]
+    readonly data: RouteData, // [!code ++]
+    cause: unknown, // [!code ++]
+  ) { // [!code ++]
+    super(segment === null ? "Page loader failed" : `Layout loader failed: ${segment}`, { cause }); // [!code ++]
+  } // [!code ++]
+} // [!code ++]
+
+export async function loadRouteData({ route, params }: RouteMatch, ctx: EigenContext): Promise<RouteData> {
+  // Every loader in the stack still starts at once. allSettled instead of all: // [!code ++]
+  // it waits for the slow ones even after a failure, but keeps every result // [!code ++]
+  const tasks: Array<readonly [segment: string | null, run: () => unknown]> = [ // [!code ++]
+    ...route.layouts.map((layout) => [layout.path, () => layout.loader?.({ params, ctx }) ?? null] as const), // [!code ++]
+    [null, () => route.loader?.({ params, ctx }) ?? null], // [!code ++]
+  ]; // [!code ++]
+  const results = await Promise.allSettled(tasks.map(async ([, run]) => run())); // [!code ++]
+
+  const data: RouteData = { layouts: {}, page: null }; // [!code ++]
+  let failure: { segment: string | null; reason: unknown } | undefined; // [!code ++]
+  for (const [i, result] of results.entries()) { // [!code ++]
+    const segment = tasks[i][0]; // [!code ++]
+    if (result.status === "rejected") { // [!code ++]
+      // A redirect() from any loader wins; runRoute turns it into a response // [!code ++]
+      if (result.reason instanceof RedirectResponse) throw result.reason; // [!code ++]
+      // Otherwise the outermost failure wins: its boundary is above all the others // [!code ++]
+      failure ??= { segment, reason: result.reason }; // [!code ++]
+    } else if (segment === null) { // [!code ++]
+      data.page = result.value; // [!code ++]
+    } else { // [!code ++]
+      data.layouts[segment] = result.value; // [!code ++]
+    } // [!code ++]
+  } // [!code ++]
+
+  if (failure) throw new LoaderError(failure.segment, data, failure.reason); // [!code ++]
+  return data; // [!code ++]
+}
+```
+
+`resolveRouteData` stays as it is: Part 12's `resolveDeferred` turns a rejected deferred value into `null` instead of throwing, so only awaited loader values produce loader errors.
+
+### Picking the boundary
+
+Which boundary shows the error follows directly from the nesting: a page loader's error goes to the innermost `error.tsx` on the route's path, and a layout loader's error goes to the innermost `error.tsx` _above_ that layout, skipping the layout's own segment. Both rules, plus the list a render error walks through on the server, go in a small module that the server and the router share (register `eigen/route-errors` like the others):
+
+```typescript title="packages/eigen/route-errors.ts"
+import type { RouteDefinition } from "./types";
+
+export interface SerializedRouteError {
+  message: string;
+  digest: string;
+  phase: "loader" | "render";
+  route: string;
+  params: Record<string, string>;
+  /** Path of the segment whose error.tsx shows the error; null for GlobalErrorBoundary */
+  boundary: string | null;
+}
+
+/** Rebuild the Error a boundary's fallback receives. Server and client both use it, so the HTML matches. */
+export function toBoundaryError(serialized: SerializedRouteError): Error {
+  return Object.assign(new Error(serialized.message), { digest: serialized.digest });
+}
+
+/** The boundary for a failed loader: `segment` is a layout path, or null for the page */
+export function loaderErrorBoundary(route: RouteDefinition, segment: string | null): string | null {
+  // A layout's own error.tsx renders inside the layout, so only the segments
+  // above the failing layout count. A page's error can use all of them.
+  const end = segment === null ? route.segments.length : route.segments.findIndex((s) => s.layout?.path === segment);
+  return route.segments.slice(0, end).findLast((s) => s.error)?.path ?? null;
+}
+
+/** Every boundary on the route, innermost first, ending with GlobalErrorBoundary (null) */
+export function renderErrorBoundaries(route: RouteDefinition): Array<string | null> {
+  const paths = route.segments.filter((s) => s.error).map((s) => s.path);
+  return [...paths.reverse(), null];
+}
+```
+
+### Handling both on the server
+
+There's an important catch on the server: **React's error boundaries don't run during server rendering.** `getDerivedStateFromError` is a client-side mechanism — when a component throws inside `renderToString`, the whole call throws. So the SSR pipeline handles both phases itself and hands the result to a boundary as `initialError`:
 
 <SsrErrorPathsDiagram />
 
-```tsx title="entry-server.tsx"
+```tsx title="src/entry-server.tsx"
+import { renderToString } from "react-dom/server";
+import { matchNotFound, matchRoute, type RouteMatch } from "eigen/match-route";
+import { notFoundRoutes, routes } from "eigen/routes";
 import { runRoute } from "eigen/run-route";
+import { LoaderError, resolveRouteData, type RouteData } from "eigen/route-data";
+import { loaderErrorBoundary, renderErrorBoundaries, type SerializedRouteError } from "eigen/route-errors";
 import { serializeForScript } from "eigen/serialize";
+import { App } from "./app";
 
 export async function render(request: Request): Promise<RenderResult> {
   const { pathname } = new URL(request.url);
-  const match = matchRoute(pathname, routes);
-  if (!match) return { html: "<h1>404</h1>", status: 404, data: null, head: "" };
+  const routeMatch = matchRoute(pathname, routes);
+  // No route: the deepest not-found.tsx above the URL (see Not-found handling)
+  const match = routeMatch ?? matchNotFound(pathname, notFoundRoutes);
+  if (!match) {
+    // Not even a root not-found.tsx: Part 14's bare 404 from the Router
+    return { html: renderToString(<App pathname={pathname} data={null} />), status: 404, data: null, head: "" };
+  }
 
-  // Phase 1: middleware + loaders
-  let data: unknown = null;
+  // Phase 1: middleware + loaders, then deferred values (renderToString can't wait for them)
+  let data: RouteData | null = null;
   let routeError: SerializedRouteError | undefined;
   try {
     const result = await runRoute(match, request);
     if ("response" in result) return result; // redirects, 403s, ...
-    data = result.data;
+    data = await resolveRouteData(result.data);
   } catch (error) {
-    routeError = toSerializedError(error, "loader", match);
+    if (!(error instanceof LoaderError)) throw error; // middleware crashed: a plain 500
+    ({ data, routeError } = await loaderFailure(error, match));
   }
 
-  // Phase 2: rendering. The generated route component passes initialError to
-  // the nearest boundary, which renders its fallback instead of its children.
-  let html: string;
+  // Phase 2: rendering. RouteTree hands routeError to the boundary it names.
+  const renderApp = (e?: SerializedRouteError) =>
+    renderToString(<App pathname={pathname} data={data} routeError={e} />);
+  let html: string | undefined;
   try {
-    html = renderToString(<App match={match} data={data} initialError={routeError} />);
+    html = renderApp(routeError);
   } catch (error) {
-    // A component threw during SSR. No boundary caught it (they can't on the
-    // server), so re-render with the error handed to the nearest boundary.
-    routeError = toSerializedError(error, "render", match);
-    html = renderToString(<App match={match} data={null} initialError={routeError} />);
+    // A component threw, and the error doesn't say which one. Hand it to each
+    // boundary in turn, innermost first: the first render that succeeds used
+    // the innermost boundary above the component that threw.
+    const failure = toSerializedError(error, "render", match, null);
+    for (const boundary of renderErrorBoundaries(match.route)) {
+      routeError = { ...failure, boundary };
+      try {
+        html = renderApp(routeError);
+        break;
+      } catch {
+        // That boundary renders the thrower too (it's in a layout above it) — go outward
+      }
+    }
+    // Even GlobalErrorBoundary failed: the throw is in App, outside RouteTree.
+    // The client can't hydrate this; React will client-render the root.
+    html ??= "<h1>Something went wrong</h1>";
   }
 
-  // Metadata (Part 30) and session/query state (Parts 33–34) are omitted here
+  // Metadata (Part 30) and session/query state (Parts 33–34) are omitted here.
+  // `data` is what the client hydrates with: the same data the server rendered.
   const head = routeError ? `<script>window.__EIGEN_ERROR__=${serializeForScript(routeError)}</script>` : "";
-  return { html, status: routeError ? 500 : 200, data, head };
+  return { html, status: routeError ? 500 : routeMatch ? 200 : 404, data, head };
+}
+
+/** A failed loader as the error UI needs it: the data that did load, and the serialized error */
+async function loaderFailure(error: LoaderError, match: RouteMatch) {
+  return {
+    // The loaders that succeeded still feed the layouts above the boundary
+    data: await resolveRouteData(error.data),
+    routeError: toSerializedError(error.cause, "loader", match, loaderErrorBoundary(match.route, error.segment)),
+  };
 }
 ```
 
-(As elsewhere after Part 12, `renderToString` keeps the snippet short; the real pipeline streams. With streaming, a component that throws inside a `<Suspense>` boundary makes React send that boundary's fallback and retry the subtree on the client — where the error boundary _does_ catch it if it throws again. Errors outside every Suspense boundary fail the shell, which is where the fallback re-render above applies.)
+(`toSerializedError` is defined in the serialization section below; `RenderResult` is Part 30's, with `head`.) In the render path the loaders succeeded, so every attempt renders with the real `data`. The layouts above the boundary get what they need, and what the server rendered with is exactly what `window.__EIGEN_DATA__` hands the client.
 
-On client-side navigations, the router does the same thing for `/_eigen/data` failures: it passes the error to the route as `initialError` with `phase: 'loader'`, and passes `reloadData` so the error component's retry button works.
+(As elsewhere after Part 12, `renderToString` keeps the snippet short; the real pipeline streams, and `renderStream` handles loader errors the same way. With streaming, a component that throws inside a `<Suspense>` boundary makes React send that boundary's fallback and retry the subtree on the client — where the error boundary _does_ catch it if it throws again, with `phase: 'render'`. If the retry succeeds, nothing is caught, and React reports the server error through `onRecoverableError` instead. That's why there's no separate "stream" phase. Errors outside every Suspense boundary fail the shell, which is where the boundary-by-boundary retry above applies.)
+
+### Loader errors on client navigations
+
+The `/_eigen/data` endpoint from Part 14 answers a failed loader the same way: a 500 with the partial data and the serialized error, instead of an unhandled exception:
+
+```typescript title="src/entry-server.tsx"
+export async function loadData(request: Request): Promise<Response> {
+  // ...matching unchanged from Part 14
+  try { // [!code ++]
+    const result = await runRoute(match, new Request(new URL(pathname, url), { headers: request.headers }));
+    if ("response" in result) return asClientRedirect(result.response);
+    return Response.json(await resolveRouteData(result.data));
+  } catch (error) { // [!code ++]
+    if (!(error instanceof LoaderError)) throw error; // [!code ++]
+    const { data, routeError } = await loaderFailure(error, match); // [!code ++]
+    return Response.json({ data, error: routeError }, { status: 500 }); // [!code ++]
+  } // [!code ++]
+}
+```
+
+The router keeps the error in the same state as the pathname and data, so all three change together (the rule from [Part 13](/13-nested-layouts#rendering-the-stack-and-why-layouts-persist)), and gives `RouteTree` a `reloadData` that refetches the current route:
+
+```tsx title="packages/eigen/router.tsx"
+import { Suspense, useCallback, useState, useTransition } from "react";
+import { matchNotFound, matchRoute } from "eigen/match-route";
+import { notFoundRoutes, routes } from "eigen/routes";
+
+interface RouteState {
+  pathname: string;
+  data: RouteData | null;
+  error?: SerializedRouteError;
+}
+
+/** One /_eigen/data round trip, as the state the router commits */
+async function fetchRouteState(pathname: string, signal?: AbortSignal): Promise<RouteState> {
+  const res = await fetch(`/_eigen/data?path=${encodeURIComponent(pathname)}`, { signal });
+  const body = await res.json();
+  // A failed loader comes back as a 500 carrying { data, error }
+  if (res.status === 500 && body?.error) return { pathname, data: body.data, error: body.error };
+  return { pathname, data: body };
+}
+
+export function Router({ initialPathname, initialData, initialError }: RouterProps) {
+  const [state, setState] = useState<RouteState>({
+    pathname: initialPathname,
+    data: initialData,
+    error: initialError,
+  });
+  const [, startTransition] = useTransition();
+  // The navigation handler (Parts 22–23) commits a whole RouteState:
+  //   const next = await fetchRouteState(url.pathname, event.signal)
+  //   startTransition(() => setState(next))
+  // and Part 23's preloadRoute caches fetchRouteState(href) instead of raw JSON.
+
+  const reloadData = useCallback(async () => {
+    const next = await fetchRouteState(state.pathname);
+    startTransition(() => setState(next));
+  }, [state.pathname]);
+
+  const match = matchRoute(state.pathname, routes) ?? matchNotFound(state.pathname, notFoundRoutes);
+  if (!match) return <h1>404</h1>;
+
+  return (
+    <Suspense fallback={<div>Loading...</div>}>
+      <RouteTree
+        match={match}
+        data={state.data}
+        pathname={state.pathname}
+        routeError={state.error}
+        reloadData={reloadData}
+      />
+    </Suspense>
+  );
+}
+```
+
+`App` passes a new `routeError` prop through to `Router` as `initialError`. A retry that succeeds commits state without an error, so the boundary's `initialError` changes to `undefined` and it renders its children again with the new data; a retry that fails commits a new error object, which the boundary shows instead.
 
 ---
 
 ## Loading states and Suspense integration
 
-The `loading.tsx` convention maps directly to Suspense fallbacks. The route plugin wraps each segment in a `<Suspense>` boundary with the corresponding loading component:
+The `loading.tsx` convention maps directly to Suspense fallbacks: `RouteTree` above wraps each segment's content in a `<Suspense>` whose fallback is that segment's loading component.
 
-```typescript
-// Generated: loading.tsx becomes the Suspense fallback
-<Suspense fallback={<DashboardLoading params={params} pathname={pathname} />}>
-  <DashboardPage />
-</Suspense>
-```
-
-This works seamlessly with streaming SSR (Part 12): the loading component is sent as HTML in the initial shell, and the real content streams in when the loader resolves. The loading component is a React component, not a static spinner — it can show skeletons that match the page layout.
+A fallback only shows when something below it _suspends_. `runRoute` awaits every loader before rendering starts, so awaited loader values never show `loading.tsx` — the page already has them. What does suspend is a page reading one of [Part 12](/12-streaming-ssr)'s deferred values with `useDeferred()` (or any promise with `use()`), and a `React.lazy` page or layout whose chunk is still loading. With streaming SSR, the loading component is sent as HTML in the initial shell, and the real content streams in when the page's deferred values resolve. The loading component is a React component, not a static spinner — it can show skeletons that match the page layout.
 
 ### Client-side navigation loading
 
-During client-side navigations (Part 22), the loading state appears while the new route's data is being fetched. The framework uses React's `useTransition` to keep the current page visible while loading:
-
-```typescript
-// In the router — pending state during navigation
-function Router() {
-  const [isPending, startTransition] = useTransition()
-
-  function handleNavigate(pathname: string) {
-    startTransition(async () => {
-      const data = await fetchLoaderData(pathname)
-      // State updates after an `await` are not automatically part of the
-      // transition (a current React limitation), so wrap them again —
-      // otherwise they're urgent updates and the Suspense fallback can flash
-      startTransition(() => {
-        setPathname(pathname)
-        setData(data)
-      })
-    })
-  }
-
-  return (
-    <>
-      {/* Show a progress bar during transitions */}
-      {isPending && <NavigationProgress />}
-
-      {/* Current page stays visible until new page is ready */}
-      <Suspense fallback={<CurrentRouteLoading />}>
-        <CurrentRoute />
-      </Suspense>
-    </>
-  )
-}
-```
-
-The `isPending` state from `useTransition` gives the framework two options for loading UX:
-
-1. **Instant transition** — Immediately show the new route's `loading.tsx` skeleton (like Next.js)
-2. **Delayed transition** — Keep the current page visible with a progress bar, switch to the new page when data arrives (like Remix/TanStack)
-
-Eigen defaults to the delayed transition (keep current page visible) because it feels less jarring, but makes it configurable per-link:
+During client-side navigations ([Part 22](/22-navigation-api)), the router fetches the new route's data before it commits anything, and uses React's `useTransition` to keep the current page visible meanwhile:
 
 ```tsx
-// Immediate transition — show skeleton right away
-<Link to="/dashboard" transition="instant">Dashboard</Link>
+// In the router — pending state during navigation
+const [isPending, startTransition] = useTransition();
 
-// Delayed transition — keep current page, show progress bar (default)
-<Link to="/dashboard" transition="pending">Dashboard</Link>
+function navigate(pathname: string) {
+  startTransition(async () => {
+    const next = await fetchRouteState(pathname);
+    // State updates after an `await` are not automatically part of the
+    // transition (a current React limitation), so wrap them again —
+    // otherwise they're urgent updates and the Suspense fallback can flash
+    startTransition(() => setState(next));
+  });
+}
+
+// ...and render the progress bar next to the tree, not instead of it:
+// {isPending && <NavigationProgress />}
+// <RouteTree … />
 ```
+
+Frameworks pick one of two loading UXs for navigations:
+
+1. **Instant transition** — Immediately show the new route's `loading.tsx` skeleton (Next.js)
+2. **Delayed transition** — Keep the current page visible with a progress bar, switch to the new page when data arrives (Remix, TanStack Router)
+
+Eigen implements the delayed transition: pathname and data are committed together once the fetch completes, so there is no moment when the new route is rendered without its data, and nothing suspends to show the skeleton. An instant transition would have to commit the pathname first and hand the page its data as a pending promise read with `use()` — Part 12's deferred mechanism applied to the whole loader result. That's a reasonable extension, but it changes every page's data contract, so we leave it out. `loading.tsx` still shows on navigations whenever the new page suspends on deferred data.
 
 ---
 
@@ -446,6 +855,8 @@ Eigen defaults to the delayed transition (keep current page visible) because it 
 The `not-found.tsx` convention handles 404s at any level of the route tree:
 
 ```tsx title="src/pages/dashboard/not-found.tsx"
+import type { NotFoundProps } from "eigen/error-types";
+
 // Renders when a path under /dashboard doesn't match any route
 export default function DashboardNotFound({ pathname }: NotFoundProps) {
   return (
@@ -460,7 +871,42 @@ export default function DashboardNotFound({ pathname }: NotFoundProps) {
 }
 ```
 
-The root `not-found.tsx` is the global 404 page. Segment-level not-found components handle missing child routes while preserving the parent layout — so `DashboardLayout` still renders with its sidebar when a bad URL like `/dashboard/nonexistent` is visited.
+The root `not-found.tsx` is the global 404 page. A segment-level one handles unmatched URLs below its directory while keeping the parent layout — so `DashboardLayout` still renders with its sidebar when a bad URL like `/dashboard/nonexistent` is visited. This goes further than Next.js, which renders only the root `not-found` for unmatched URLs and uses nested `not-found` files only when a page calls `notFound()`.
+
+The generated `notFoundRoutes` make this a matching problem. Each one is a route whose path is its directory, whose page is the `not-found.tsx` component, and whose `layouts` and `segments` are the directory's stack. `matchNotFound` finds the deepest one whose path is a prefix of the URL:
+
+```typescript title="packages/eigen/match-route.ts"
+/**
+ * For a URL no route matches: the not-found route of the deepest directory
+ * that contains it. '/dashboard/nonexistent' → the '/dashboard' entry.
+ */
+export function matchNotFound(pathname: string, notFoundRoutes: RouteDefinition[]): RouteMatch | null {
+  const urlParts = pathname.split("/").filter(Boolean);
+  let best: RouteMatch | null = null;
+  let bestDepth = -1;
+
+  for (const route of notFoundRoutes) {
+    const parts = route.path.split("/").filter(Boolean);
+    if (parts.length > urlParts.length || parts.length <= bestDepth) continue;
+
+    const params: Record<string, string> = {};
+    const isPrefix = parts.every((part, i) => {
+      if (part.startsWith(":")) {
+        params[part.slice(1)] = decodeURIComponent(urlParts[i]);
+        return true;
+      }
+      return part === urlParts[i];
+    });
+    if (isPrefix) {
+      best = { route, params };
+      bestDepth = parts.length;
+    }
+  }
+  return best;
+}
+```
+
+`render()` above falls back to it when `matchRoute` returns `null`, and answers with status 404. The match goes through `runRoute` like any other, so global middleware runs and the layout loaders above the not-found page provide their data. The client router uses the same fallback, so hydrating a 404 page renders the same tree the server did.
 
 ---
 
@@ -468,16 +914,14 @@ The root `not-found.tsx` is the global 404 page. Segment-level not-found compone
 
 When an error occurs during SSR, the client must hydrate the _same_ error UI, so the error is serialized into the page. Two rules apply: it goes through `serializeForScript` (an error message can contain user input — `Post "</script><script>…" not found` — so raw `JSON.stringify` would be an XSS hole), and in production it doesn't carry the real message at all. Internal error text (SQL, hostnames, file paths, stack traces) stays in the server logs, linked by a short digest:
 
-```typescript title="entry-server.tsx"
-interface SerializedRouteError {
-  message: string;
-  digest: string;
-  phase: "loader" | "render";
-  route: string;
-  params: Record<string, string>;
-}
-
-function toSerializedError(error: unknown, phase: "loader" | "render", match: RouteMatch): SerializedRouteError {
+```typescript title="src/entry-server.tsx"
+// RouteMatch and SerializedRouteError are already imported for render()
+function toSerializedError(
+  error: unknown,
+  phase: "loader" | "render",
+  match: RouteMatch,
+  boundary: string | null,
+): SerializedRouteError {
   const digest = crypto.randomUUID().slice(0, 8);
   // The full error, with its stack, goes to the server log only
   console.error(`[eigen] ${phase} error ${digest} on ${match.route.path}`, error);
@@ -489,31 +933,64 @@ function toSerializedError(error: unknown, phase: "loader" | "render", match: Ro
     phase,
     route: match.route.path,
     params: match.params,
+    boundary,
   };
 }
 ```
 
-The server renders the fallback from this sanitized object too (via `initialError` above), so server HTML and client hydration agree. The client entry reads it and hands it to the same boundary:
+The server renders the fallback from this sanitized object: `RouteTree` hands the `SerializedRouteError` itself to the boundary it names, and the boundary rebuilds the `Error` with `toBoundaryError`. The client entry reads the same object and passes it down the same way, so server HTML and client hydration agree.
 
-```tsx title="entry-client.tsx"
-const serialized = (window as any).__EIGEN_ERROR__ as SerializedRouteError | undefined;
-const initialError = serialized
-  ? { error: Object.assign(new Error(serialized.message), { digest: serialized.digest }), phase: serialized.phase }
-  : undefined;
+The client entry is also the place to report errors. React 19 gives the root three callbacks that between them see every error: `onCaughtError` for errors an error boundary caught, `onUncaughtError` for errors no boundary caught (React unmounts the root), and `onRecoverableError` for errors React recovered from on its own — such as a Suspense boundary that failed on the server and rendered fine on the client:
 
-hydrateRoot(document.getElementById("root")!, <App initialError={initialError} />);
+```tsx title="src/entry-client.tsx"
+import { hydrateRoot, type ErrorInfo } from "react-dom/client";
+import type { SerializedRouteError } from "eigen/route-errors";
+import { App } from "./app";
+
+declare global {
+  interface Window {
+    __EIGEN_ERROR__?: SerializedRouteError;
+  }
+}
+
+function report(kind: "caught" | "uncaught" | "recoverable") {
+  return (error: unknown, info: ErrorInfo) => {
+    // These callbacks replace React's default console logging, so keep it
+    console.error(error);
+    // Report to error tracking (PostHog, Sentry, etc.)
+    (window as any).posthog?.captureException(error, {
+      kind,
+      route: window.location.pathname,
+      componentStack: info.componentStack,
+    });
+  };
+}
+
+hydrateRoot(
+  document.getElementById("root")!,
+  <App pathname={window.location.pathname} data={window.__EIGEN_DATA__} routeError={window.__EIGEN_ERROR__} />,
+  {
+    onCaughtError: report("caught"),
+    onUncaughtError: report("uncaught"),
+    onRecoverableError: report("recoverable"),
+  },
+);
 ```
+
+Errors the server caught never reach these callbacks — the boundary starts out showing them, nothing is thrown on the client — but they're already in the server log under their digest. Reporting from each boundary's `componentDidCatch` instead would duplicate `onCaughtError` and still miss the uncaught and recoverable errors.
 
 ---
 
 ## Typed error recovery
 
-The most powerful pattern: the error component can retry the loader with the original typed params:
+The most powerful pattern: the error component can retry the loader with the original typed params. A segment file needs a directory, so the post page from [Part 34](/34-data-fetching) moves from `posts/[id].tsx` to `posts/[id]/index.tsx` (the route stays `/posts/:id`) and gets an `error.tsx` next to it:
 
 ```tsx title="src/pages/posts/[id]/error.tsx"
+import type { ErrorBoundaryProps } from "eigen/error-types";
+
 export default function PostError({
   error,
-  params, // params.id: string — typed from the route
+  params, // params.id: string — from the '/posts/:id' annotation
   phase,
   retryLoader,
 }: ErrorBoundaryProps<"/posts/:id">) {
@@ -537,30 +1014,34 @@ export default function PostError({
 }
 ```
 
-The `params.id` is typed as `string` because the error component knows it's scoped to the `/posts/:id` route. This is only possible because the route plugin generates the error boundary with the correct generic parameter. A generic `error.tsx` that handles all routes would have `params: Record<string, string>` — less useful.
+`params.id` is typed as `string` because `ErrorBoundaryProps<'/posts/:id'>` looks the params up in the generated `RouteParamsMap`. Without the annotation, the props default to every route's params at once — less useful. As with `defineLoader`, the annotation is the author's claim about where the file lives, checked against the routes that exist but not against the file's directory.
 
 ---
 
 ## What to observe
 
-1. **Throw an error in a loader** (e.g., `throw new Error('Database unavailable')`). The error boundary renders with `phase: 'loader'` and a retry button — and the response status is 500. Click retry — `reloadData` re-requests `/_eigen/data`, the loader re-executes, and the page appears once it succeeds.
+1. **Throw an error in a page loader** (e.g., `throw new Error('Database unavailable')`). The page's own segment boundary renders with `phase: 'loader'` and a retry button, the layouts above it still render with their data, and the response status is 500. Click retry — `reloadData` re-requests `/_eigen/data`, the loader re-executes, and the page appears once it succeeds.
 
-2. **Throw an error in a component's render** (e.g., access a property on `null`). Load the page directly: the SSR fallback path renders the error UI. Then trigger the same error after a client-side navigation: this time the React error boundary catches it with `phase: 'render'`. Either way, the layout above the boundary still renders.
+2. **Throw in the dashboard layout's loader instead.** `dashboard/error.tsx` doesn't catch it, because it renders inside `DashboardLayout`; the root `error.tsx` replaces the whole dashboard. The playground above shows the same thing.
 
-3. **Run a production build and view source on an errored page.** `window.__EIGEN_ERROR__` holds a generic message and a digest; the real message is only in the server log next to the same digest.
+3. **Throw an error in a component's render** (e.g., access a property on `null`). Load the page directly: the SSR fallback path renders the error UI. Then trigger the same error after a client-side navigation: this time the React error boundary catches it with `phase: 'render'`, and `onCaughtError` reports it. Either way, the layout above the boundary still renders.
 
-4. **Remove `error.tsx`** from a segment. The error bubbles up to the parent segment's error boundary — demonstrating the cascade.
+4. **Navigate away from an errored page and back**, with React DevTools open. The boundary resets on the new pathname, and the dashboard layout keeps its state: it wasn't remounted.
 
-5. **Check the types** — hover over `params` in an error component. It knows the route's dynamic segments, not just `Record<string, string>`.
+5. **Run a production build and view source on an errored page.** `window.__EIGEN_ERROR__` holds a generic message, a digest and the `boundary` it was rendered at; the real message is only in the server log next to the same digest.
 
-6. **Navigate to a non-existent route under a layout.** The layout renders normally, and the segment's `not-found.tsx` (or the global one) shows inside the layout's content area.
+6. **Remove `error.tsx`** from a segment. The error bubbles up to the parent segment's error boundary — demonstrating the cascade.
+
+7. **Change the generic in an error component** to a path that doesn't exist, like `ErrorBoundaryProps<'/post/:id'>`. TypeScript rejects it; with the right path, `params` has exactly that route's dynamic segments.
+
+8. **Visit `/dashboard/nonexistent`.** The response is a 404, `DashboardLayout` renders normally, and `dashboard/not-found.tsx` shows inside its content area. Delete that file and the root `not-found.tsx` takes over, without the dashboard layout.
 
 ---
 
 ## Key insight
 
-Error handling in a framework isn't `try/catch` — it's a _hierarchy of error boundaries_ that mirrors the route tree. Each boundary knows its segment's params, can distinguish loader errors from render errors, and can offer typed recovery actions. The loading state system is the same hierarchy but for the pending state — each segment can show its own skeleton while data loads.
+Error handling in a framework isn't `try/catch` — it's a _hierarchy of error boundaries_ that mirrors the route tree. Each boundary knows its segment's params, can distinguish loader errors from render errors, and can offer typed recovery actions. The loading state system is the same hierarchy but for the pending state — each segment can show its own skeleton while something inside it suspends.
 
-The type safety angle is what makes Eigen's approach distinct. Because the route plugin generates the error boundary wiring and the type declarations together, the error component for `/posts/:id` knows that `params.id` is a string. This is the same "types from the filesystem" pattern that powers the rest of Eigen — the plugin sees `src/pages/posts/[id]/error.tsx`, infers the route path, and generates `ErrorBoundaryProps<'/posts/:id'>`.
+What makes the hierarchy work outside React's own rendering is that the framework knows the tree. The loader pipeline records which segment failed, the route module lists each route's segments, and so the server can pick the same boundary React would have picked and render its fallback before any client code runs. The client hydrates against that same choice.
 
-The framework handles the plumbing (boundary placement, server-side error rendering, safe error serialization, loader retry, Suspense integration). The developer writes the UI (what the error looks like, what recovery actions to offer). Both sides are type-safe.
+The framework handles the plumbing (boundary placement, server-side error rendering, safe error serialization, loader retry, Suspense integration). The developer writes the UI (what the error looks like, what recovery actions to offer), and annotates it with the route it belongs to.

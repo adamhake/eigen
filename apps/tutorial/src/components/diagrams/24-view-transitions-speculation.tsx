@@ -22,7 +22,7 @@ export function NavigationModesDiagram() {
       <Box {...l(0)} label="click <Link>" sub="navigate event fires" mono />
       <Box {...l(1)} label="event.intercept()" sub="same document; prerender unused" mono />
       <Box {...l(2)} label="fetch /_eigen/data" sub="or Part 23's hover preload" mono />
-      <Box {...l(3)} label="startViewTransition()" sub="same-document animation" mono />
+      <Box {...l(3)} label="<ViewTransition>" sub="React animates the update" mono />
 
       <Box {...r(0)} label="hover link" sub="speculation rule matches" />
       <Box {...r(1)} label="prerender page" sub="hidden background page" tone="accent" />

@@ -143,7 +143,7 @@ The crucial difference from [Part 1](/01-bare-vite-spa): we use [`hydrateRoot`](
 
 The client wraps the route component in `<Suspense>` (because the virtual module uses `React.lazy` for code splitting). The server must include the same `<Suspense>` boundary so the component trees match — otherwise React detects a structural mismatch during hydration. Since the server uses static imports (not `React.lazy`), the component never suspends, and `renderToString` renders straight through the `<Suspense>` boundary. The boundary adds no elements — only a pair of invisible comment markers (`<!--$-->` … `<!--/$-->`) in the HTML.
 
-Those markers matter on the client. During hydration, the `React.lazy` page component suspends while its chunk downloads. Because the server HTML marks the boundary, React leaves that server-rendered content in place, hydrates the rest of the page (the nav is interactive immediately), and finishes the boundary once the chunk arrives — no fallback flash, no mismatch. Streaming SSR ([`renderToPipeableStream`](https://react.dev/reference/react-dom/server/renderToPipeableStream), which we'll adopt in [Part 12](/12-streaming-ssr)) builds on the same boundaries so the _server_ doesn't have to wait for slow parts either.
+Those markers matter on the client. During hydration, the `React.lazy` page component suspends while its chunk downloads. Because the server HTML marks the boundary, React leaves that server-rendered content in place, hydrates the rest of the page (the nav is interactive immediately), and finishes the boundary once the chunk arrives — no fallback flash, no mismatch. Streaming SSR ([`renderToReadableStream`](https://react.dev/reference/react-dom/server/renderToReadableStream), which we'll adopt in [Part 12](/12-streaming-ssr)) builds on the same boundaries so the _server_ doesn't have to wait for slow parts either.
 
 ### The initial data flow
 
@@ -166,37 +166,27 @@ import { matchRoute } from "eigen/match-route"; // [!code --]
 import { matchRoute, type RouteMatch } from "eigen/match-route"; // [!code ++]
 import { routes } from "eigen/routes";
 
-function App({ match, data }: { match: RouteMatch | null; data: unknown }) {
-  // [!code ++]
+function App({ match, data }: { match: RouteMatch | null; data: unknown }) { // [!code ++]
   const Component = match?.route.component; // [!code ++]
-  return (
-    // [!code ++]
-    <div>
-      {" "}
-      // [!code ++]
-      <nav>
-        {" "}
-        // [!code ++]
-        <a href="/">Home</a> | <a href="/about">About</a> | // [!code ++]
-        <a href="/posts/1">Post 1</a> | // [!code ++]
-        <a href="/posts/2">Post 2</a> // [!code ++]
-      </nav>{" "}
-      // [!code ++]
+  return ( // [!code ++]
+    <div> {/* [!code ++] */}
+      <nav> {/* [!code ++] */}
+        <a href="/">Home</a> | <a href="/about">About</a> |{" "} {/* [!code ++] */}
+        <a href="/posts/1">Post 1</a>{" "} {/* [!code ++] */}
+        |{" "} {/* [!code ++] */}
+        <a href="/posts/2">Post 2</a> {/* [!code ++] */}
+      </nav> {/* [!code ++] */}
       {match && Component ? ( // [!code ++]
-        <Suspense fallback={<div>Loading...</div>}>
-          {" "}
-          // [!code ++]
-          <Component params={match.params} data={data} /> // [!code ++]
+        <Suspense fallback={<div>Loading...</div>}> {/* [!code ++] */}
+          <Component params={match.params} data={data} /> {/* [!code ++] */}
         </Suspense> // [!code ++]
-      ) : (
-        // [!code ++]
+      ) : ( // [!code ++]
         <h1>404</h1> // [!code ++]
-      )}{" "}
-      // [!code ++]
+      )} {/* [!code ++] */}
     </div> // [!code ++]
   ); // [!code ++]
 } // [!code ++]
-// [!code ++]
+
 export interface RenderResult {
   html: string;
   status: number;
@@ -206,8 +196,7 @@ export interface RenderResult {
 export async function render(pathname: string): Promise<RenderResult> {
   const match = matchRoute(pathname, routes);
   if (!match) return { html: "<h1>404</h1>", status: 404, data: null }; // [!code --]
-  if (!match) {
-    // [!code ++]
+  if (!match) { // [!code ++]
     // Render the full shell so the client's 404 hydrates cleanly // [!code ++]
     const html = renderToString(<App match={null} data={null} />); // [!code ++]
     return { html, status: 404, data: null }; // [!code ++]
@@ -227,7 +216,7 @@ export async function render(pathname: string): Promise<RenderResult> {
 }
 ```
 
-The `App` component receives the already-resolved `match` from `render`, so route matching happens once per request. Unmatched URLs render the same shell with a `404` heading in place of the page — exactly what the client's `Router` renders for an unknown path — so 404 pages hydrate without a mismatch too.
+The `App` component receives the already-resolved `match` from `render`, so route matching happens once per request. The nav markup mirrors the client's `App` character for character, including the `{" "}` placements: JSX trims whitespace at line ends, so writing the same links with different line breaks would produce different text nodes and a hydration mismatch. Unmatched URLs render the same shell with a `404` heading in place of the page — exactly what the client's `Router` renders for an unknown path — so 404 pages hydrate without a mismatch too.
 
 Notice the server uses `<a href="/">` instead of `<Link to="/">`. That's not because `Link` can't run on the server — it only touches [`pushState`](https://developer.mozilla.org/en-US/docs/Web/API/History/pushState) inside its click handler, which never fires during server rendering, so it already renders a plain `<a>`. The problem is _where it lives_: `Link` is defined in `entry-client.tsx`, and importing that file on the server would run its `hydrateRoot(...)` call. Once `Link` moves into the framework package ([Part 11](/11-framework-plugin)), both entries can share it. For now, the nav structure just needs to produce the same HTML on both sides.
 
@@ -250,7 +239,7 @@ Start the dev server with `npx tsx server.ts` (the custom server from [Part 3](/
 
 2. **Hydration errors.** Try making the server render different content than the client — for example, using `new Date()` in a component. The server and client will produce different timestamps, and React will warn about the mismatch in the console. This demonstrates why the hydration contract matters.
 
-3. **Client-side navigation.** After hydration, clicking `Link` components uses [`pushState`](https://developer.mozilla.org/en-US/docs/Web/API/History/pushState) — no server roundtrip. The component for the new route renders instantly. But notice that nobody calls the loader on the client side — `data` is always `window.__EIGEN_DATA__`, which was baked into the HTML for the _initial_ page load. Start on `http://localhost:3000/posts/1`, then click "Post 2" in the nav. The URL changes to `/posts/2`, but the title and body still show Post 1's content — the loader wasn't re-invoked. We'll fix this in [Part 5](/05-typed-loaders) by adding a client-side data fetching endpoint.
+3. **Client-side navigation.** After hydration, clicking `Link` components uses [`pushState`](https://developer.mozilla.org/en-US/docs/Web/API/History/pushState) — no server roundtrip. The component for the new route renders instantly. But notice that nobody calls the loader on the client side — `data` is always `window.__EIGEN_DATA__`, which was baked into the HTML for the _initial_ page load. Start on `http://localhost:3000/posts/1`, then click "Post 2" in the nav. The URL changes to `/posts/2`, but the title and body still show Post 1's content — the loader wasn't re-invoked. (Start on `/` or `/about` instead and clicking "Post 1" crashes: `data` is that page's `null`, and `PostPage` reads `data.title`.) We'll fix this in [Part 5](/05-typed-loaders) by adding a client-side data fetching endpoint.
 
 4. **The `Link` component constraints.** In your editor, try `<Link to="/invalid">` — TypeScript reports an error. Try `<Link to="/posts/:id">` without a `params` prop — TypeScript requires `{ id: string }`, thanks to the conditional props type from [Part 2](/02-route-discovery-plugin).
 
