@@ -4,5 +4,13 @@
   "tabWidth": 2,
   "useTabs": false,
   "singleQuote": false,
-  "sortImports": true
+  "sortImports": true,
+  "overrides": [
+    {
+      "files": ["**/*.mdx", "**/*.md"],
+      "options": {
+        "embeddedLanguageFormatting": "off"
+      }
+    }
+  ]
 }
