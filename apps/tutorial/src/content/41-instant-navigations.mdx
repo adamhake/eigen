@@ -186,8 +186,6 @@ export function renderSegment(
     ),
   );
 }
-
-export { routes }; // the build plugin below walks the route table
 ```
 
 `complete` is how the server tells the client whether a shell is the whole segment. If the prerender resolved before the abort, nothing was halted, and the client never needs to ask again. If it resolved only because of the abort, the segment has holes.
@@ -212,8 +210,7 @@ async function segmentResponse(request: Request, url: URL): Promise<Response> {
   const pageRequest = new Request(new URL(path, url), { headers: request.headers });
 
   // A segment of a protected page is the protected page: Part 26's rule for shells
-  const ssr = await import.meta.viteRsc.loadModule<typeof import("./entry-ssr")>("ssr", "index");
-  const blocked = await ssr.runShellMiddleware(pageRequest);
+  const blocked = await runShellMiddleware(pageRequest);
   if (blocked) return blocked;
 
   const id = url.searchParams.get("id") ?? PAGE;
@@ -738,6 +735,7 @@ export async function prerenderPage(rsc: RscEntry, request: Request) {
   const controller = new AbortController();
   const pending = prerender(element, {
     signal: controller.signal,
+    bootstrapModules: [getClientEntryUrl()],
     onError(error, info) {
       // Aborting reports every still-pending boundary — that's expected
       if (!controller.signal.aborted) console.error(error); // [!code --]
@@ -751,8 +749,9 @@ export async function prerenderPage(rsc: RscEntry, request: Request) {
   // ...cacheFillsSettled, the extra turns and the abort, unchanged
 
   const { prelude, postponed } = await pending;
-  return { prelude: await new Response(prelude).text(), postponed }; // [!code --]
-  return { prelude: await new Response(prelude).text(), postponed, blocking }; // [!code ++]
+  // ...the </body></html> trimming, unchanged
+  return { prelude: open, postponed }; // [!code --]
+  return { prelude: open, postponed, blocking }; // [!code ++]
 }
 ```
 
@@ -865,7 +864,7 @@ if (pathname === "/_eigen/segment") {
   // Anything else is rendered on demand, and renderSegment does its own checks
   if (!prebuilt) return rsc.default(event.req);
 
-  const blocked = await ssr.runShellMiddleware(new Request(new URL(path, event.url), event.req));
+  const blocked = await rsc.runShellMiddleware(new Request(new URL(path, event.url), event.req));
   if (blocked) return blocked;
   const body = await readFile(join("dist/server/segments", prebuilt.file));
   return new Response(body, { headers: rsc.segmentHeaders(prebuilt) });

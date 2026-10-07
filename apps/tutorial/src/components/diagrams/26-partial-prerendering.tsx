@@ -54,10 +54,10 @@ export function PprResumeTimelineDiagram() {
       caption="The server answers with the pre-rendered shell at once, then streams the holes that resume() renders into the same response."
       steps={[
         "The browser requests /products/1. It's listed in ppr.json, so once middleware lets the request through, the server reads its shell.html and postponed.json instead of falling back to SSR.",
-        "The server enqueues the shell up to the <!--eigen-resume--> marker immediately. The browser paints the static content and the hole fallbacks.",
+        "The server enqueues the whole shell immediately. The browser paints the static content and the hole fallbacks.",
         "resumePage re-runs the RSC render and passes the element and the postponed state to resume(), so only the holes render.",
         "resume() returns each hole's HTML with fill-in scripts that match the boundary IDs already in the prelude.",
-        "The server forwards those chunks on the same response as they resolve, then the rest of the template. The price appears in place of its fallback.",
+        "The server forwards those chunks on the same response as they resolve; resume() ends with the closing </body></html>. The price appears in place of its fallback.",
       ]}
     >
       <Lifeline x={BROWSER} bottom={334} label="Browser" />

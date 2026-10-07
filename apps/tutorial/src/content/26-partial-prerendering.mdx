@@ -129,38 +129,57 @@ A component that awaits `getRequest()` _outside_ any Suspense boundary leaves no
 
 ### Build time: generate the static shell
 
-The `rsc` entry's `renderRSC` gains a `prerendering` flag and runs the render inside `runWithRequest`, so `getRequest()` can find the request. It also stops wrapping the tree in `<html>`. A shell is spliced into Part 16's `template.html` at `<!--ssr-outlet-->`, inside `<div id="root">`, so the payload is now the layout tree alone, and the client entry hydrates `#root` instead of `document`. The `ssr` entry gains two functions — one for each half of PPR:
+The `rsc` entry's `renderRSC` gains a `prerendering` flag and runs the render inside `runWithRequest`, so `getRequest()` can find the request. The payload is still Part 21's whole document, `<html>` included, so a shell is a complete HTML document and needs no template. The rsc entry also takes over the middleware check for shells: it already imports the route table, and the `ssr` environment must not (Part 21).
 
 ```tsx title="src/entry-rsc.tsx (change)"
 import { renderToReadableStream } from "@vitejs/plugin-rsc/rsc";
+import { executeMiddleware } from "eigen/middleware"; // [!code ++]
 import { matchRoute } from "eigen/match-route";
-import { routes } from "eigen/routes";
+import { globalMiddleware, routes } from "eigen/routes"; // [!code ++]
 import { runWithRequest } from "eigen/request"; // [!code ++]
 import { withRequestCache } from "eigen/runtime/cache";
 export { cacheFillsSettled } from "eigen/runtime/cache"; // [!code ++]
+export { routes }; // [!code ++]
 
 export function renderRSC(request: Request, { prerendering = false } = {}): ReadableStream {
   return runWithRequest({ request, prerendering }, () => // [!code ++]
     withRequestCache(() => {
       const match = matchRoute(new URL(request.url).pathname, routes);
-      // The template supplies <html> and <body> now // [!code ++]
-      return renderToReadableStream(match ? <RouteTree match={match} /> : <h1>404</h1>);
+      const root = (
+        <html lang="en">
+          <body>{match ? <RouteTree match={match} /> : <h1>404</h1>}</body>
+        </html>
+      );
+      return renderToReadableStream(root);
     }),
   ); // [!code ++]
 }
+
+/** Middleware for a request served from a shell. Returns its response if it short-circuits. */ // [!code ++]
+export async function runShellMiddleware(request: Request): Promise<Response | null> { // [!code ++]
+  const { pathname } = new URL(request.url); // [!code ++]
+  const match = matchRoute(pathname, routes); // [!code ++]
+  const { response } = await executeMiddleware([...globalMiddleware, ...(match?.route.middleware ?? [])], { // [!code ++]
+    request, // [!code ++]
+    params: match?.params ?? {}, // [!code ++]
+    pathname, // [!code ++]
+  }); // [!code ++]
+  return response ?? null; // [!code ++]
+} // [!code ++]
 ```
 
+The `ssr` entry gains two functions, one for each half of PPR. Neither imports the route table: everything route-specific arrives through the rsc entry, passed in by the caller.
+
 ```tsx title="src/entry-ssr.tsx (addition)"
-import { createFromReadableStream } from "@vitejs/plugin-rsc/ssr";
+import { createFromReadableStream, getClientEntryUrl } from "@vitejs/plugin-rsc/ssr";
 import { prerender } from "react-dom/static";
 import { resume } from "react-dom/server";
 import { injectRSCPayload } from "rsc-html-stream/server";
-import { executeMiddleware } from "eigen/middleware";
-import { matchRoute } from "eigen/match-route";
-import { globalMiddleware, routes } from "eigen/routes";
 
-// The built rsc entry's exports (renderRSC, cacheFillsSettled), passed in by the caller
+// The built rsc entry's exports (renderRSC, cacheFillsSettled, ...), passed in by the caller
 type RscEntry = typeof import("./entry-rsc");
+
+const DOCUMENT_END = "</body></html>";
 
 export async function prerenderPage(rsc: RscEntry, request: Request) {
   const element = await createFromReadableStream(rsc.renderRSC(request, { prerendering: true }));
@@ -168,6 +187,8 @@ export async function prerenderPage(rsc: RscEntry, request: Request) {
   const controller = new AbortController();
   const pending = prerender(element, {
     signal: controller.signal,
+    // As in Part 21's renderToHTML: without it, the shell never loads entry-client
+    bootstrapModules: [getClientEntryUrl()],
     onError(error) {
       // Aborting reports every still-pending boundary — that's expected
       if (!controller.signal.aborted) console.error(error);
@@ -184,7 +205,11 @@ export async function prerenderPage(rsc: RscEntry, request: Request) {
   controller.abort(new Error("eigen: prerender complete"));
 
   const { prelude, postponed } = await pending;
-  return { prelude: await new Response(prelude).text(), postponed };
+  const html = await new Response(prelude).text();
+  // The prelude closes the document, and so does resume()'s output. Leave the
+  // shell open, so the holes that follow it land inside <body>
+  const open = postponed && html.endsWith(DOCUMENT_END) ? html.slice(0, -DOCUMENT_END.length) : html;
+  return { prelude: open, postponed };
 }
 
 export async function resumePage(rsc: RscEntry, request: Request, postponed: object) {
@@ -198,37 +223,32 @@ export async function resumePage(rsc: RscEntry, request: Request, postponed: obj
   const html = await resume(element, postponed);
   return html.pipeThrough(injectRSCPayload(forClient));
 }
-
-/** Middleware for a request served from a shell. Returns its response if it short-circuits. */
-export async function runShellMiddleware(request: Request): Promise<Response | null> {
-  const { pathname } = new URL(request.url);
-  const match = matchRoute(pathname, routes);
-  const { response } = await executeMiddleware([...globalMiddleware, ...(match?.route.middleware ?? [])], {
-    request,
-    params: match?.params ?? {},
-    pathname,
-  });
-  return response ?? null;
-}
 ```
+
+Stripping `</body></html>` matters because a prerendered document is complete: React ends the prelude with the closing tags even when holes are postponed, and `resume()` ends its own output with them too. Sent back to back, the hole content would arrive after `</html>`. Browsers recover from that, but it's invalid HTML. Next.js handles it by holding the closing tags back until the end of the response, and dropping them from the shell does the same job at build time.
 
 Where those cache hits come from matters. The default `MemoryCacheStore` (Part 25) lives in the build process, so a freshly started production server begins with an empty store: the first request misses on `ProductInfo` and queries the CMS again. If the CMS changed since the build, the RSC payload the client hydrates from no longer matches the shell's HTML, and hydration reports a mismatch. Next.js avoids this by saving the prerender's cache entries next to the postponed state and seeding the request from them. In Eigen, configure the same remote store (Part 25's `"use cache: remote"` handlers) for the build and the server, or regenerate shells whenever their tags are revalidated (observation 5).
 
-The prelude is ordinary Fizz output: the static HTML plus each hole's fallback, wrapped in React's boundary markers:
+The prelude is ordinary Fizz output: the static HTML plus each hole's fallback, wrapped in React's boundary markers, and no closing tags:
 
 ```html
-<div id="root">
-  <nav>...</nav>
-  <h1>Product Name</h1>
-  <p>Product description from CMS (cached)</p>
-  <!--$?--><template id="B:0"></template>
-  <div>Loading price...</div>
-  <!--/$-->
-  <!--$?--><template id="B:1"></template>
-  <div>Loading reviews...</div>
-  <!--/$-->
-  <footer>...</footer>
-</div>
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <link rel="modulepreload" href="/assets/entry-client-[hash].js" />
+  </head>
+  <body>
+    <nav>...</nav>
+    <h1>Product Name</h1>
+    <p>Product description from CMS (cached)</p>
+    <!--$?--><template id="B:0"></template>
+    <div>Loading price...</div>
+    <!--/$-->
+    <!--$?--><template id="B:1"></template>
+    <div>Loading reviews...</div>
+    <!--/$-->
+    <footer>...</footer>
+    <script type="module" src="/assets/entry-client-[hash].js" async></script>
 ```
 
 ### The Vite build plugin for PPR
@@ -236,7 +256,7 @@ The prelude is ordinary Fizz output: the static HTML plus each hole's fallback, 
 PPR is opt-in per route, through the same `staticGeneration` export Part 16 uses for SSG:
 
 ```tsx title="src/pages/products/[id].tsx (addition)"
-// Not a fully static page: SSG skips it, and the PPR plugin prerenders a shell instead
+// Not a fully static page, so prerender a PPR shell for it instead
 export const staticGeneration = { prerender: false, partial: true };
 ```
 
@@ -253,11 +273,11 @@ export interface StaticGenerationConfig {
 }
 ```
 
-The plugin follows Part 16's SSG exactly: a `buildApp` hook with `order: 'post'`, so it runs after both environment builds and after SSG (post hooks run sequentially in plugin order, and `eigenPPR()` is listed after `eigenSSG()`). It reads the template SSG saved to `dist/server/template.html`, and reuses Part 16's `pathsToPrerender` to expand `generateStaticParams`. Shells are written under `dist/server/ppr/`, _not_ `dist/client/`: a shell served as a static file would never get its holes filled. Like SSG's `prerendered.json`, a `ppr.json` manifest tells the server which paths have shells:
+The plugin follows Part 16's SSG: a `buildApp` hook with `order: 'post'`, so it runs after plugin-rsc's builds. It walks the rsc entry's route table, and reuses Part 16's `pathsToPrerender` to expand `generateStaticParams`. RSC mode leaves the SSG plugin out (Part 21), but its exported helper still works. Shells are written under `dist/server/ppr/`, _not_ `dist/client/`: a shell served as a static file would never get its holes filled. Like SSG's `prerendered.json`, a `ppr.json` manifest tells the server which paths have shells:
 
 ```typescript title="packages/eigen/plugins/eigen-ppr.ts"
 import type { Plugin } from "vite";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { pathsToPrerender } from "./eigen-ssg";
@@ -278,10 +298,9 @@ export default function eigenPPR(): Plugin {
         // plugin-rsc names each environment's entry index.js (Part 21)
         const rsc = await load(join(rscDir, "index.js"));
         const ssr = await load(join(serverDir, "index.js"));
-        const template = readFileSync(join(serverDir, "template.html"), "utf-8");
 
         const shells: string[] = [];
-        for (const route of ssr.routes) {
+        for (const route of rsc.routes) {
           if (!route.staticGeneration?.partial) continue;
 
           // Part 16's expansion of static paths and generateStaticParams,
@@ -298,12 +317,10 @@ export default function eigenPPR(): Plugin {
             const request = new Request(new URL(pathname, "http://localhost"));
             const { prelude, postponed } = await ssr.prerenderPage(rsc, request);
 
-            // The marker is where the request-time stream will be spliced in
-            const shellHtml = template.replace("<!--ssr-outlet-->", `${prelude}<!--eigen-resume-->`);
-
             const dir = join(serverDir, "ppr", pathname);
             mkdirSync(dir, { recursive: true });
-            writeFileSync(join(dir, "shell.html"), shellHtml);
+            // A whole document; left open when holes follow it
+            writeFileSync(join(dir, "shell.html"), prelude);
             // postponed === null means the page turned out fully static
             writeFileSync(join(dir, "postponed.json"), JSON.stringify(postponed));
             shells.push(pathname);
@@ -318,7 +335,7 @@ export default function eigenPPR(): Plugin {
 }
 ```
 
-Add `eigenPPR()` to the plugin array returned by `eigen()`, after `eigenSSG()`. Dynamic routes without `generateStaticParams` get no shell — there's no concrete URL to prerender — and fall back to full SSR.
+Add `eigenPPR()` to the plugins `eigen()` returns in RSC mode. Dynamic routes without `generateStaticParams` get no shell — there's no concrete URL to prerender — and fall back to a full render.
 
 ### Request time: fill the dynamic holes
 
@@ -326,53 +343,47 @@ When a request comes in, the server doesn't re-render the shell. It sends the pr
 
 <PprResumeTimelineDiagram />
 
-This is Part 16's production server with one more branch, checked before the SSR fallback. A shell is not a public file: Part 16's fallback ran middleware inside `renderStream`, so this branch runs it first and returns its redirect or 401 if it short-circuits:
+In RSC mode the production server hands pages to the rsc entry's fetch handler, the same one plugin-rsc's dev server calls (Part 21). It renders the payload and then the HTML, running middleware as it goes. The PPR branch is checked first. A shell is not a public file, so this branch runs middleware itself and returns the redirect or 401 if one short-circuits:
 
 ```typescript title="server.prod.ts (PPR branch)"
 import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
-// In RSC mode the server bundle is dist/server/index.js; renderStream and isBot come from it too
+// plugin-rsc's two server bundles (Part 21)
 const pprPaths = new Set<string>(JSON.parse(readFileSync("dist/server/ppr.json", "utf-8")));
 const rsc = await import("./dist/rsc/index.js");
 const ssr = await import("./dist/server/index.js");
 
-// Replaces Part 16's catch-all handler
 app.all("/**", async (event) => {
   const { pathname } = event.url;
 
-  // ...Part 16's prerendered.has(pathname) branch stays first, unchanged...
-
-  // Membership check, as with prerendered.json: request paths
+  // Membership check, as with Part 16's prerendered.json: request paths
   // never reach the filesystem unless the build listed them
   if (event.req.method !== "GET" || !pprPaths.has(pathname)) {
-    // Regular SSR (Part 16's fallback)
-    return ssr.renderStream(event.req, { template, waitForAll: ssr.isBot(event.req) });
+    // Everything else: Part 21's RSC → HTML render
+    return rsc.default(event.req);
   }
 
-  // Auth guards, rate limits, redirects: same as for an SSR'd page
-  const blocked = await ssr.runShellMiddleware(event.req);
+  // Auth guards, rate limits, redirects: same as for a rendered page
+  const blocked = await rsc.runShellMiddleware(event.req);
   if (blocked) return blocked;
 
   const dir = join("dist/server/ppr", pathname);
   const shell = await readFile(join(dir, "shell.html"), "utf-8");
   const postponed = JSON.parse(await readFile(join(dir, "postponed.json"), "utf-8"));
-  const [head, tail] = shell.split("<!--eigen-resume-->");
   const headers = { "Content-Type": "text/html; charset=utf-8" };
 
-  if (postponed === null) return new Response(head + tail, { headers });
+  if (postponed === null) return new Response(shell, { headers });
 
-  const encoder = new TextEncoder();
   const body = new ReadableStream<Uint8Array>({
     async start(controller) {
-      controller.enqueue(encoder.encode(head)); // 1. the shell, immediately
+      controller.enqueue(new TextEncoder().encode(shell)); // 1. the shell, immediately
       const resumed = await ssr.resumePage(rsc, event.req, postponed);
       for await (const chunk of resumed) {
-        // 2. the holes, as they resolve
+        // 2. the holes as they resolve, then </body></html>
         controller.enqueue(chunk);
       }
-      controller.enqueue(encoder.encode(tail)); // 3. the rest of the template
       controller.close();
     },
   });
