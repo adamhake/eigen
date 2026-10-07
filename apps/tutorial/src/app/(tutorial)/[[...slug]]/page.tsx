@@ -5,6 +5,7 @@ import { notFound } from "next/navigation";
 
 import { LLMCopyButton, ViewOptions } from "@/components/ai/page-actions";
 import { ConceptBadges } from "@/components/mdx/badge";
+import { partFromSlug, SeriesMap } from "@/components/series-map";
 import { gitConfig } from "@/lib/layout.shared";
 import { getPageImage, source } from "@/lib/source";
 import { getMDXComponents } from "@/mdx-components";
@@ -15,6 +16,7 @@ export default async function Page(props: PageProps<"/[[...slug]]">) {
   if (!page) notFound();
 
   const MDX = page.data.body;
+  const part = partFromSlug(params.slug);
 
   return (
     <DocsPage toc={page.data.toc} full={page.data.full}>
@@ -28,6 +30,7 @@ export default async function Page(props: PageProps<"/[[...slug]]">) {
           githubUrl={`https://github.com/${gitConfig.user}/${gitConfig.repo}/blob/${gitConfig.branch}/${gitConfig.contentDir}/${page.path}`}
         />
       </div>
+      {part !== null && <SeriesMap current={part} />}
       <DocsBody>
         <MDX
           components={getMDXComponents({
