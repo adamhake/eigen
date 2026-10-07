@@ -455,18 +455,17 @@ Nested cached functions get their own scope: when `PostPage` calls a cached `get
 ```tsx title="src/entry-rsc.tsx"
 import { withRequestCache } from "eigen/runtime/cache"; // [!code ++]
 
-export async function renderRSC(pathname: string): Promise<ReadableStream> {
+export function renderRSC(request: Request): ReadableStream {
   // AsyncLocalStorage follows the render's continuations, so components that // [!code ++]
   // render after the first chunk has flushed still see the same memo // [!code ++]
   return withRequestCache(() => { // [!code ++]
-    const match = matchRoute(pathname, routes);
-    if (!match) return renderToReadableStream(<h1>404</h1>);
-
-    const Component = match.route.component;
-    // Server components can be async — they fetch data directly
-    const element = <Component params={match.params} />;
-
-    return renderToReadableStream(element);
+    const match = matchRoute(new URL(request.url).pathname, routes);
+    const root = (
+      <html lang="en">
+        <body>{match ? <RouteTree match={match} /> : <h1>404</h1>}</body>
+      </html>
+    );
+    return renderToReadableStream(root);
   }); // [!code ++]
 }
 ```

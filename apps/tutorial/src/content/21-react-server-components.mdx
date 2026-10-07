@@ -197,24 +197,31 @@ Rendering a page with RSC is a three-phase process:
 
 ```tsx title="src/entry-rsc.tsx"
 import { renderToReadableStream } from "@vitejs/plugin-rsc/rsc";
-import { matchRoute } from "eigen/match-route";
+import { matchRoute, type RouteMatch } from "eigen/match-route";
 import { routes } from "eigen/routes";
 
 // This is the RSC-specific renderToReadableStream, NOT react-dom/server's.
 // It produces an RSC payload stream, not an HTML stream.
 
-export async function renderRSC(pathname: string): Promise<ReadableStream> {
-  const match = matchRoute(pathname, routes);
+export function renderRSC(request: Request): ReadableStream {
+  const match = matchRoute(new URL(request.url).pathname, routes);
   // The payload describes the whole document, so the client hydrates `document`
   const root = (
     <html lang="en">
-      <body>
-        {/* Server components can be async — they fetch data directly */}
-        {match ? <match.route.component params={match.params} /> : <h1>404</h1>}
-      </body>
+      <body>{match ? <RouteTree match={match} /> : <h1>404</h1>}</body>
     </html>
   );
   return renderToReadableStream(root);
+}
+
+/** Part 13's layout chain, outermost first, wrapped around the page */
+function RouteTree({ match }: { match: RouteMatch }) {
+  // Server components can be async — they fetch data directly
+  const Page = match.route.component;
+  return match.route.layouts.reduceRight<React.ReactNode>(
+    (children, { component: Layout }) => <Layout>{children}</Layout>,
+    <Page params={match.params} />,
+  );
 }
 
 // plugin-rsc's dev and preview servers call the rsc entry's default export
@@ -222,7 +229,9 @@ export async function renderRSC(pathname: string): Promise<ReadableStream> {
 export default async function handler(request: Request): Promise<Response> {
   const url = new URL(request.url);
   const isRsc = url.pathname.endsWith(".rsc");
-  const rscStream = await renderRSC(isRsc ? url.pathname.slice(0, -".rsc".length) || "/" : url.pathname);
+  if (isRsc) url.pathname = url.pathname.slice(0, -".rsc".length) || "/";
+  // Components see the page's URL, not the `.rsc` one
+  const rscStream = renderRSC(new Request(url, request));
 
   // Raw payload for client navigations and for inspection (`/posts/1.rsc`)
   if (isRsc) {
@@ -238,6 +247,8 @@ export default async function handler(request: Request): Promise<Response> {
 ```
 
 The output of Phase 1 is an **RSC payload** (React's "Flight" format) — a stream of mostly-text rows, each a JSON-like chunk with an ID, that encodes the React element tree (binary data such as typed arrays gets its own rows). Server component output is serialized inline. Client component references are included as markers. Props passed from server to client components are serialized.
+
+`RouteTree` is Part 13's layout nesting without the loader plumbing. A layout is a server component like the page, so it fetches its own data, and it receives only `children`. The `data` prop and `LayoutDataProvider` belong to the classic SSR path.
 
 ### Phase 2: SSR rendering (ssr environment)
 
@@ -275,6 +286,44 @@ hydrateRoot(document, root)
 ```
 
 The client only hydrates `"use client"` components. Server components are already rendered in the HTML — the client doesn't load or execute their code at all.
+
+### Client navigations
+
+The client can't render the next page itself: it has no server component code. So a navigation asks the server for the next page's payload, the same `.rsc` URL, and renders that. The client entry keeps the current payload in state:
+
+```tsx title="src/entry-client.tsx"
+import { createFromFetch, createFromReadableStream } from "@vitejs/plugin-rsc/browser";
+import { startTransition, use, useEffect, useState, type ReactNode } from "react";
+import { hydrateRoot } from "react-dom/client";
+
+const rscUrl = (pathname: string) => pathname.replace(/\/$/, "") + ".rsc";
+
+let setPayload: (payload: Promise<ReactNode>) => void;
+
+function Root({ initial }: { initial: Promise<ReactNode> }) {
+  const [payload, set] = useState(initial);
+  useEffect(() => {
+    setPayload = set; // Navigations can start once the page has hydrated
+  }, []);
+  return use(payload);
+}
+
+export function navigate(href: string, { push = true } = {}) {
+  const url = new URL(href, location.href);
+  if (push) history.pushState(null, "", url);
+  // A transition keeps the current page on screen while the next payload streams
+  startTransition(() => setPayload(createFromFetch<ReactNode>(fetch(rscUrl(url.pathname)))));
+}
+
+addEventListener("popstate", () => navigate(location.href, { push: false }));
+
+const initial = fetch(rscUrl(location.pathname)).then((res) => createFromReadableStream<ReactNode>(res.body!));
+hydrateRoot(document, <Root initial={initial} />);
+```
+
+A small client `Link` calls `navigate(href)` on click instead of letting the browser load the page. The new payload has the same `<html>`, the same layouts in the same positions, and a different page at the bottom. React reconciles it against the current tree like any other re-render, so client components inside a shared layout keep their state, and only the DOM that changed is touched. That's how layouts persist in RSC mode: the server re-renders them, and the client keeps them.
+
+This router is deliberately minimal. Part 22 replaces `pushState` and `popstate` with the Navigation API. [Part 41](/41-instant-navigations) removes the costs that remain: every click waits for a server round trip, and every payload re-sends layouts the client already has.
 
 ---
 
@@ -426,9 +475,11 @@ The mechanism is identical to Part 15: the `rsc` environment keeps the function 
 
 3. **Inspect the RSC payload.** The rsc entry's handler returns the raw stream (`Content-Type: text/x-component`) for URLs ending in `.rsc` — the convention plugin-rsc's examples use — so fetch `/posts/1.rsc` in development. You'll see rows of serialized React elements, client references (module IDs plus export names), and serialized props.
 
-4. **Try using `useState` in a server component.** TypeScript is happy — `@types/react` has one set of types for every environment — but the request fails: under the `react-server` condition, the `react` package's server build doesn't export `useState`, so in the `rsc` environment the import is `undefined` and the call fails with a `… is not a function` TypeError. This is a module-resolution boundary, not a type-level one.
+4. **Navigate between two pages that share a layout.** The Network tab shows one `.rsc` request per click and no HTML documents. Put a `"use client"` counter in the layout, increment it, then navigate: the count survives, even though the server re-rendered the layout around it.
 
-5. **Watch `@vitejs/plugin-rsc`'s transform output** in `vite-plugin-inspect`. The same `LikeButton.tsx` file produces three different outputs: a client reference stub (rsc), the full component (ssr), and the hydration-ready component (client).
+5. **Try using `useState` in a server component.** TypeScript is happy — `@types/react` has one set of types for every environment — but the request fails: under the `react-server` condition, the `react` package's server build doesn't export `useState`, so in the `rsc` environment the import is `undefined` and the call fails with a `… is not a function` TypeError. This is a module-resolution boundary, not a type-level one.
+
+6. **Watch `@vitejs/plugin-rsc`'s transform output** in `vite-plugin-inspect`. The same `LikeButton.tsx` file produces three different outputs: a client reference stub (rsc), the full component (ssr), and the hydration-ready component (client).
 
 ---
 

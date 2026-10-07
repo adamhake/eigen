@@ -125,30 +125,28 @@ export default async function ProductPage({ params }: { params: { id: string } }
 }
 ```
 
-A component that awaits `getRequest()` _outside_ any Suspense boundary leaves nothing static to put in the shell. The plugin below doesn't check for that. Detecting it (an empty prelude) and falling back to plain SSR for the route is left as an exercise.
+A component that awaits `getRequest()` _outside_ any Suspense boundary leaves nothing static to put in the shell. The plugin below doesn't check for that. Detecting it (an empty prelude) and falling back to plain SSR for the route is left as an exercise. [Part 41](/41-instant-navigations#checking-that-a-route-is-instant) turns that check into a build error.
 
 ### Build time: generate the static shell
 
-The `rsc` entry's `renderRSC` changes signature: it takes the `Request` (for `getRequest()`) and a `prerendering` flag instead of a pathname, and it returns the stream synchronously. Part 21's caller in the server entry changes from `renderRSC(pathname)` to `renderRSC(request)` to match. The `ssr` entry gains two functions — one for each half of PPR:
+The `rsc` entry's `renderRSC` gains a `prerendering` flag and runs the render inside `runWithRequest`, so `getRequest()` can find the request. It also stops wrapping the tree in `<html>`. A shell is spliced into Part 16's `template.html` at `<!--ssr-outlet-->`, inside `<div id="root">`, so the payload is now the layout tree alone, and the client entry hydrates `#root` instead of `document`. The `ssr` entry gains two functions — one for each half of PPR:
 
 ```tsx title="src/entry-rsc.tsx (change)"
 import { renderToReadableStream } from "@vitejs/plugin-rsc/rsc";
 import { matchRoute } from "eigen/match-route";
 import { routes } from "eigen/routes";
-import { runWithRequest } from "eigen/request";
+import { runWithRequest } from "eigen/request"; // [!code ++]
 import { withRequestCache } from "eigen/runtime/cache";
-export { cacheFillsSettled } from "eigen/runtime/cache";
+export { cacheFillsSettled } from "eigen/runtime/cache"; // [!code ++]
 
 export function renderRSC(request: Request, { prerendering = false } = {}): ReadableStream {
-  const { pathname } = new URL(request.url);
-  return runWithRequest({ request, prerendering }, () =>
+  return runWithRequest({ request, prerendering }, () => // [!code ++]
     withRequestCache(() => {
-      const match = matchRoute(pathname, routes);
-      if (!match) return renderToReadableStream(<h1>404</h1>);
-      const Component = match.route.component;
-      return renderToReadableStream(<Component params={match.params} />);
+      const match = matchRoute(new URL(request.url).pathname, routes);
+      // The template supplies <html> and <body> now // [!code ++]
+      return renderToReadableStream(match ? <RouteTree match={match} /> : <h1>404</h1>);
     }),
-  );
+  ); // [!code ++]
 }
 ```
 
