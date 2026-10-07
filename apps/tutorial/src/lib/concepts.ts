@@ -792,4 +792,25 @@ export const conceptDefinitions: Record<string, ConceptDefinition> = {
       "Publishing from CI with npm trusted publishing (OIDC), which removes long-lived tokens and attaches a signed provenance attestation.",
     url: "https://docs.npmjs.com/trusted-publishers",
   },
+
+  // Part 41
+  "segment-level rsc payloads": {
+    description:
+      "Rendering each layout and page as its own RSC payload, so a layout shared by many URLs is sent and cached once.",
+  },
+  "partial prefetching": {
+    description:
+      "Prefetching a route's static shell (static and cached content) before the click, and streaming request-dependent content after it.",
+    url: "https://nextjs.org/docs/app/api-reference/config/next-config-js/partialPrefetching",
+  },
+  "client segment cache": {
+    description:
+      "A browser-side cache of RSC payloads keyed by segment, with stale times the server derives from cacheLife.",
+    url: "https://nextjs.org/docs/app/guides/prefetching",
+  },
+  "instant navigation validation": {
+    description:
+      "A build check that fails when uncached or request-time data is read outside <Suspense>, which would block a route's shell.",
+    url: "https://nextjs.org/docs/messages/blocking-route",
+  },
 };

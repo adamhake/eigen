@@ -1,0 +1,933 @@
+---
+title: "Part 41: Instant Navigations"
+description: "Segment-level RSC payloads, shells prerendered with React's Flight prerender, a client segment cache with a prefetch scheduler, and a build check that keeps navigations instant."
+concepts:
+  - "segment-level RSC payloads"
+  - "partial prefetching"
+  - "client segment cache"
+  - "instant navigation validation"
+---
+
+_This module makes client navigations as fast as the first page load. It splits the RSC payload into one payload per layout and page, prerenders each one's static shell the way [Part 26](/26-partial-prerendering) prerenders a page, caches those shells in the browser before the user clicks, and fails the build when a route can't be shown instantly. It builds on RSC mode: read [Part 21](/21-react-server-components), [Part 22](/22-navigation-api), [Part 25](/25-use-cache) and Part 26 first._
+
+---
+
+## Where navigations still wait
+
+After Part 26, the first visit to a product page is fast: the server sends a prebuilt shell, and the holes stream in after it. The _second_ page is slow again. Part 21's client router fetches the whole payload for the next URL on click and keeps the old page on screen until it arrives. The server renders the root layout, the shop layout and the page from scratch, including the parts that haven't changed since the build, and none of the request starts until the user clicks.
+
+Eigen already has three prefetchers. None of them helps here:
+
+| Prefetcher                                     | What it fetches ahead                           | Why it doesn't fix RSC navigations                                                      |
+| ---------------------------------------------- | ----------------------------------------------- | --------------------------------------------------------------------------------------- |
+| `preloadRoute` ([Part 23](/23-advanced-router#route-preloading)) | Loader JSON from `/_eigen/data`                 | RSC pages have no loaders. The data is inside the payload                               |
+| Speculation Rules ([Part 24](/24-view-transitions-speculation)) | A whole document, prerendered by the browser   | Only for `navigationMode = "document"` routes. A full page load drops client state      |
+| TanStack Query ([Part 34](/34-data-fetching#prefetching-on-navigation-intent)) | Query data                                      | Data, not UI: the server still renders the page on click                               |
+
+What's missing is a prefetch of the RSC payload itself. And a payload for a whole page is the wrong unit to prefetch: ten links to ten products would fetch the same two layouts ten times.
+
+Next.js 16 rebuilt its client router around this problem. Its _segment cache_ stores one entry per layout and page, so a shared layout is fetched once, and it prefetches only what a link is missing. Since 16.3, _Partial Prefetching_ (`partialPrefetching: true`, recommended alongside `cacheComponents`) prefetches a reusable shell for each route: the static and cached content, but not the parts that need the request. On click, the shell renders at once and the rest streams in. We'll build Eigen's version:
+
+1. Split the payload into segments, one per layout and one for the page.
+2. Render a single segment on the server, either in full or as a prerendered shell.
+3. Cache segment shells in the browser, with stale times from `cacheLife`.
+4. Prefetch the shells for links on screen, in priority order.
+5. Navigate from the cache, then fill the holes.
+6. Clear the cache when a server function revalidates data.
+7. Fail the build when a route can't render an instant shell.
+
+<Callout type="info" title="Two meanings of “partial prefetching”">
+  Before Next.js 16.3, a "partial" prefetch was the default `<Link>` behavior for dynamic routes: prefetch down to the
+  nearest `loading.js`, and nothing below it. Since 16.3 the term means the App Shell model described above, which is
+  what this module builds.
+</Callout>
+
+---
+
+## Splitting the payload into segments
+
+A _segment_ is one layout or the page. Its ID is the layout's path, as in Part 13's route table, or `page` for the page. The URL `/shop/2` has the chain `["/", "/shop", "page"]`:
+
+```typescript title="packages/eigen/segment-ids.ts"
+export const PAGE = "page";
+
+/** Segment IDs for a route, outermost first: ['/', '/shop', 'page'] */
+export function segmentChain(route: { layouts: { path: string }[] }): string[] {
+  return [...route.layouts.map((layout) => layout.path), PAGE];
+}
+
+/** Layouts are the same for every URL under them; a page belongs to one URL */
+export function segmentKey(id: string, pathname: string): string {
+  return id === PAGE ? `${PAGE}:${pathname}` : id;
+}
+```
+
+`segmentKey` holds the observation the whole module rests on. In RSC mode a layout receives only `children` (Part 21's `RouteTree`), with no params and no loader data. Its output doesn't depend on the URL, so one payload for the `/shop` layout serves every URL under `/shop`. The page does depend on the URL, so its key includes the pathname.
+
+<SegmentCacheDiagram />
+
+The obstacle is `children`. Part 21's `RouteTree` nests the page inside the layouts, so the layout's payload _contains_ the page. To send them separately, a layout's children become a placeholder that the client fills in: an `Outlet` client component that names its parent segment.
+
+```tsx title="packages/eigen/segments.tsx"
+import type { ReactNode } from "react";
+import type { RouteMatch } from "eigen/match-route";
+import { Outlet, SegmentRoot } from "eigen/client/segments";
+import { PAGE, segmentChain } from "./segment-ids";
+
+/** One segment's element. A layout's children are left to the client */
+export function segmentElement(match: RouteMatch, id: string): ReactNode {
+  if (id === PAGE) {
+    const Page = match.route.component;
+    return <Page params={match.params} />;
+  }
+  const layout = match.route.layouts.find((l) => l.path === id);
+  if (!layout) throw new Error(`No layout "${id}" on route ${match.route.path}`);
+  const Layout = layout.component;
+  return (
+    <Layout>
+      <Outlet parent={id} />
+    </Layout>
+  );
+}
+
+/** Replaces Part 21's RouteTree: every segment rendered, nothing nested yet */
+export function RouteTree({ match, pathname }: { match: RouteMatch; pathname: string }) {
+  const chain = segmentChain(match.route);
+  const segments = Object.fromEntries(chain.map((id) => [id, segmentElement(match, id)]));
+  return <SegmentRoot initial={{ pathname, chain, segments }} />;
+}
+```
+
+`renderRSC` passes the pathname through: `<RouteTree match={match} pathname={pathname} />`. The first page load still sends one payload, but it now arrives as a map of segments, so it has the same shape as what later navigations assemble from the cache.
+
+The client puts the map back together. `SegmentRoot` holds the current tree in state, and each `Outlet` renders the next segment in the chain:
+
+```tsx title="packages/eigen/client/segments.tsx"
+"use client";
+import { createContext, Fragment, use, useState, type ReactNode } from "react";
+import { PAGE } from "../segment-ids";
+
+export interface SegmentTree {
+  pathname: string;
+  chain: string[];
+  segments: Record<string, ReactNode>;
+}
+
+const TreeContext = createContext<SegmentTree | null>(null);
+
+export function SegmentRoot({ initial }: { initial: SegmentTree }) {
+  const [tree, setTree] = useState(initial);
+  // ...the navigate listener, in "Navigating from the cache" below
+  return <TreeContext value={tree}>{tree.segments[tree.chain[0]]}</TreeContext>;
+}
+
+export function Outlet({ parent }: { parent: string }) {
+  const tree = use(TreeContext)!;
+  const child = tree.chain[tree.chain.indexOf(parent) + 1];
+  // A different URL is a different page: remount it instead of reusing its state
+  return <Fragment key={child === PAGE ? tree.pathname : child}>{tree.segments[child]}</Fragment>;
+}
+```
+
+Element identity does the rest. Going from `/shop/1` to `/shop/2`, the next tree reuses the _same_ `"/"` and `"/shop"` element objects from the cache. When React sees the same element object at the same position, it skips that subtree entirely. Only the `Outlet`s re-render, because they read the context. The layouts are neither re-sent nor re-rendered.
+
+---
+
+## Rendering one segment on the server
+
+The rsc entry gains `renderSegment`. With `partial: false` it streams a segment in full, like `renderRSC` does for a page. With `partial: true` it prerenders the segment's shell.
+
+Part 26 built shells with `prerender` from `react-dom/static`, which produces HTML. A segment shell has to be a _Flight_ payload, and React's Flight server has its own `prerender`, which plugin-rsc exposes as `@vitejs/plugin-rsc/rsc/static`. It takes the same `signal`. When the signal aborts, React doesn't fail the work that's still pending: it _halts_ it, and writes nothing for it. The payload that comes out has every finished part and a gap wherever something was still waiting.
+
+```tsx title="src/entry-rsc.tsx (addition)"
+import { prerender } from "@vitejs/plugin-rsc/rsc/static";
+import { cacheFillsSettled, trackStale } from "eigen/runtime/cache";
+import { PAGE, segmentChain } from "eigen/segment-ids";
+import { segmentElement } from "eigen/segments";
+
+export interface SegmentResult {
+  body: ReadableStream<Uint8Array>;
+  /** false when the prerender was cut off with work still pending: the segment has holes */
+  complete: boolean;
+  /** Seconds the browser may reuse this shell (see "The client segment cache") */
+  stale: number;
+}
+
+export function renderSegment(
+  request: Request,
+  id: string,
+  { partial = false } = {},
+): Promise<SegmentResult | null> {
+  const match = matchRoute(new URL(request.url).pathname, routes);
+  if (!match || !segmentChain(match.route).includes(id)) return Promise.resolve(null);
+
+  // prerendering: true makes getRequest() hang, exactly as in Part 26
+  return runWithRequest({ request, prerendering: partial }, () =>
+    withRequestCache(() =>
+      trackStale(async (stale) => {
+        const element = segmentElement(match, id);
+        if (!partial) return { body: renderToReadableStream(element), complete: true, stale: 0 };
+
+        const controller = new AbortController();
+        let complete = false;
+        const pending = prerender(element, { signal: controller.signal }).then((result) => {
+          complete = !controller.signal.aborted; // finished before the cut-off
+          return result;
+        });
+
+        // Part 26's timing: let "use cache" fills finish, then a few turns to serialize them
+        await cacheFillsSettled();
+        for (let i = 0; i < 3; i++) await new Promise((resolve) => setImmediate(resolve));
+        controller.abort(new Error("eigen: segment prerender complete"));
+
+        const { prelude } = await pending;
+        return { body: prelude, complete, stale: stale() };
+      }),
+    ),
+  );
+}
+
+export { routes }; // the build plugin below walks the route table
+```
+
+`complete` is how the server tells the client whether a shell is the whole segment. If the prerender resolved before the abort, nothing was halted, and the client never needs to ask again. If it resolved only because of the abort, the segment has holes.
+
+`cacheFillsSettled()` watches Part 25's process-wide `inFlight` map. At build time that's fine. At runtime, a prefetch can end up waiting for another request's cache fills, which delays the shell without changing its content. A production framework tracks fills per render.
+
+The endpoint sits in the rsc entry's fetch handler, next to `.rsc`:
+
+```tsx title="src/entry-rsc.tsx (handler addition)"
+export default async function handler(request: Request): Promise<Response> {
+  const url = new URL(request.url);
+  if (url.pathname === "/_eigen/segment") return segmentResponse(request, url); // [!code ++]
+  // ...Part 21's .rsc and HTML branches
+}
+
+async function segmentResponse(request: Request, url: URL): Promise<Response> {
+  const path = url.searchParams.get("path") ?? "";
+  // A site path only: new URL("//evil.example", url) would leave the origin
+  if (!path.startsWith("/") || path.startsWith("//")) return new Response("Bad Request", { status: 400 });
+
+  // Components see the page's URL and the caller's cookies, as on a real navigation
+  const pageRequest = new Request(new URL(path, url), { headers: request.headers });
+
+  // A segment of a protected page is the protected page: Part 26's rule for shells
+  const ssr = await import.meta.viteRsc.loadModule<typeof import("./entry-ssr")>("ssr", "index");
+  const blocked = await ssr.runShellMiddleware(pageRequest);
+  if (blocked) return blocked;
+
+  const id = url.searchParams.get("id") ?? PAGE;
+  const result = await renderSegment(pageRequest, id, { partial: url.searchParams.has("partial") });
+  if (!result) return new Response("Not Found", { status: 404 });
+  return new Response(result.body, { headers: segmentHeaders(result) });
+}
+
+export function segmentHeaders({ complete, stale }: Pick<SegmentResult, "complete" | "stale">) {
+  return {
+    "Content-Type": "text/x-component;charset=utf-8",
+    "X-Eigen-Segment": complete ? "complete" : "partial",
+    "X-Eigen-Stale": String(stale),
+  };
+}
+```
+
+Fetch `/_eigen/segment?path=/shop/2&id=/shop&partial` in the browser and you'll see the layout's Flight rows. Where the `Outlet` sits there's only a client reference: the page isn't in it. Only the pathname matters. Search params are left out to keep the key simple.
+
+---
+
+## The client segment cache
+
+The cache maps segment keys to payloads. A payload is still a stream when it goes into the cache, so each slot holds a promise, plus the resolved entry once the response headers have arrived:
+
+```typescript title="packages/eigen/client/segment-cache.ts"
+import { createFromFetch } from "@vitejs/plugin-rsc/browser";
+import type { ReactNode } from "react";
+import { segmentKey } from "../segment-ids";
+
+export interface SegmentEntry {
+  element: Promise<ReactNode>;
+  /** The server cut the prerender off: some of this segment is still a hole */
+  partial: boolean;
+  staleAt: number;
+}
+
+interface Slot {
+  promise: Promise<SegmentEntry>;
+  entry?: SegmentEntry; // set once the response headers are in
+}
+
+/** Next.js's floor for prefetched data: shorter stale times aren't worth a prefetch */
+const MIN_STALE_SECONDS = 30;
+const cache = new Map<string, Slot>();
+
+export function fetchSegment(
+  id: string,
+  pathname: string,
+  { partial, signal }: { partial: boolean; signal?: AbortSignal },
+): Promise<SegmentEntry> {
+  const query = new URLSearchParams({ path: pathname, id });
+  if (partial) query.set("partial", "");
+
+  const response = fetch(`/_eigen/segment?${query}`, { signal }).then((res) => {
+    // A redirect means middleware turned us away: let the navigation load the document
+    if (!res.ok || res.redirected) throw new Error(`Segment ${id} of ${pathname} failed: ${res.status}`);
+    return res;
+  });
+
+  // Without this flag, the client reports "Connection closed." for every halted
+  // row when the stream ends. With it, halted rows simply stay pending.
+  const element = createFromFetch<ReactNode>(response, { unstable_allowPartialStream: partial });
+  element.catch(() => {}); // a failure surfaces through the returned promise instead
+
+  return response.then((res) => ({
+    element,
+    partial: res.headers.get("X-Eigen-Segment") === "partial",
+    staleAt: Date.now() + Math.max(Number(res.headers.get("X-Eigen-Stale")), MIN_STALE_SECONDS) * 1000,
+  }));
+}
+
+/** A segment shell: from the cache if it's pending or fresh, otherwise fetched and shared */
+export function prefetchSegment(id: string, pathname: string): Promise<SegmentEntry> {
+  const key = segmentKey(id, pathname);
+  const slot = cache.get(key);
+  if (slot && (!slot.entry || slot.entry.staleAt > Date.now())) return slot.promise;
+
+  const next: Slot = { promise: fetchSegment(id, pathname, { partial: true }) };
+  cache.set(key, next);
+  next.promise.then(
+    (entry) => (next.entry = entry),
+    // A failed prefetch must not poison the cache (Part 23's rule)
+    () => cache.get(key) === next && cache.delete(key),
+  );
+  return next.promise;
+}
+
+/** A fresh entry the cache already holds, for a navigation */
+export function readSegment(id: string, pathname: string): SegmentEntry | undefined {
+  const entry = cache.get(segmentKey(id, pathname))?.entry;
+  return entry && entry.staleAt > Date.now() ? entry : undefined;
+}
+
+export function clearSegmentCache(): void {
+  cache.clear();
+}
+```
+
+`unstable_allowPartialStream` is what makes a halted shell usable. Normally, when a Flight stream closes while some rows are still pending, the client rejects them with "Connection closed." and the nearest error boundary catches it. With the flag, React 19.3 marks those rows _halted_, and they stay suspended. Rendered inside a `<Suspense>`, a halted row shows its fallback: that's the hole, on the client.
+
+Navigations never write to the cache. A full render can contain request data (cookies, a user's prices), so it's used once and dropped, the same as Next.js's default of 0 seconds for dynamic data.
+
+### Stale times from `cacheLife`
+
+How long may the browser reuse a shell? Next.js answers with a third `cacheLife` field, `stale`: the time a client may reuse a result without asking the server. The server sends it in the `x-nextjs-stale-time` header, and the client never uses less than 30 seconds. Part 25's `CacheLife` gets the field, using the Next.js preset values:
+
+```typescript title="packages/eigen/runtime/cache.ts (change)"
+export interface CacheLife {
+  stale: number; // seconds a browser may reuse a prefetched result // [!code ++]
+  revalidate: number; // seconds until the entry is stale (served, then refreshed)
+  expire: number; // seconds until the entry is unusable (next request waits)
+}
+
+export const PROFILES = {
+  default: { stale: 300, revalidate: 900, expire: NEVER },
+  seconds: { stale: 30, revalidate: 1, expire: 60 },
+  minutes: { stale: 300, revalidate: 60, expire: 3_600 },
+  hours: { stale: 300, revalidate: 3_600, expire: 86_400 },
+  days: { stale: 300, revalidate: 86_400, expire: 604_800 },
+  weeks: { stale: 300, revalidate: 604_800, expire: 2_592_000 },
+  max: { stale: 300, revalidate: 2_592_000, expire: 31_536_000 },
+} satisfies Record<string, CacheLife>;
+```
+
+A segment's stale time is the shortest `stale` of every cache entry it read. Part 25's `propagate` already carries lifetimes from inner entries to outer ones. At the top of the render there's no outer cache scope, so `propagate` hands the value to a render-level tracker instead:
+
+```typescript title="packages/eigen/runtime/cache.ts (addition)"
+const renderStale = new AsyncLocalStorage<{ stale: number }>();
+
+/** Runs a render, and lets it read the shortest `stale` of every cache entry it used */
+export function trackStale<T>(fn: (stale: () => number) => T): T {
+  const store = { stale: PROFILES.default.stale };
+  return renderStale.run(store, () => fn(() => store.stale));
+}
+
+function propagate(entry: CacheEntry): void {
+  const parent = cacheScope.getStore();
+  if (!parent) {
+    const render = renderStale.getStore(); // [!code ++]
+    if (render) render.stale = Math.min(render.stale, entry.stale); // [!code ++]
+    return;
+  }
+  for (const tag of entry.tags) parent.tags.add(tag);
+  if (!parent.lifeSet) {
+    parent.life = {
+      stale: Math.min(parent.life.stale, entry.stale), // [!code ++]
+      revalidate: Math.min(parent.life.revalidate, entry.revalidate),
+      expire: Math.min(parent.life.expire, entry.expire),
+    };
+  }
+}
+```
+
+A segment that reads no cached data at all is static, and gets the default: five minutes, like Next.js's `staleTimes.static`. Because `CacheEntry` spreads `scope.life`, every stored entry now carries `stale` with no further changes.
+
+Next.js goes one step further and uses these numbers to decide what may go into a shell at all: an entry with `stale` under 30 seconds, or `expire` under five minutes, is treated as dynamic and stays a hole. Eigen keeps it in the shell and lets the 30-second floor bound how stale it can get.
+
+---
+
+## The prefetch scheduler
+
+Prefetching starts from links. A visible link asks for the segments its URL needs, and a link the user hovers over moves to the front of the queue. The client can't match routes with `eigen/routes`: in RSC mode that table holds server components, and Part 21 keeps it out of the client graph. So the route plugin generates a second virtual module, `eigen/route-manifest`, that holds data only:
+
+```typescript title="packages/eigen/plugins/route-tree.ts (addition)"
+import { compareRoutes, compileRoute } from "../match-route";
+
+/** Patterns and layout paths, nothing importable: safe for the client graph */
+export function generateRouteManifest(tree: RouteNode): string {
+  const entries: { path: string; layouts: { path: string }[] }[] = [];
+  (function walk(node: RouteNode, layouts: { path: string }[]) {
+    if (node.layout) layouts = [...layouts, { path: node.layout.path }];
+    for (const page of node.pages) entries.push({ path: page.path, layouts });
+    for (const child of node.children) walk(child, layouts);
+  })(tree, []);
+
+  // Part 23's ranking, so matchRoute picks the same route on both sides
+  const manifest = entries
+    .map((entry) => ({ ...entry, segments: compileRoute(entry.path) }))
+    .sort((a, b) => compareRoutes(a.segments, b.segments));
+  return `export const manifest = ${JSON.stringify(manifest)};`;
+}
+```
+
+It's served through the same `resolveId`/`load` pair as `eigen/routes`, and regenerated by Part 9's `hotUpdate` when a route file is added or removed. Part 23's `matchRoute` only reads `path` and `segments`, so it works on manifest entries unchanged.
+
+The scheduler is a priority queue with a concurrency limit. Links showing intent come before links that are only visible, and within each level the newest link comes first. That's the order Next.js uses: what the user is about to click matters more than what they scrolled past.
+
+```typescript title="packages/eigen/client/prefetch.ts"
+import { matchRoute } from "eigen/match-route";
+import { manifest } from "eigen/route-manifest";
+import { segmentChain } from "../segment-ids";
+import { prefetchSegment } from "./segment-cache";
+
+const VIEWPORT = 0;
+const INTENT = 1;
+const MAX_IN_FLIGHT = 4;
+
+interface Task {
+  pathname: string;
+  priority: typeof VIEWPORT | typeof INTENT;
+}
+
+const queue: Task[] = [];
+let inFlight = 0;
+
+export function schedulePrefetch(pathname: string, priority: Task["priority"]): void {
+  const index = queue.findIndex((task) => task.pathname === pathname);
+  // Re-queue at the end: newest first within a priority level
+  const previous = index === -1 ? VIEWPORT : queue.splice(index, 1)[0].priority;
+  queue.push({ pathname, priority: Math.max(priority, previous) as Task["priority"] });
+  pump();
+}
+
+/** Drop a queued prefetch. One already in flight finishes: its layouts may be shared */
+export function cancelPrefetch(pathname: string): void {
+  const index = queue.findIndex((task) => task.pathname === pathname);
+  if (index !== -1) queue.splice(index, 1);
+}
+
+function takeNext(): Task | undefined {
+  let best = queue.length - 1;
+  for (let i = queue.length - 2; i >= 0; i--) {
+    if (queue[i].priority > queue[best].priority) best = i;
+  }
+  return best === -1 ? undefined : queue.splice(best, 1)[0];
+}
+
+function pump(): void {
+  while (inFlight < MAX_IN_FLIGHT) {
+    const task = takeNext();
+    if (!task) return;
+    const match = matchRoute(task.pathname, manifest);
+    if (!match) continue;
+
+    inFlight++;
+    // Segments already cached or in flight resolve at once: only the missing ones hit the network
+    Promise.allSettled(segmentChain(match.route).map((id) => prefetchSegment(id, task.pathname))).finally(() => {
+      inFlight--;
+      pump();
+    });
+  }
+}
+```
+
+Links register with one shared `IntersectionObserver`. A link that scrolls away cancels its queued prefetch, unless another link on screen points to the same URL:
+
+```typescript title="packages/eigen/client/prefetch.ts (continued)"
+const links = new Map<Element, string>(); // observed link → pathname
+const visible = new Set<Element>();
+let observer: IntersectionObserver | undefined;
+
+export function observeLink(link: Element, pathname: string): () => void {
+  observer ??= new IntersectionObserver((records) => {
+    for (const { target, isIntersecting } of records) {
+      const path = links.get(target);
+      if (!path) continue;
+      if (isIntersecting) {
+        visible.add(target);
+        schedulePrefetch(path, VIEWPORT);
+      } else {
+        visible.delete(target);
+        if (![...visible].some((other) => links.get(other) === path)) cancelPrefetch(path);
+      }
+    }
+  });
+  links.set(link, pathname);
+  observer.observe(link);
+  return () => {
+    observer!.unobserve(link);
+    links.delete(link);
+    visible.delete(link);
+  };
+}
+
+/** After an invalidation: every link on screen prefetches again */
+export function prefetchVisibleLinks(): void {
+  for (const link of visible) schedulePrefetch(links.get(link)!, VIEWPORT);
+}
+
+export const prefetchOnIntent = (pathname: string) => schedulePrefetch(pathname, INTENT);
+```
+
+RSC mode needs a client `Link`, because server components can't attach effects. Its `prefetch` prop replaces Part 23's `preload`: `"auto"` prefetches the segment shells, and `false` turns prefetching off for links nobody is likely to click, like a logout button. Prefetching runs only in production builds, as in Next.js: in development every prefetch would trigger a fresh, unoptimized render.
+
+```tsx title="packages/eigen/client/link.tsx"
+"use client";
+import { useEffect, useRef, type ReactNode } from "react";
+import { observeLink, prefetchOnIntent } from "./prefetch";
+
+interface LinkProps {
+  href: string; // Part 23's typed `to`/`params`/`search` work unchanged; a plain href keeps this short
+  prefetch?: "auto" | false;
+  children: ReactNode;
+}
+
+export function Link({ href, prefetch = "auto", children }: LinkProps) {
+  const ref = useRef<HTMLAnchorElement>(null);
+  const enabled = prefetch !== false && import.meta.env.PROD;
+
+  useEffect(() => {
+    if (!enabled || !ref.current) return;
+    return observeLink(ref.current, new URL(href, location.href).pathname);
+  }, [href, enabled]);
+
+  const onIntent = enabled ? () => prefetchOnIntent(new URL(href, location.href).pathname) : undefined;
+
+  // Still a plain <a>: the Navigation API intercepts the click (Part 22)
+  return (
+    <a ref={ref} href={href} onMouseEnter={onIntent} onFocus={onIntent} onTouchStart={onIntent}>
+      {children}
+    </a>
+  );
+}
+```
+
+Next.js 16 has one more value, `prefetch={true}`. That fetches a _per-link_ prefetch, which resolves the URL's params and the cached content behind them, because a Next.js App Shell is shared by every URL of a route and so can't contain them. Eigen's page shells are per URL from the start (see the comparison table below), so `"auto"` already covers it.
+
+---
+
+## Navigating from the cache
+
+Now the router. Part 21's `navigate()` and its `popstate` listener go away, and `SegmentRoot` takes over Part 22's `navigate` listener, with `prepareTree` in place of the data fetch:
+
+<InstantNavigationDiagram />
+
+```typescript title="packages/eigen/client/navigate.ts"
+import type { ReactNode } from "react";
+import { segmentChain } from "../segment-ids";
+import { fetchSegment, readSegment } from "./segment-cache";
+import type { SegmentTree } from "./segments";
+
+/** Everything a navigation can render right now, and the full renders still on their way */
+export async function prepareTree(pathname: string, route: { layouts: { path: string }[] }, signal: AbortSignal) {
+  const chain = segmentChain(route);
+
+  // Prefetched shells where we have them; a full render for anything missing
+  const entries = await Promise.all(
+    chain.map((id) => readSegment(id, pathname) ?? fetchSegment(id, pathname, { partial: false, signal })),
+  );
+
+  // A shell with holes needs the real thing. Start those now, in parallel
+  const fills = chain.flatMap((id, i) =>
+    entries[i].partial ? [{ id, entry: fetchSegment(id, pathname, { partial: false, signal }) }] : [],
+  );
+  for (const fill of fills) fill.entry.catch(() => {}); // handled after the commit
+
+  const segments: Record<string, ReactNode> = {};
+  await Promise.all(chain.map(async (id, i) => (segments[id] = await entries[i].element)));
+  const tree: SegmentTree = { pathname, chain, segments };
+  return { tree, fills };
+}
+```
+
+Awaiting a shell's `element` doesn't wait for its holes. The promise resolves as soon as the root row has arrived, and for a cached shell that has already happened. The halted rows inside it stay pending, and they're all inside Suspense boundaries (the build check below makes sure of that).
+
+```tsx title="packages/eigen/client/segments.tsx (SegmentRoot, completed)"
+import { matchRoute } from "eigen/match-route";
+import { manifest } from "eigen/route-manifest";
+import { startTransition, useEffect, useLayoutEffect, useRef } from "react";
+import { prepareTree } from "./navigate";
+
+/** navigate() info that asks for a real document load instead of an intercept */
+const DOCUMENT_LOAD = "eigen:document-load";
+
+export function SegmentRoot({ initial }: { initial: SegmentTree }) {
+  const [tree, setTree] = useState(initial);
+
+  // Part 22's commit: resolves once React has applied the new tree
+  const onCommit = useRef<(() => void) | null>(null);
+  useLayoutEffect(() => {
+    onCommit.current?.();
+    onCommit.current = null;
+  }, [tree]);
+  const commit = (next: SegmentTree) =>
+    new Promise<void>((resolve) => {
+      onCommit.current = resolve;
+      startTransition(() => setTree(next));
+    });
+
+  useEffect(() => {
+    if (!("navigation" in window)) return;
+
+    const handleNavigate = (event: NavigateEvent) => {
+      if (!event.canIntercept || event.hashChange || event.downloadRequest !== null || event.formData !== null) return;
+      if (event.info === DOCUMENT_LOAD) return;
+      const url = new URL(event.destination.url);
+      const match = matchRoute(url.pathname, manifest);
+      if (!match) return;
+
+      event.intercept({
+        async handler() {
+          try {
+            const { tree: next, fills } = await prepareTree(url.pathname, match.route, event.signal);
+            event.signal.throwIfAborted();
+            await commit(next); // the shell is on screen: the navigation is done
+
+            // Swap in each full segment when it arrives, if we're still on this page
+            for (const { id, entry } of fills) {
+              entry
+                .then(({ element }) => element)
+                .then((element) =>
+                  startTransition(() =>
+                    setTree((current) =>
+                      current.pathname === url.pathname
+                        ? { ...current, segments: { ...current.segments, [id]: element } }
+                        : current,
+                    ),
+                  ),
+                )
+                .catch(() => {}); // superseded or failed: the fallback stays until the next navigation
+            }
+          } catch (error) {
+            if (event.signal.aborted) throw error;
+            // Middleware redirect, 404, server error: let the server answer with a document
+            navigation.navigate(url.href, { history: "replace", info: DOCUMENT_LOAD });
+          }
+        },
+        focusReset: "after-transition",
+        scroll: "after-transition",
+      });
+    };
+
+    navigation.addEventListener("navigate", handleNavigate);
+    return () => navigation.removeEventListener("navigate", handleNavigate);
+  }, []);
+
+  return <TreeContext value={tree}>{tree.segments[tree.chain[0]]}</TreeContext>;
+}
+```
+
+The navigation settles when the _shell_ commits, not when the holes fill. That matters for everything Part 22 hangs on that promise: `navigation.transition` ends, the progress indicator stops, and focus and scroll are restored against a page that's already on screen. Part 35 described this as the "instant transition" Next.js uses and Eigen's classic router doesn't: the new route appears right away with its fallbacks showing, instead of the old one staying until all the data has arrived.
+
+The fill is the same reconciliation trick as the layouts. The full payload for `page:/shop/2` has the same structure as its shell, so React keeps the DOM it has and only renders into the boundaries that were showing fallbacks. If the user has moved on by then, the functional update finds a different `pathname` and changes nothing.
+
+Without a prefetch, as in development, or with `prefetch={false}`, or when a shell has gone stale, `readSegment` misses and the navigation fetches full segments. That's still better than Part 21: those requests run in parallel, one per segment, instead of one request for the whole page.
+
+---
+
+## Invalidation
+
+A shell cached in the browser is a copy of server data, so it can go stale the moment a server function changes that data. Part 38 left this to the page ("call `navigation.reload()`"). Next.js handles it in the framework: when a Server Action revalidates, the response carries an `x-action-revalidated` header and the client router clears its cache. Eigen does the same in three steps.
+
+First, `revalidateTag` notes that it ran, using a store that's only active during a server function call:
+
+```typescript title="packages/eigen/cache.ts (change)"
+import { AsyncLocalStorage } from "node:async_hooks";
+
+const revalidations = new AsyncLocalStorage<{ revalidated: boolean }>(); // [!code ++]
+
+/** Runs a server function and reports whether it revalidated anything */ // [!code ++]
+export async function trackRevalidation<T>(fn: () => Promise<T>) { // [!code ++]
+  const store = { revalidated: false }; // [!code ++]
+  const result = await revalidations.run(store, fn); // [!code ++]
+  return { result, revalidated: store.revalidated }; // [!code ++]
+} // [!code ++]
+
+export async function revalidateTag(tag: string): Promise<void> {
+  await Promise.all(Object.values(getCacheHandlers()).map((store) => store.revalidateTag(tag)));
+  const store = revalidations.getStore(); // [!code ++]
+  if (store) store.revalidated = true; // [!code ++]
+}
+```
+
+Second, Part 15's RPC endpoint turns that into a header:
+
+```typescript title="packages/eigen/server-fn-endpoint.ts (change)"
+  try {
+    const result = await registration.fn(input, context); // [!code --]
+    return Response.json(result ?? null); // [!code --]
+    const { result, revalidated } = await trackRevalidation(() => registration.fn(input, context)); // [!code ++]
+    return Response.json(result ?? null, { // [!code ++]
+      headers: revalidated ? { "X-Eigen-Revalidated": "1" } : {}, // [!code ++]
+    }); // [!code ++]
+  } catch (e) {
+```
+
+Third, the client stub reacts to it:
+
+```typescript title="packages/eigen/server-fn-client.ts (change)"
+    if (!res.ok) {
+      const body = await res.json().catch(() => null);
+      throw new Error(body?.error ?? `Server function failed (${res.status})`);
+    }
+    if (res.headers.has("X-Eigen-Revalidated")) invalidate(); // [!code ++]
+    return res.json();
+```
+
+```typescript title="packages/eigen/client/invalidate.ts"
+import { prefetchVisibleLinks } from "./prefetch";
+import { clearSegmentCache } from "./segment-cache";
+
+export function invalidate(): void {
+  clearSegmentCache();
+  prefetchVisibleLinks(); // what the user can click next is fresh again
+  // Re-run the current page's navigation: the router intercepts it like any
+  // other, and with the cache empty it fetches full segments
+  if ("navigation" in window) navigation.reload();
+}
+```
+
+Like Next.js, Eigen clears the _whole_ cache instead of working out which shells read the revalidated tag. A tag can reach a segment through any number of nested cache entries. Tracking that on the client would mean shipping each segment's tags with it, and a cache that is merely empty costs a few extra prefetches. In classic mode, the same `navigation.reload()` re-runs the loaders, so Part 38's manual call can go. `"use server"` functions called through plugin-rsc's `callServer` need the same header check in the callback registered with `setServerCallback`.
+
+---
+
+## Checking that a route is instant
+
+The shell of a page is only useful if it has something in it. Take Part 26's product page and remove the `<Suspense>` around `ProductPrice`. The price now awaits `getRequest()` with no boundary above it except the ones in the layouts. The page segment's shell halts at its root, the click renders a blank page, or the fallback of some layout boundary, and the navigation waits for the full render after all.
+
+With `cacheComponents`, Next.js fails the build for this, with the error "Uncached data was accessed outside of `<Suspense>`". Request data (`cookies()`, `headers()`, `connection()`, awaited `params`) and uncached fetches have to be inside a boundary, or be cached. The check works on aborted work. Every task React's HTML renderer abandons when the prerender is cut off is reported to `onError` with its component stack, and if that stack contains no `Suspense` frame, the work was blocking the shell itself.
+
+Part 26's `prerenderPage` already aborts and already sees those errors. It just ignored them:
+
+```tsx title="src/entry-ssr.tsx (prerenderPage change)"
+// How React prints a Suspense frame in a component stack
+const SUSPENSE_FRAME = /\n\s+(?:at|in) Suspense\b/; // [!code ++]
+
+export async function prerenderPage(rsc: RscEntry, request: Request) {
+  const element = await createFromReadableStream(rsc.renderRSC(request, { prerendering: true }));
+  let blocking: string | null = null; // [!code ++]
+
+  const controller = new AbortController();
+  const pending = prerender(element, {
+    signal: controller.signal,
+    onError(error, info) {
+      // Aborting reports every still-pending boundary — that's expected
+      if (!controller.signal.aborted) console.error(error); // [!code --]
+      if (!controller.signal.aborted) return console.error(error); // [!code ++]
+      // ...unless nothing above it could show a fallback // [!code ++]
+      const stack = info.componentStack ?? ""; // [!code ++]
+      if (!blocking && !SUSPENSE_FRAME.test(stack)) blocking = stack; // [!code ++]
+    },
+  });
+
+  // ...cacheFillsSettled, the extra turns and the abort, unchanged
+
+  const { prelude, postponed } = await pending;
+  return { prelude: await new Response(prelude).text(), postponed }; // [!code --]
+  return { prelude: await new Response(prelude).text(), postponed, blocking }; // [!code ++]
+}
+```
+
+A new build plugin uses it for every route it can prerender, PPR or not, and writes the segment shells while it's there. Prebuilt shells save the server a prerender for every prefetch of a known URL:
+
+```typescript title="packages/eigen/plugins/eigen-segments.ts"
+import type { Plugin } from "vite";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+import { PAGE, segmentChain, segmentKey } from "../segment-ids";
+import { pathsToPrerender } from "./eigen-ssg";
+
+export interface SegmentFile {
+  file: string;
+  complete: boolean;
+  stale: number;
+}
+
+export default function eigenSegments(): Plugin {
+  return {
+    name: "eigen-segments",
+    apply: "build",
+
+    buildApp: {
+      order: "post",
+      async handler(builder) {
+        const root = builder.config.root;
+        const serverDir = resolve(root, builder.environments.ssr.config.build.outDir);
+        const rscDir = resolve(root, builder.environments.rsc.config.build.outDir);
+        const load = (file: string) => import(pathToFileURL(file).href);
+        const rsc = await load(join(rscDir, "index.js"));
+        const ssr = await load(join(serverDir, "index.js"));
+
+        const outDir = join(serverDir, "segments");
+        mkdirSync(outDir, { recursive: true });
+        const index: Record<string, SegmentFile> = {};
+        const failures: string[] = [];
+
+        for (const route of rsc.routes) {
+          const paths = await pathsToPrerender({
+            ...route,
+            staticGeneration: { ...route.staticGeneration, prerender: true },
+          });
+
+          for (const pathname of paths) {
+            const request = new Request(new URL(pathname, "http://localhost"));
+
+            // 1. The instant check, on the whole tree: layouts can hold the boundary
+            const { blocking } = await ssr.prerenderPage(rsc, request);
+            if (blocking && route.instant !== false) {
+              failures.push(
+                `Route "${route.path}" (${pathname}): Uncached data was accessed outside of <Suspense>.\n` +
+                  `Navigations to it can't show anything until the server finishes. Wrap it in <Suspense>,\n` +
+                  `cache it with "use cache", or export const instant = false.${blocking}`,
+              );
+            }
+
+            // 2. The shells: each layout once, each page per URL
+            for (const id of segmentChain(route)) {
+              const key = segmentKey(id, pathname);
+              if (index[key]) continue; // a layout an earlier route already wrote
+              const { body, complete, stale } = await rsc.renderSegment(request, id, { partial: true });
+              const file = `${Object.keys(index).length}.rsc`;
+              writeFileSync(join(outDir, file), new Uint8Array(await new Response(body).arrayBuffer()));
+              index[key] = { file, complete, stale };
+            }
+          }
+        }
+
+        if (failures.length > 0) throw new Error(failures.join("\n\n"));
+        writeFileSync(join(outDir, "index.json"), JSON.stringify(index, null, 2));
+        console.log(`  ✓ Segments: ${Object.keys(index).length} shells`);
+      },
+    },
+  };
+}
+```
+
+`instant` is a route export, carried into the route table the same way Part 16 carries `staticGeneration`:
+
+```tsx title="src/pages/account/billing.tsx"
+// This page is allowed to block: the whole thing depends on the session
+export const instant = false;
+```
+
+Next.js 16.3 stabilized the same export (`export const instant = false`). In a production build, the component stack names client components and host elements. Server components appear in it only in development, because they ran in the rsc environment and the HTML renderer only sees their output. That's one reason Next.js also runs this validation during `next dev`. Dynamic routes without `generateStaticParams` have no URL to check at build time, which is the other reason.
+
+The production server serves prebuilt shells before calling into the rsc entry. Middleware still runs first, as it does for Part 26's HTML shells:
+
+```typescript title="server.prod.ts (segment branch)"
+import type { SegmentFile } from "eigen/plugins/eigen-segments";
+import { segmentKey } from "eigen/segment-ids";
+
+const segmentFiles: Record<string, SegmentFile> = JSON.parse(
+  readFileSync("dist/server/segments/index.json", "utf-8"),
+);
+
+// Before Part 26's PPR branch
+if (pathname === "/_eigen/segment") {
+  const params = event.url.searchParams;
+  const path = params.get("path") ?? "";
+  const id = params.get("id") ?? "";
+  const prebuilt =
+    params.has("partial") &&
+    path.startsWith("/") &&
+    !path.startsWith("//") &&
+    rsc.segmentChainFor(path)?.includes(id) &&
+    segmentFiles[segmentKey(id, path)];
+  // Anything else is rendered on demand, and renderSegment does its own checks
+  if (!prebuilt) return rsc.default(event.req);
+
+  const blocked = await ssr.runShellMiddleware(new Request(new URL(path, event.url), event.req));
+  if (blocked) return blocked;
+  const body = await readFile(join("dist/server/segments", prebuilt.file));
+  return new Response(body, { headers: rsc.segmentHeaders(prebuilt) });
+}
+```
+
+`segmentChainFor` is a two-line export of the rsc entry: `matchRoute` the path and return `segmentChain(match.route)`, or `null`. The check matters because a layout's key doesn't include the path. Without it, a request could pair the `/admin` layout with a public `path`, and middleware would approve the public path while the server sent the admin layout. `renderSegment` makes the same check for segments it renders on demand. A key is only ever looked up in the index, never turned into a file path, so a crafted `path` can't read other files: the same rule as `ppr.json` in Part 26. Prebuilt shells have Part 26's revalidation caveat too. `revalidateTag` clears the server's cache entries, but not the files, so a shell built from an old CMS value is served until the next deploy. Here the cost is smaller, because the click also fetches the full segment whenever the shell is partial. A complete (fully cached) shell is never refetched, though, so it's served stale until the next deploy, or until it's regenerated whenever one of its tags is revalidated.
+
+---
+
+## Going further
+
+Next.js 16 adds three things on top of this model:
+
+- **Preserved route state.** With `cacheComponents`, a page you navigate away from isn't unmounted. Its layout router wraps it in `<Activity mode="hidden">`, which keeps its state and DOM but cleans up its effects, and a few recently visited pages are kept that way. In Eigen, `Outlet` would keep the last few page elements and render each one in an `<Activity>` whose `mode` is `"visible"` only for `tree.pathname`. Back/forward then restores form inputs and scroll positions inside the page.
+- **Stage functions.** `prefetch()` and `navigation()` from `next/cache` mark work that belongs to a later stage. Anything below `prefetch()` stays out of the shell and is filled by a per-link prefetch. Anything below `navigation()` waits for the click. Unlike `connection()`, neither makes the work depend on the request, so `"use cache"` still works below them. In Eigen they'd be siblings of `getRequest()` that hang only in certain kinds of renders.
+- **Stage guarantees.** `export const ensureStatic = "shell"` (or `"prefetch"`, `"navigation"`) fails the build if dynamic content reaches that stage: the instant check, applied to the other stages.
+
+---
+
+## How this maps to Next.js
+
+| Concern               | Eigen                                                        | Next.js 16                                                                                       |
+| --------------------- | ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------ |
+| Unit of caching       | One entry per layout, one per page URL                       | One entry per route segment; the page's App Shell is per _route_, shared across its params       |
+| What a shell contains | Everything except `getRequest()` and unfinished work         | Static and cached content and session data (`cookies()`, `headers()`); URL data streams in later |
+| Wire format           | `/_eigen/segment?path&id&partial`                            | `.segments/<path>.segment.rsc` files and the `Next-Router-Segment-Prefetch` header               |
+| Link API              | `prefetch="auto" \| false`                                   | `prefetch="auto" \| true \| false`; `true` adds a per-link prefetch with URL data                |
+| Stale time            | `X-Eigen-Stale` from `cacheLife.stale`, 30 s minimum         | `x-nextjs-stale-time` from `cacheLife.stale`, 30 s minimum                                       |
+| Invalidation          | `X-Eigen-Revalidated` clears the cache, then `reload()`      | `x-action-revalidated`; the Server Action response refreshes the current page                    |
+| Instant check         | Build-time, from component stacks; `export const instant`    | Build- and dev-time, "Uncached data was accessed outside of `<Suspense>`"; `export const instant` |
+
+The first row is the real difference. A page shell shared by every URL of a route can't contain anything that depends on `params`, so Next.js has to know which parts of a page read them. That's why Next.js 15 made `params` a promise: a page that awaits it suspends, and that suspension marks the boundary between the route's shell and its URL data. Eigen pages receive `params` as a plain object, so every page shell is per URL. That costs one prefetch per link instead of one per route, which is the trade-off Next.js's per-link `prefetch={true}` makes too.
+
+---
+
+## What to observe
+
+1. **Run the build and open `dist/server/segments/index.json`.** Each layout appears once however many routes share it, and each prerenderable page URL has its own entry. Pages with a `getRequest()` hole are `"complete": false`. Fully cached ones are `true`.
+
+2. **Preview the production build with a page of product links, and open the Network tab.** As links scroll into view you'll see `/_eigen/segment` requests: one per shared layout in total, then one page shell per link, never more than four at a time. Hover over a link far down the list: its prefetch jumps the queue.
+
+3. **Click a product link that has been prefetched.** The layouts, the cached product info and the price skeleton appear at once. A single request without `partial` follows, for the page segment only, and the price fills in. Compare it with Part 21's navigation, where nothing changed until the server had rendered everything.
+
+4. **Turn on "Highlight updates" in React DevTools and navigate between two products.** The shop layout doesn't flash: it's the same element object, so React skips it. A `"use client"` counter in the layout keeps its count, as in Part 21.
+
+5. **Add `cacheLife("seconds")` to a cached component on a product page.** That page's shell now carries `X-Eigen-Stale: 30`. Wait 30 seconds and hover over the link again: it prefetches again. A layout with the default profile is still reused.
+
+6. **Call a server function that runs `revalidateTag`.** Its response has `X-Eigen-Revalidated: 1`. The current page re-navigates with full segments, and the links on screen prefetch again.
+
+7. **Remove the `<Suspense>` around `ProductPrice` and build.** The build fails with "Uncached data was accessed outside of `<Suspense>`" and a component stack. Add `export const instant = false` and it passes, but clicking that link now waits for the price.
+
+---
+
+## Key insight
+
+Prefetching used to mean fetching a whole page per link: Part 23's loader JSON, or a document for Speculation Rules. Splitting the payload into segments changes what can be shared. A layout's payload is the same for every URL below it, so it's fetched once. A page's shell is the same for every request until its cached data changes, so it's fetched before the click. Only the holes wait for the click.
+
+The pieces are ones the series already built. Part 13's layout chain decides what the segments are. Part 26's prerender-and-abort, moved from HTML to Flight, produces the shells. Part 25's `cacheLife` sets how long the browser may keep them, and Part 22's `navigate` event commits them. The boundary between the shell and the holes is the same `<Suspense>` that Part 26 used for the first page load, now used for every navigation as well. The build check makes sure every route has that boundary where it needs one.
+
+---
+
+## What's next
+
+This completes the Deep Dives, and the series. If you skipped Phase III to get here, [Part 26](/26-partial-prerendering) and [Part 25](/25-use-cache) explain the server half of everything this module put in the browser.

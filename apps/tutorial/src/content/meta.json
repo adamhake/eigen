@@ -45,6 +45,7 @@
     "37-css-styling-pipeline",
     "38-forms-mutations",
     "39-developer-experience-cli",
-    "40-monorepo-publishing"
+    "40-monorepo-publishing",
+    "41-instant-navigations"
   ]
 }

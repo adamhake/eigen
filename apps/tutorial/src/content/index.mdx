@@ -1,9 +1,9 @@
 ---
 title: "The Eigen Series"
-description: "A 41-part tutorial building a fully-featured React meta-framework from scratch using Vite's plugin API."
+description: "A 42-part tutorial building a fully-featured React meta-framework from scratch using Vite's plugin API."
 ---
 
-The Eigen Series is a 41-part tutorial (Parts 0–40) where you build a fully-featured React meta-framework from scratch using [Vite's](https://vite.dev/) plugin API. By the end, you won't just know _how_ to use frameworks like [Next.js](https://nextjs.org/) and [TanStack Start](https://tanstack.com/start) — you'll understand how they work, why they make the architectural decisions they do, and how to build your own.
+The Eigen Series is a 42-part tutorial (Parts 0–41) where you build a fully-featured React meta-framework from scratch using [Vite's](https://vite.dev/) plugin API. By the end, you won't just know _how_ to use frameworks like [Next.js](https://nextjs.org/) and [TanStack Start](https://tanstack.com/start) — you'll understand how they work, why they make the architectural decisions they do, and how to build your own.
 
 ## Why build a framework?
 
@@ -40,7 +40,7 @@ React Server Components, `"use cache"`, Partial Prerendering, AI streaming, View
 <Step>
 ### Deep Dives
 
-Self-contained modules on auth, SEO, images, data fetching, error handling, CSS, forms, DX tooling, and publishing. Can be read independently after Phase I.
+Self-contained modules on auth, SEO, images, data fetching, error handling, CSS, forms, DX tooling, publishing, and instant navigations. Can be read independently after Phase I.
 
 </Step>
 </Steps>
@@ -135,3 +135,4 @@ These modules go deep on specific concerns. Each is self-contained and can be re
 | 38   | **Forms & Mutations**                 | Progressive enhancement with `<Form action={serverFn}>` (works with and without JavaScript), calling server functions directly, optimistic UI with `useOptimistic`, shared zod validation schemas, cache revalidation after mutations   |
 | 39   | **Developer Experience & CLI**        | `create-eigen` scaffolding CLI, AST-based code generation with `magicast`, `eslint-plugin-eigen` custom rules, TypeScript language service plugin for route autocomplete, framework diagnostics in the dev overlay                      |
 | 40   | **Monorepo & Package Publishing**     | Converting path aliases to pnpm workspaces, `tsdown` library builds with subpath exports, Turborepo task orchestration, `@changesets/cli` versioning, npm trusted publishing with automatic provenance, GitHub Actions release workflow |
+| 41   | **Instant Navigations**               | Segment-level RSC payloads, shells from React's Flight `prerender`, a client segment cache with `cacheLife` stale times, a viewport/intent prefetch scheduler, cache invalidation from server functions, a build check for uncached data outside `<Suspense>` (requires Phase III) |

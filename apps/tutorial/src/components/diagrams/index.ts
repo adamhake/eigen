@@ -41,3 +41,4 @@ export * from "./37-css-styling-pipeline";
 export * from "./38-forms-mutations";
 export * from "./39-developer-experience-cli";
 export * from "./40-monorepo-publishing";
+export * from "./41-instant-navigations";

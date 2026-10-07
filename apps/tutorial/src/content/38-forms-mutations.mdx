@@ -703,7 +703,7 @@ await updatePost({ id, title, body });
 navigation.reload();
 ```
 
-Without the Navigation API, `navigation.reload()` isn't available; `window.location.reload()` does the same job with a full page load.
+Without the Navigation API, `navigation.reload()` isn't available; `window.location.reload()` does the same job with a full page load. [Part 41](/41-instant-navigations#invalidation) moves this call into the framework: the endpoint flags responses whose server function revalidated a tag, and the client stub reloads by itself.
 
 ### The revalidation flow
 

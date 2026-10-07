@@ -72,6 +72,7 @@ const lanes: { name: string; blurb: string; pieces: Piece[] }[] = [
       { part: 29, slug: "29-module-federation", label: "Module federation" },
       { part: 35, slug: "35-error-boundaries-loading", label: "Errors + loading" },
       { part: 38, slug: "38-forms-mutations", label: "Forms" },
+      { part: 41, slug: "41-instant-navigations", label: "Instant navigations" },
     ],
   },
   {
@@ -95,7 +96,7 @@ const lanes: { name: string; blurb: string; pieces: Piece[] }[] = [
   },
 ];
 
-const TOTAL = 41;
+const TOTAL = 42;
 
 /** The part number for a page slug like `13-nested-layouts`, or null for non-part pages. */
 export function partFromSlug(slug: string[] | undefined): number | null {
@@ -149,8 +150,8 @@ export function SeriesMap({ current }: { current: number }) {
             </div>
           ))}
           <p className="m-0 pt-1 text-xs text-fd-muted-foreground">
-            Solid: covered in earlier parts. Outlined: still to come. Deep dives (30–40) can be read in any order after
-            Phase I.
+            Solid: covered in earlier parts. Outlined: still to come. Deep dives (30–41) can be read in any order after
+            the parts they build on.
           </p>
         </div>
       </Accordion>

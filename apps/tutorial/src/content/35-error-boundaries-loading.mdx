@@ -846,7 +846,7 @@ Frameworks pick one of two loading UXs for navigations:
 1. **Instant transition** — Immediately show the new route's `loading.tsx` skeleton (Next.js)
 2. **Delayed transition** — Keep the current page visible with a progress bar, switch to the new page when data arrives (Remix, TanStack Router)
 
-Eigen implements the delayed transition: pathname and data are committed together once the fetch completes, so there is no moment when the new route is rendered without its data, and nothing suspends to show the skeleton. An instant transition would have to commit the pathname first and hand the page its data as a pending promise read with `use()` — Part 12's deferred mechanism applied to the whole loader result. That's a reasonable extension, but it changes every page's data contract, so we leave it out. `loading.tsx` still shows on navigations whenever the new page suspends on deferred data.
+Eigen implements the delayed transition: pathname and data are committed together once the fetch completes, so there is no moment when the new route is rendered without its data, and nothing suspends to show the skeleton. An instant transition would have to commit the pathname first and hand the page its data as a pending promise read with `use()` — Part 12's deferred mechanism applied to the whole loader result. That's a reasonable extension, but it changes every page's data contract, so we leave it out. In RSC mode, [Part 41](/41-instant-navigations) gets instant transitions without that change: the page's prefetched shell renders at once, and its holes stream in. `loading.tsx` still shows on navigations whenever the new page suspends on deferred data.
 
 ---
 
